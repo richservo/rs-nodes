@@ -1,6 +1,8 @@
 import base64
 import io
 import json
+import re
+import sys
 import urllib.request
 import urllib.error
 
@@ -16,7 +18,7 @@ class OllamaHTTPError(Exception):
         super().__init__(f"{code} {reason}")
 
 
-DEFAULT_SYSTEM_PROMPT = """You are a prompt formatter. Your ONLY job is to restructure the user's text into a specific tag format. Do NOT add, remove, or change any content. Only reorganize it.
+DEFAULT_SYSTEM_PROMPT = """You are a prompt formatter. Your job is to restructure the user's text into a specific tag format and enhance the prompt using the image as reference. Do not change anything about the spirit of the prompt just add visual details to make the output better. Make sure to include a detailed description of the person in the scene and the environment and add any other missing visual details without adding any new elements. Do NOT change the order, make sure actions and dialogue follow the exact order of the original prompt. Anything in quotation marks are dialogue, anything not in quotation marks are action. The standard flow will be action followed by dialogue followed by action. There will never be a case where multiple actions should ever be bundled into a single action or dialogue should be one after another.
 
 Format rules:
 - [s] = style/setting (appears once at the start, describes the visual style)
@@ -32,13 +34,18 @@ Instructions:
 6. Do NOT invent new details, actions, or dialogue that aren't in the original
 7. Output ONLY the formatted text with tags — no explanations, no preamble
 
-Example input:
-A cinematic realistic shot. A man sits at a desk looking worried. He says "Are you okay?" while leaning forward. The room is dimly lit.
 
 Example output:
 [s] cinematic-realistic
-[a] A man sits at a desk looking worried. The room is dimly lit. He leans forward.
-[d] Are you okay?"""
+[a] A man in his late 30s, with short, neatly trimmed dark hair, wearing a beige blazer over an orange t-shirt, sits in a recording studio. He is wearing black headphones and facing a microphone. The background shows a wall with framed artwork depicting fantasy and sci-fi scenes. The man initially looks to his left, displaying a confused and concerned expression. He then turns his head to look over his right shoulder, glancing towards someone off-screen to his left. A subtle hum of studio equipment fills the air. Then, the man speaks in a slightly worried tone, directed towards the unseen person
+[d] Tim, are you feeling okay?
+[a] He squints, his brow furrowing, and continues in a concerned voice
+[d] You don't look so good, man.
+[a] The background ambience remains constant, a gentle white noise underlying the man's speech.
+
+[s] = style
+[a] = action
+[d] = dialogue (should be raw text, no quotation marks)"""
 
 
 class RSPromptFormatter:
@@ -88,7 +95,10 @@ class RSPromptFormatter:
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to pull model '{model_name}': {e}")
 
-    def _http_post(self, url, payload):
+    def _stream_chat(self, base_url, payload):
+        """Send a streaming chat request and print tokens as they arrive."""
+        url = f"{base_url}/api/chat"
+        payload["stream"] = True
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -96,17 +106,41 @@ class RSPromptFormatter:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            resp = urllib.request.urlopen(req, timeout=300)
         except urllib.error.HTTPError as e:
-            # Read the response body for Ollama's error message
             body = ""
             try:
                 body = e.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
             raise OllamaHTTPError(e.code, e.reason, body) from e
+
+        print("[RS Prompt Formatter] Generating:", flush=True)
+        full_text = []
+        in_think = False
+        try:
+            for line in resp:
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    print(token, end="", flush=True)
+                    full_text.append(token)
+                if chunk.get("done"):
+                    break
+        finally:
+            resp.close()
+            print(flush=True)
+
+        raw = "".join(full_text)
+        # Strip <think>...</think> blocks (including partial/unclosed)
+        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+        cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+        return cleaned
 
     def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str, reference_image=None):
         base = ollama_url.rstrip("/")
@@ -130,11 +164,11 @@ class RSPromptFormatter:
                 {"role": "system", "content": system_prompt},
                 user_message,
             ],
-            "stream": False,
+            "keep_alive": 0,
         }
 
         try:
-            result = self._http_post(f"{base}/api/chat", payload)
+            formatted = self._stream_chat(base, payload)
         except OllamaHTTPError as e:
             detail = ""
             try:
@@ -144,17 +178,15 @@ class RSPromptFormatter:
                 detail = e.body[:200] if e.body else ""
 
             if "not found" in detail.lower():
-                # Auto-pull the model, then retry
                 print(f"[RS Prompt Formatter] Model '{model}' not found — pulling from Ollama...")
                 self._pull_model(base, model)
                 print(f"[RS Prompt Formatter] Model '{model}' ready.")
-                result = self._http_post(f"{base}/api/chat", payload)
+                formatted = self._stream_chat(base, payload)
             else:
                 raise RuntimeError(f"Ollama error ({e.code}): {detail or e.reason}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"Cannot connect to Ollama at {base}: {e}")
 
-        formatted = result.get("message", {}).get("content", "")
         if not formatted:
             raise RuntimeError("Ollama returned an empty response")
 

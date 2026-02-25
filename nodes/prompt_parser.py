@@ -12,8 +12,8 @@ class RSPromptParser:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING")
-    RETURN_NAMES = ("video_prompt", "audio_prompt", "dialogue_count", "dialogue_list")
+    RETURN_TYPES = ("STRING", "STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("video_prompt", "audio_prompt", "dialogue_count", "current_index", "dialogue_list")
     FUNCTION = "parse"
     CATEGORY = "rs-nodes"
 
@@ -52,4 +52,6 @@ class RSPromptParser:
 
         dialogue_list = "\n".join(f"{i+1}. {line}" for i, line in enumerate(audio_prompts))
 
-        return (video_prompt, audio_prompt, dialogue_count, dialogue_list)
+        current_index = min(dialogue_index, dialogue_count) if dialogue_count > 0 else 0
+
+        return (video_prompt, audio_prompt, dialogue_count, current_index, dialogue_list)

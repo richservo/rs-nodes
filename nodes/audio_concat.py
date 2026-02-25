@@ -1,3 +1,4 @@
+import hashlib
 import os
 import torch
 import torchaudio
@@ -44,7 +45,18 @@ class RSAudioConcat:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        return float("nan")
+        # Hash file modification times so we re-execute when any clip file changes on disk
+        input_dir = folder_paths.get_input_directory()
+        h = hashlib.md5()
+        for key, val in sorted(kwargs.items()):
+            if key.startswith("audio_file_") and val and val != "none":
+                filepath = os.path.join(input_dir, val)
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    h.update(f"{val}:{mtime}".encode())
+                except OSError:
+                    h.update(f"{val}:missing".encode())
+        return h.hexdigest()
 
     def concat(self, clip_count: int, **kwargs):
         input_dir = folder_paths.get_input_directory()

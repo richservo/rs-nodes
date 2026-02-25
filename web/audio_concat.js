@@ -85,13 +85,14 @@ app.registerExtension({
         // --- Upload button ---
         const uploadContainer = document.createElement("div");
         uploadContainer.style.cssText =
-            "width:100%;padding:4px;box-sizing:border-box;";
+            "width:calc(100% - 16px);padding:4px;box-sizing:border-box;margin:0 auto;overflow:hidden;";
 
         const uploadBtn = document.createElement("button");
         uploadBtn.textContent = "Upload Audio Clips";
         uploadBtn.style.cssText =
-            "width:100%;padding:6px 12px;cursor:pointer;border-radius:4px;" +
-            "border:1px solid #666;background:#333;color:#ddd;font-size:13px;";
+            "width:100%;padding:10px 12px;cursor:pointer;border-radius:4px;" +
+            "border:1px solid #666;background:#333;color:#ddd;font-size:13px;" +
+            "box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
 
         const fileInput = document.createElement("input");
         fileInput.type = "file";
@@ -185,6 +186,7 @@ app.registerExtension({
 
         node.addDOMWidget("upload_audio", "custom", uploadContainer, {
             serialize: false,
+            getMinHeight: () => 36,
         });
 
         // --- Per-clip header bars (label, move up/down, remove) ---
@@ -358,7 +360,7 @@ app.registerExtension({
             }
 
             const sz = node.computeSize();
-            node.setSize([Math.max(sz[0], node.size[0]), sz[1]]);
+            node.setSize([Math.max(sz[0], node.size[0], 350), sz[1]]);
             node.setDirtyCanvas(true, true);
         }
 
@@ -370,6 +372,10 @@ app.registerExtension({
 
         requestAnimationFrame(() => {
             updateVisibility();
+            // Ensure node is wide enough for the upload button
+            if (node.size[0] < 350) {
+                node.setSize([350, node.size[1]]);
+            }
         });
     },
 });
