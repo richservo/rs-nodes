@@ -128,26 +128,41 @@ app.registerExtension({
         });
 
         // --- Snapshot all widgets for visibility management ---
-        let allWidgets = null;
+        let snapshotDone = false;
+
+        function hideWidget(w) {
+            if (w.element) w.element.style.display = "none";
+            if (!w._origType) w._origType = w.type;
+            w.type = "hidden";
+            w.computeSize = () => [0, -4];
+        }
+
+        function showWidget(w) {
+            if (w.element) w.element.style.display = "";
+            if (w._origType) {
+                w.type = w._origType;
+                delete w._origType;
+            }
+            delete w.computeSize;
+        }
 
         function updateVisibility() {
-            if (!allWidgets) {
-                allWidgets = [...node.widgets];
+            if (!snapshotDone) {
+                snapshotDone = true;
             }
 
-            const runInferenceWidget = allWidgets.find(
+            const runInferenceWidget = node.widgets.find(
                 (w) => w.name === "run_inference"
             );
             const inferencing = runInferenceWidget
                 ? runInferenceWidget.value
                 : true;
 
-            const modeWidget = allWidgets.find((w) => w.name === "mode");
+            const modeWidget = node.widgets.find((w) => w.name === "mode");
             const currentMode = modeWidget ? modeWidget.value : "all";
             const isOneShot = currentMode === "one_shot";
 
-            const visible = [];
-            for (const w of allWidgets) {
+            for (const w of node.widgets) {
                 const clipIdx = getClipIndex(w.name);
                 const isClipWidget =
                     clipIdx > 0 &&
@@ -160,29 +175,20 @@ app.registerExtension({
 
                 let show = true;
                 if (isClipWidget) {
-                    // In one_shot mode, show clip 1 controls only (for trim/pause)
-                    // In other modes, show up to currentClipCount
                     show = isOneShot
                         ? clipIdx === 1
                         : clipIdx <= currentClipCount;
                 } else if (w.name === "select_index") {
-                    // select_index only when mode=single and inferencing
                     show = inferencing && currentMode === "single";
                 } else if (INFERENCE_WIDGETS.has(w.name)) {
                     show = inferencing;
                 }
 
                 if (show) {
-                    visible.push(w);
-                    if (w.element) w.element.style.display = "";
+                    showWidget(w);
                 } else {
-                    if (w.element) w.element.style.display = "none";
+                    hideWidget(w);
                 }
-            }
-
-            node.widgets.length = 0;
-            for (const w of visible) {
-                node.widgets.push(w);
             }
 
             const sz = node.computeSize();
