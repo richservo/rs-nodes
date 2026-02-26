@@ -50,7 +50,7 @@ app.registerExtension({
                 bar,
                 { serialize: false }
             );
-            headers[i] = headerWidget;
+            headers[i] = { widget: headerWidget, label: label };
 
             // Position header before the first control widget for this clip
             const firstControl =
@@ -131,18 +131,26 @@ app.registerExtension({
         let snapshotDone = false;
 
         function hideWidget(w) {
-            if (w.element) w.element.style.display = "none";
+            if (w.element) {
+                w.element.hidden = true;
+                w.element.style.display = "none";
+            }
             if (!w._origType) w._origType = w.type;
             w.type = "hidden";
+            w.hidden = true;
             w.computeSize = () => [0, -4];
         }
 
         function showWidget(w) {
-            if (w.element) w.element.style.display = "";
+            if (w.element) {
+                w.element.hidden = false;
+                w.element.style.display = "";
+            }
             if (w._origType) {
                 w.type = w._origType;
                 delete w._origType;
             }
+            w.hidden = false;
             delete w.computeSize;
         }
 
@@ -223,6 +231,20 @@ app.registerExtension({
             // Update clip count from execution result
             if (output && output.clip_count && output.clip_count[0] != null) {
                 currentClipCount = output.clip_count[0];
+            }
+
+            // Update clip header labels with dialogue text
+            if (output && output.clip_labels) {
+                for (let i = 1; i <= MAX_CLIPS; i++) {
+                    if (!headers[i]) continue;
+                    const text = output.clip_labels[i - 1];
+                    if (text) {
+                        const truncated = text.length > 40 ? text.slice(0, 40) + "\u2026" : text;
+                        headers[i].label.textContent = "Clip " + i + " \u2014 " + truncated;
+                    } else {
+                        headers[i].label.textContent = "Clip " + i;
+                    }
+                }
             }
 
             // Update per-clip inline audio sources

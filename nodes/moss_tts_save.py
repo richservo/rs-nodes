@@ -1,3 +1,5 @@
+import difflib
+import gc
 import hashlib
 import os
 import re
@@ -45,24 +47,23 @@ def _run_generation(model, input_ids, attention_mask, model_id, processor,
                 self.do_samples = kwargs.get("do_samples", None)
                 self.n_vq_for_inference = kwargs.get("n_vq_for_inference", 32)
 
-        gen_config = _LocalGenerationConfig.from_pretrained(
-            model.config._name_or_path or model.config.name_or_path
-        )
-        gen_config.pad_token_id = processor.tokenizer.pad_token_id
-        gen_config.eos_token_id = 151653
-        gen_config.max_new_tokens = max_new_tokens
-        gen_config.temperature = 1.0
-        gen_config.top_p = top_p
-        gen_config.top_k = top_k
-        gen_config.repetition_penalty = repetition_penalty
-        gen_config.use_cache = True
-        gen_config.do_sample = False
-        gen_config.n_vq_for_inference = model.channels - 1
-        gen_config.do_samples = [True] * model.channels
-
         text_layer = {"repetition_penalty": 1.0, "temperature": 1.5, "top_p": 1.0, "top_k": top_k}
         audio_layer = {"repetition_penalty": repetition_penalty, "temperature": temperature, "top_p": top_p, "top_k": top_k}
-        gen_config.layers = [text_layer] + [audio_layer] * (model.channels - 1)
+
+        gen_config = _LocalGenerationConfig(
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=151653,
+            max_new_tokens=max_new_tokens,
+            temperature=1.0,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            use_cache=True,
+            do_sample=False,
+            n_vq_for_inference=model.channels - 1,
+            do_samples=[True] * model.channels,
+            layers=[text_layer] + [audio_layer] * (model.channels - 1),
+        )
 
         return model.generate(input_ids=input_ids, attention_mask=attention_mask, generation_config=gen_config)
     else:
@@ -201,90 +202,275 @@ class RSMossTTSSave:
         wav = _apply_handles(wav.cpu(), sample_rate, head_handle, tail_handle)
         return wav
 
-    def _segment_oneshot(self, wav_1d, num_segments, sample_rate, line_lengths=None):
-        """Split a one-shot waveform into segments using silence detection."""
-        if num_segments <= 1:
-            return [wav_1d]
+    # ------------------------------------------------------------------
+    #  Whisper-based word alignment
+    # ------------------------------------------------------------------
 
-        # Compute RMS energy in 20ms windows with 10ms hop
+    def _whisper_get_words(self, wav_1d, sample_rate):
+        """Transcribe audio with Whisper, return [(word, start_sec, end_sec)] or None."""
+        try:
+            import whisper
+        except ImportError:
+            print("[RSMossTTSSave] openai-whisper not installed — skipping Whisper alignment")
+            return None
+
+        import numpy as np
+
+        # Resample to 16 kHz mono (Whisper requirement)
+        if sample_rate != 16000:
+            wav_16k = torchaudio.functional.resample(
+                wav_1d.unsqueeze(0), sample_rate, 16000,
+            ).squeeze(0)
+        else:
+            wav_16k = wav_1d
+        audio_np = wav_16k.cpu().numpy().astype(np.float32)
+
+        # Use ComfyUI's whisper model cache dir if it exists
+        cache_dir = os.path.join(folder_paths.models_dir, "stt", "whisper")
+        if not os.path.isdir(cache_dir):
+            cache_dir = None
+
+        try:
+            print("[RSMossTTSSave] Loading Whisper base model...")
+            model = whisper.load_model("base", download_root=cache_dir)
+            result = model.transcribe(audio_np, word_timestamps=True)
+        except Exception as e:
+            print(f"[RSMossTTSSave] Whisper transcription failed: {e}")
+            return None
+        finally:
+            try:
+                del model
+            except NameError:
+                pass
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        words = []
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                text = w["word"].strip()
+                if text:
+                    words.append((text, w["start"], w["end"]))
+
+        if not words:
+            print("[RSMossTTSSave] Whisper returned no words")
+            return None
+
+        transcript = " ".join(w[0] for w in words)
+        print(f"[RSMossTTSSave] Whisper ({len(words)} words): {transcript[:120]}...")
+        return words
+
+    def _align_words_to_lines(self, words, lines, sample_rate):
+        """Match Whisper words to script lines via sequence alignment.
+
+        Returns list of (len(lines)-1) boundary sample positions, or None.
+        """
+
+        def norm(text):
+            return re.sub(r"[^a-z0-9]", "", text.lower())
+
+        # Flat script word list with line-index tracking
+        script_words = []
+        word_line_idx = []
+        for li, line in enumerate(lines):
+            for w in line.split():
+                n = norm(w)
+                if n:
+                    script_words.append(n)
+                    word_line_idx.append(li)
+        if not script_words:
+            return None
+
+        w_norms = [norm(w[0]) for w in words]
+
+        # Sequence-align Whisper output against the known script
+        sm = difflib.SequenceMatcher(None, w_norms, script_words, autojunk=False)
+
+        # Assign each Whisper word a line index
+        whisper_line = [-1] * len(words)
+        matched_count = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for k in range(i2 - i1):
+                    whisper_line[i1 + k] = word_line_idx[j1 + k]
+                matched_count += i2 - i1
+            elif tag == "replace":
+                w_len, s_len = i2 - i1, j2 - j1
+                for k in range(w_len):
+                    s_idx = j1 + min(int(k * s_len / w_len), s_len - 1)
+                    whisper_line[i1 + k] = word_line_idx[s_idx]
+
+        # Interpolate unassigned words from neighbours
+        for i in range(len(whisper_line)):
+            if whisper_line[i] != -1:
+                continue
+            left = right = -1
+            for j in range(i - 1, -1, -1):
+                if whisper_line[j] != -1:
+                    left = whisper_line[j]
+                    break
+            for j in range(i + 1, len(whisper_line)):
+                if whisper_line[j] != -1:
+                    right = whisper_line[j]
+                    break
+            whisper_line[i] = left if left != -1 else (right if right != -1 else 0)
+
+        total = max(len(w_norms), len(script_words))
+        ratio = matched_count / total if total else 0
+        print(f"[RSMossTTSSave] Alignment: {matched_count}/{total} words matched ({ratio:.0%})")
+        if ratio < 0.4:
+            print("[RSMossTTSSave] Alignment too poor, skipping Whisper boundaries")
+            return None
+
+        # Place boundaries between adjacent lines
+        needed = len(lines) - 1
+        boundaries = []
+        for li in range(needed):
+            last_wi = first_next_wi = -1
+            for wi in range(len(whisper_line)):
+                if whisper_line[wi] == li:
+                    last_wi = wi
+            for wi in range(len(whisper_line)):
+                if whisper_line[wi] == li + 1:
+                    first_next_wi = wi
+                    break
+
+            if last_wi >= 0 and first_next_wi >= 0:
+                boundary_sec = (words[last_wi][2] + words[first_next_wi][1]) / 2.0
+            elif last_wi >= 0:
+                boundary_sec = words[last_wi][2]
+            elif first_next_wi >= 0:
+                boundary_sec = words[first_next_wi][1]
+            else:
+                print(f"[RSMossTTSSave] No words for line boundary {li+1}, alignment failed")
+                return None
+
+            boundaries.append(int(boundary_sec * sample_rate))
+            print(f"[RSMossTTSSave] Boundary {li+1}: {boundary_sec:.3f}s (sample {boundaries[-1]})")
+
+        return boundaries
+
+    # ------------------------------------------------------------------
+    #  Silence-based fallback (DP)
+    # ------------------------------------------------------------------
+
+    def _silence_dp_boundaries(self, wav_1d, lines, sample_rate, processor=None):
+        """Fallback: pick cut points at silence regions via token-weighted DP."""
+        num_segments = len(lines)
+        total_samples = wav_1d.shape[0]
+        needed = num_segments - 1
+
+        # Proportional weights
+        if processor is not None:
+            try:
+                weights = [len(processor.tokenizer.encode(line)) for line in lines]
+            except Exception:
+                weights = [len(line) for line in lines]
+        else:
+            weights = [len(line) for line in lines]
+
+        total_weight = sum(weights) or num_segments
+        if total_weight == 0:
+            weights = [1] * num_segments
+            total_weight = num_segments
+
+        cum_targets = []
+        cumulative = 0
+        for w in weights[:-1]:
+            cumulative += w
+            cum_targets.append(cumulative / total_weight)
+
+        # Silence detection
         window_size = int(0.020 * sample_rate)
         hop_size = int(0.010 * sample_rate)
-        min_silence_frames = int(0.100 / 0.010)  # 100ms = 10 frames
-
+        min_silence_frames = int(0.100 / 0.010)
         num_frames = (wav_1d.shape[0] - window_size) // hop_size + 1
-        if num_frames <= 0:
-            return self._fallback_segment(wav_1d, num_segments, line_lengths)
 
-        # RMS energy per frame
-        rms = torch.zeros(num_frames)
-        for f in range(num_frames):
-            start = f * hop_size
-            frame = wav_1d[start:start + window_size].float()
-            rms[f] = torch.sqrt(torch.mean(frame ** 2))
+        silence_centers = []
+        if num_frames > 0:
+            rms = torch.zeros(num_frames)
+            for f in range(num_frames):
+                start = f * hop_size
+                frame = wav_1d[start:start + window_size].float()
+                rms[f] = torch.sqrt(torch.mean(frame ** 2))
 
-        # Silence threshold: 10% of mean RMS
-        threshold = rms.mean() * 0.1
-        is_silent = rms < threshold
+            threshold = rms.mean() * 0.1
+            is_silent = rms < threshold
 
-        # Find silence regions (consecutive silent frames >= min length)
-        silence_regions = []
-        start_frame = None
-        for f in range(num_frames):
-            if is_silent[f]:
-                if start_frame is None:
-                    start_frame = f
-            else:
-                if start_frame is not None:
-                    length = f - start_frame
-                    if length >= min_silence_frames:
-                        center = start_frame + length // 2
-                        silence_regions.append((center, length))
-                    start_frame = None
-        if start_frame is not None:
-            length = num_frames - start_frame
-            if length >= min_silence_frames:
-                center = start_frame + length // 2
-                silence_regions.append((center, length))
+            start_frame = None
+            for f in range(num_frames):
+                if is_silent[f]:
+                    if start_frame is None:
+                        start_frame = f
+                else:
+                    if start_frame is not None:
+                        length = f - start_frame
+                        if length >= min_silence_frames:
+                            silence_centers.append((start_frame + length // 2) * hop_size)
+                        start_frame = None
+            if start_frame is not None:
+                length = num_frames - start_frame
+                if length >= min_silence_frames:
+                    silence_centers.append((start_frame + length // 2) * hop_size)
 
-        needed = num_segments - 1
-        if len(silence_regions) < needed:
-            print(f"[RSMossTTSSave] Only found {len(silence_regions)} silence gaps, "
-                  f"need {needed} — falling back to proportional split")
-            return self._fallback_segment(wav_1d, num_segments, line_lengths)
+        K = len(silence_centers)
+        print(f"[RSMossTTSSave] Silence fallback: {K} regions, {needed} cuts needed")
 
-        # Pick the N-1 most prominent (longest) silence gaps
-        silence_regions.sort(key=lambda x: x[1], reverse=True)
-        split_frames = sorted([r[0] for r in silence_regions[:needed]])
+        if K < needed:
+            return [int(total_samples * t) for t in cum_targets]
 
-        # Convert to sample indices and split
-        segments = []
-        prev = 0
-        for sf in split_frames:
-            split_sample = sf * hop_size
-            segments.append(wav_1d[prev:split_sample])
-            prev = split_sample
-        segments.append(wav_1d[prev:])
+        INF = float("inf")
+        dp = [[INF] * K for _ in range(needed)]
+        parent = [[-1] * K for _ in range(needed)]
 
-        return segments
+        for k in range(K):
+            dp[0][k] = (silence_centers[k] / total_samples - cum_targets[0]) ** 2
 
-    def _fallback_segment(self, wav_1d, num_segments, line_lengths=None):
-        """Split waveform proportionally by line character counts."""
-        total_samples = wav_1d.shape[0]
+        for j in range(1, needed):
+            best_prev, best_prev_k = INF, -1
+            for k in range(K):
+                if k > 0 and dp[j - 1][k - 1] < best_prev:
+                    best_prev = dp[j - 1][k - 1]
+                    best_prev_k = k - 1
+                if best_prev < INF:
+                    cost = best_prev + (silence_centers[k] / total_samples - cum_targets[j]) ** 2
+                    if cost < dp[j][k]:
+                        dp[j][k] = cost
+                        parent[j][k] = best_prev_k
 
-        if line_lengths and len(line_lengths) == num_segments:
-            total_chars = sum(line_lengths)
-            if total_chars > 0:
-                boundaries = []
-                cumulative = 0
-                for length in line_lengths[:-1]:
-                    cumulative += length
-                    boundaries.append(int(total_samples * cumulative / total_chars))
-            else:
-                boundaries = [int(total_samples * (i + 1) / num_segments)
-                              for i in range(num_segments - 1)]
-        else:
-            boundaries = [int(total_samples * (i + 1) / num_segments)
-                          for i in range(num_segments - 1)]
+        best_k = min(range(K), key=lambda k: dp[needed - 1][k])
+        chosen = [0] * needed
+        chosen[needed - 1] = best_k
+        for j in range(needed - 2, -1, -1):
+            chosen[j] = parent[j + 1][chosen[j + 1]]
+
+        return [silence_centers[ci] for ci in chosen]
+
+    # ------------------------------------------------------------------
+    #  Main segmentation entry point
+    # ------------------------------------------------------------------
+
+    def _segment_oneshot(self, wav_1d, lines, sample_rate, processor=None):
+        """Split one-shot waveform into per-line segments.
+
+        Tries Whisper word-level alignment first for precise cuts,
+        falls back to silence-based DP if Whisper is unavailable or fails.
+        """
+        if len(lines) <= 1:
+            return [wav_1d]
+
+        # --- Try Whisper ---
+        boundaries = None
+        whisper_words = self._whisper_get_words(wav_1d, sample_rate)
+        if whisper_words is not None:
+            boundaries = self._align_words_to_lines(whisper_words, lines, sample_rate)
+            if boundaries is not None:
+                print("[RSMossTTSSave] Using Whisper word-aligned boundaries")
+
+        # --- Fallback: silence DP ---
+        if boundaries is None:
+            print("[RSMossTTSSave] Falling back to silence-based segmentation")
+            boundaries = self._silence_dp_boundaries(wav_1d, lines, sample_rate, processor)
 
         segments = []
         prev = 0
@@ -469,6 +655,7 @@ class RSMossTTSSave:
 
         concat_count = 0
         ui_audio = []
+        clip_labels = []
 
         # --- Generation phase ---
         if run_inference:
@@ -483,6 +670,7 @@ class RSMossTTSSave:
             model.to(device)
             if hasattr(processor, "audio_tokenizer"):
                 processor.audio_tokenizer.to(device)
+            gc.collect()  # Free stale CPU tensor memory from previous offload
 
             # Encode reference audio once
             reference = None
@@ -499,10 +687,11 @@ class RSMossTTSSave:
 
             lines = _parse_dialogue_list(dialogue_list)
             total = len(lines)
+            clip_labels = lines
 
             if total == 0:
                 empty_audio = {"waveform": torch.zeros(1, 1, 1), "sample_rate": sample_rate}
-                return {"ui": {"audio": [], "clip_count": [0]}, "result": (empty_audio,)}
+                return {"ui": {"audio": [], "clip_count": [0], "clip_labels": []}, "result": (empty_audio,)}
 
             if mode == "one_shot":
                 # Concat all dialogue lines into a single text, generate once
@@ -522,8 +711,7 @@ class RSMossTTSSave:
                 self._save_oneshot(wav_1d, sample_rate, filename_prefix, format)
 
                 # Segment into individual clips
-                line_lengths = [len(line) for line in lines]
-                segments = self._segment_oneshot(wav_1d, total, sample_rate, line_lengths)
+                segments = self._segment_oneshot(wav_1d, lines, sample_rate, processor)
                 for clip_num, seg in enumerate(segments, 1):
                     info = self._save_one(seg, sample_rate, filename_prefix, clip_num, format)
                     ui_audio.append(info)
@@ -560,6 +748,7 @@ class RSMossTTSSave:
             if hasattr(processor, "audio_tokenizer"):
                 processor.audio_tokenizer.cpu()
             del reference
+            gc.collect()  # Collect stale GPU tensor references before clearing CUDA cache
             torch.cuda.empty_cache()
             mm.soft_empty_cache()
         else:
@@ -589,11 +778,15 @@ class RSMossTTSSave:
                         raise ValueError("dialogue_list is empty — cannot segment one-shot file.")
                     wav_os, sr_os = torchaudio.load(oneshot_path)
                     wav_1d_os = wav_os.mean(dim=0) if wav_os.shape[0] > 1 else wav_os.squeeze(0)
-                    line_lengths = [len(line) for line in lines]
-                    segments = self._segment_oneshot(wav_1d_os, num_lines, sr_os, line_lengths)
+                    segments = self._segment_oneshot(wav_1d_os, lines, sr_os)
                     for clip_num, seg in enumerate(segments, 1):
                         self._save_one(seg, sr_os, filename_prefix, clip_num, format)
                     concat_count = num_lines
+                    clip_labels = lines
+
+                # Parse labels from dialogue_list if available and not already set
+                if not clip_labels and dialogue_list:
+                    clip_labels = _parse_dialogue_list(dialogue_list)
 
                 # Build ui_audio from numbered clips
                 for i in range(1, concat_count + 1):
@@ -610,6 +803,9 @@ class RSMossTTSSave:
                         f"(expected {filename_prefix}_001.{format} in input directory). "
                         f"Enable run_inference to generate them."
                     )
+
+                if dialogue_list:
+                    clip_labels = _parse_dialogue_list(dialogue_list)
 
                 # Build ui_audio entries for preview (split subfolder like _save_one)
                 for i in range(1, concat_count + 1):
@@ -629,6 +825,6 @@ class RSMossTTSSave:
         full_audio_info = self._save_full(audio_dict, filename_prefix, format)
 
         return {
-            "ui": {"audio": ui_audio, "full_audio": [full_audio_info], "clip_count": [concat_count]},
+            "ui": {"audio": ui_audio, "full_audio": [full_audio_info], "clip_count": [concat_count], "clip_labels": clip_labels},
             "result": (audio_dict,),
         }
