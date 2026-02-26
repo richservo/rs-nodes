@@ -131,6 +131,7 @@ class RSMossTTSSave:
 
     def check_lazy_status(self, run_inference, **kwargs):
         needed = []
+        mode = kwargs.get("mode", "all")
         if run_inference:
             if kwargs.get("moss_pipe") is None:
                 needed.append("moss_pipe")
@@ -138,6 +139,10 @@ class RSMossTTSSave:
                 needed.append("dialogue_list")
             if kwargs.get("reference_audio") is None:
                 needed.append("reference_audio")
+        elif mode == "one_shot":
+            # May need dialogue_list to segment oneshot file if numbered clips don't exist
+            if kwargs.get("dialogue_list") is None:
+                needed.append("dialogue_list")
         return needed
 
     @classmethod
@@ -158,7 +163,7 @@ class RSMossTTSSave:
                 break
         # Also hash per-clip trim/pause values
         for i in range(1, _MAX_CLIPS + 1):
-            for field in ("start_time", "end_time", "pause_after"):
+            for field in ("start_time", "end_time", "pause_after", "pause_before"):
                 val = kwargs.get(f"{field}_{i}", 0.0)
                 h.update(f"{field}_{i}:{val}".encode())
         return h.hexdigest()
@@ -188,11 +193,107 @@ class RSMossTTSSave:
             )
 
         messages = processor.decode(outputs)
+        del outputs, input_ids, attention_mask
+
         if messages[0] is None:
             return None
         wav = messages[0].audio_codes_list[0]
         wav = _apply_handles(wav.cpu(), sample_rate, head_handle, tail_handle)
         return wav
+
+    def _segment_oneshot(self, wav_1d, num_segments, sample_rate, line_lengths=None):
+        """Split a one-shot waveform into segments using silence detection."""
+        if num_segments <= 1:
+            return [wav_1d]
+
+        # Compute RMS energy in 20ms windows with 10ms hop
+        window_size = int(0.020 * sample_rate)
+        hop_size = int(0.010 * sample_rate)
+        min_silence_frames = int(0.100 / 0.010)  # 100ms = 10 frames
+
+        num_frames = (wav_1d.shape[0] - window_size) // hop_size + 1
+        if num_frames <= 0:
+            return self._fallback_segment(wav_1d, num_segments, line_lengths)
+
+        # RMS energy per frame
+        rms = torch.zeros(num_frames)
+        for f in range(num_frames):
+            start = f * hop_size
+            frame = wav_1d[start:start + window_size].float()
+            rms[f] = torch.sqrt(torch.mean(frame ** 2))
+
+        # Silence threshold: 10% of mean RMS
+        threshold = rms.mean() * 0.1
+        is_silent = rms < threshold
+
+        # Find silence regions (consecutive silent frames >= min length)
+        silence_regions = []
+        start_frame = None
+        for f in range(num_frames):
+            if is_silent[f]:
+                if start_frame is None:
+                    start_frame = f
+            else:
+                if start_frame is not None:
+                    length = f - start_frame
+                    if length >= min_silence_frames:
+                        center = start_frame + length // 2
+                        silence_regions.append((center, length))
+                    start_frame = None
+        if start_frame is not None:
+            length = num_frames - start_frame
+            if length >= min_silence_frames:
+                center = start_frame + length // 2
+                silence_regions.append((center, length))
+
+        needed = num_segments - 1
+        if len(silence_regions) < needed:
+            print(f"[RSMossTTSSave] Only found {len(silence_regions)} silence gaps, "
+                  f"need {needed} — falling back to proportional split")
+            return self._fallback_segment(wav_1d, num_segments, line_lengths)
+
+        # Pick the N-1 most prominent (longest) silence gaps
+        silence_regions.sort(key=lambda x: x[1], reverse=True)
+        split_frames = sorted([r[0] for r in silence_regions[:needed]])
+
+        # Convert to sample indices and split
+        segments = []
+        prev = 0
+        for sf in split_frames:
+            split_sample = sf * hop_size
+            segments.append(wav_1d[prev:split_sample])
+            prev = split_sample
+        segments.append(wav_1d[prev:])
+
+        return segments
+
+    def _fallback_segment(self, wav_1d, num_segments, line_lengths=None):
+        """Split waveform proportionally by line character counts."""
+        total_samples = wav_1d.shape[0]
+
+        if line_lengths and len(line_lengths) == num_segments:
+            total_chars = sum(line_lengths)
+            if total_chars > 0:
+                boundaries = []
+                cumulative = 0
+                for length in line_lengths[:-1]:
+                    cumulative += length
+                    boundaries.append(int(total_samples * cumulative / total_chars))
+            else:
+                boundaries = [int(total_samples * (i + 1) / num_segments)
+                              for i in range(num_segments - 1)]
+        else:
+            boundaries = [int(total_samples * (i + 1) / num_segments)
+                          for i in range(num_segments - 1)]
+
+        segments = []
+        prev = 0
+        for b in boundaries:
+            segments.append(wav_1d[prev:b])
+            prev = b
+        segments.append(wav_1d[prev:])
+
+        return segments
 
     def _save_one(self, wav_1d, sample_rate, filename_prefix, index, fmt):
         wav_2d = wav_1d.unsqueeze(0)  # [1, S]
@@ -378,6 +479,11 @@ class RSMossTTSSave:
 
             model, processor, sample_rate, device, model_id = moss_pipe
 
+            # Ensure model is on GPU (may have been offloaded after previous run)
+            model.to(device)
+            if hasattr(processor, "audio_tokenizer"):
+                processor.audio_tokenizer.to(device)
+
             # Encode reference audio once
             reference = None
             if reference_audio is not None:
@@ -412,9 +518,16 @@ class RSMossTTSSave:
                 if wav_1d is None:
                     raise ValueError("One-shot generation failed — model returned no audio")
 
-                info = self._save_oneshot(wav_1d, sample_rate, filename_prefix, format)
-                ui_audio.append(info)
-                concat_count = 0  # no numbered clips to concat
+                # Save the raw one-shot file as a reference copy
+                self._save_oneshot(wav_1d, sample_rate, filename_prefix, format)
+
+                # Segment into individual clips
+                line_lengths = [len(line) for line in lines]
+                segments = self._segment_oneshot(wav_1d, total, sample_rate, line_lengths)
+                for clip_num, seg in enumerate(segments, 1):
+                    info = self._save_one(seg, sample_rate, filename_prefix, clip_num, format)
+                    ui_audio.append(info)
+                concat_count = total
             else:
                 if mode == "single":
                     idx = min(select_index, total) - 1
@@ -442,28 +555,52 @@ class RSMossTTSSave:
 
                 concat_count = total
 
+            # Offload model to CPU to free VRAM for other workflows
+            model.cpu()
+            if hasattr(processor, "audio_tokenizer"):
+                processor.audio_tokenizer.cpu()
+            del reference
+            torch.cuda.empty_cache()
             mm.soft_empty_cache()
         else:
             # No inference — load from disk based on mode
             input_dir = folder_paths.get_input_directory()
 
             if mode == "one_shot":
-                # Load the one-shot file directly
-                oneshot_filename = f"{filename_prefix}_oneshot.{format}"
-                oneshot_path = os.path.join(input_dir, oneshot_filename)
-                if not os.path.isfile(oneshot_path):
-                    raise ValueError(
-                        f"One-shot file not found: {oneshot_filename}. "
-                        f"Enable run_inference with mode=one_shot to generate it."
-                    )
-                concat_count = 0  # signal to skip numbered concat
-                subfolder = ""
-                view_filename = oneshot_filename
-                if "/" in oneshot_filename or "\\" in oneshot_filename:
-                    parts = oneshot_filename.replace("\\", "/")
-                    subfolder = parts.rsplit("/", 1)[0]
-                    view_filename = parts.rsplit("/", 1)[1]
-                ui_audio.append({"filename": view_filename, "subfolder": subfolder, "type": "input"})
+                # Discover numbered clips from previous segmentation
+                concat_count = _discover_clip_count(filename_prefix, format)
+                if concat_count == 0:
+                    # No numbered clips — try to segment the oneshot file
+                    oneshot_filename = f"{filename_prefix}_oneshot.{format}"
+                    oneshot_path = os.path.join(input_dir, oneshot_filename)
+                    if not os.path.isfile(oneshot_path):
+                        raise ValueError(
+                            f"No clip files or one-shot file found for prefix '{filename_prefix}'. "
+                            f"Enable run_inference with mode=one_shot to generate them."
+                        )
+                    if not dialogue_list:
+                        raise ValueError(
+                            "dialogue_list must be connected to segment the one-shot file. "
+                            "Connect the dialogue list or run inference first."
+                        )
+                    lines = _parse_dialogue_list(dialogue_list)
+                    num_lines = len(lines)
+                    if num_lines == 0:
+                        raise ValueError("dialogue_list is empty — cannot segment one-shot file.")
+                    wav_os, sr_os = torchaudio.load(oneshot_path)
+                    wav_1d_os = wav_os.mean(dim=0) if wav_os.shape[0] > 1 else wav_os.squeeze(0)
+                    line_lengths = [len(line) for line in lines]
+                    segments = self._segment_oneshot(wav_1d_os, num_lines, sr_os, line_lengths)
+                    for clip_num, seg in enumerate(segments, 1):
+                        self._save_one(seg, sr_os, filename_prefix, clip_num, format)
+                    concat_count = num_lines
+
+                # Build ui_audio from numbered clips
+                for i in range(1, concat_count + 1):
+                    filename = f"{filename_prefix}_{i:03d}.{format}"
+                    filepath = os.path.join(input_dir, filename)
+                    if os.path.isfile(filepath):
+                        ui_audio.append(self._split_filename(filename))
             else:
                 # all or single — discover numbered clips on disk
                 concat_count = _discover_clip_count(filename_prefix, format)
@@ -487,44 +624,9 @@ class RSMossTTSSave:
                             view_filename = parts.rsplit("/", 1)[1]
                         ui_audio.append({"filename": view_filename, "subfolder": subfolder, "type": "input"})
 
-        # --- Output phase ---
-        if mode == "one_shot":
-            # One-shot: load the file, apply clip 1 trim/pause, save as _full
-            oneshot_path = os.path.join(
-                folder_paths.get_input_directory(),
-                f"{filename_prefix}_oneshot.{format}",
-            )
-            wav, sr = torchaudio.load(oneshot_path)
-            if wav.shape[0] > 1:
-                wav = wav.mean(dim=0, keepdim=True)
-
-            # Apply clip 1 trim
-            start_trim = kwargs.get("start_time_1", 0.0)
-            end_trim = kwargs.get("end_time_1", 0.0)
-            start_sample = int(start_trim * sr)
-            end_sample = wav.shape[1] - int(end_trim * sr)
-            wav = wav[:, start_sample:max(start_sample, end_sample)]
-
-            # Apply pause before/after
-            parts = []
-            pause_before = kwargs.get("pause_before_1", 0.0)
-            if pause_before > 0:
-                parts.append(torch.zeros(1, int(pause_before * sr)))
-            parts.append(wav)
-            pause_after = kwargs.get("pause_after_1", 0.0)
-            if pause_after > 0:
-                parts.append(torch.zeros(1, int(pause_after * sr)))
-
-            if len(parts) > 1:
-                wav = torch.cat(parts, dim=1)
-
-            audio_dict = {"waveform": wav.unsqueeze(0), "sample_rate": sr}
-            full_audio_info = self._save_full(audio_dict, filename_prefix, format)
-        else:
-            # all/single: concat numbered clips with trim/pause
-            audio_dict = self._concat_clips(concat_count, filename_prefix, format, **kwargs)
-            # Save the concatenated result as a full clip file
-            full_audio_info = self._save_full(audio_dict, filename_prefix, format)
+        # --- Output phase (unified for all modes) ---
+        audio_dict = self._concat_clips(concat_count, filename_prefix, format, **kwargs)
+        full_audio_info = self._save_full(audio_dict, filename_prefix, format)
 
         return {
             "ui": {"audio": ui_audio, "full_audio": [full_audio_info], "clip_count": [concat_count]},

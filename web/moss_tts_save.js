@@ -160,7 +160,6 @@ app.registerExtension({
 
             const modeWidget = node.widgets.find((w) => w.name === "mode");
             const currentMode = modeWidget ? modeWidget.value : "all";
-            const isOneShot = currentMode === "one_shot";
 
             for (const w of node.widgets) {
                 const clipIdx = getClipIndex(w.name);
@@ -175,9 +174,7 @@ app.registerExtension({
 
                 let show = true;
                 if (isClipWidget) {
-                    show = isOneShot
-                        ? clipIdx === 1
-                        : clipIdx <= currentClipCount;
+                    show = clipIdx <= currentClipCount;
                 } else if (w.name === "select_index") {
                     show = inferencing && currentMode === "single";
                 } else if (INFERENCE_WIDGETS.has(w.name)) {
