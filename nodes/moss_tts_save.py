@@ -96,7 +96,7 @@ class RSMossTTSSave:
                 "run_inference": ("BOOLEAN", {"default": True}),
                 "filename_prefix": ("STRING", {"default": "clip"}),
                 "format": (["wav", "flac", "mp3", "ogg"],),
-                "mode": (["all", "single", "one_shot"],),
+                "mode": (["one_shot", "all", "single"],),
             },
             "optional": {
                 "moss_pipe": ("MOSS_TTS_PIPE", {"lazy": True}),
@@ -140,8 +140,8 @@ class RSMossTTSSave:
                 needed.append("dialogue_list")
             if kwargs.get("reference_audio") is None:
                 needed.append("reference_audio")
-        elif mode == "one_shot":
-            # May need dialogue_list to segment oneshot file if numbered clips don't exist
+        else:
+            # Need dialogue_list for clip labels and one_shot segmentation
             if kwargs.get("dialogue_list") is None:
                 needed.append("dialogue_list")
         return needed
@@ -713,9 +713,7 @@ class RSMossTTSSave:
                 # Segment into individual clips
                 segments = self._segment_oneshot(wav_1d, lines, sample_rate, processor)
                 for clip_num, seg in enumerate(segments, 1):
-                    info = self._save_one(seg, sample_rate, filename_prefix, clip_num, format)
-                    ui_audio.append(info)
-                concat_count = total
+                    self._save_one(seg, sample_rate, filename_prefix, clip_num, format)
             else:
                 if mode == "single":
                     idx = min(select_index, total) - 1
@@ -738,10 +736,17 @@ class RSMossTTSSave:
                         print(f"[RSMossTTSSave] Warning: generation failed for clip {clip_num}, skipping")
                         continue
 
-                    info = self._save_one(wav_1d, sample_rate, filename_prefix, clip_num, format)
-                    ui_audio.append(info)
+                    self._save_one(wav_1d, sample_rate, filename_prefix, clip_num, format)
 
-                concat_count = total
+            concat_count = total
+
+            # Build ui_audio from ALL clips on disk (not just generated ones)
+            input_dir = folder_paths.get_input_directory()
+            for i in range(1, concat_count + 1):
+                filename = f"{filename_prefix}_{i:03d}.{format}"
+                filepath = os.path.join(input_dir, filename)
+                if os.path.isfile(filepath):
+                    ui_audio.append(self._split_filename(filename))
 
             # Offload model to CPU to free VRAM for other workflows
             model.cpu()
