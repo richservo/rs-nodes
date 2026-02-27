@@ -66,6 +66,7 @@ class RSLTXVGenerate:
                 "upscale_steps":     ("INT",   {"default": 4,   "min": 1,   "max": 10000}),
                 "upscale_cfg":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "upscale_denoise":   ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,   "step": 0.01}),
+                "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": True}),
                 # Overrides
@@ -136,6 +137,7 @@ class RSLTXVGenerate:
         upscale_steps=4,
         upscale_cfg=1.0,
         upscale_denoise=0.5,
+        upscale_fallback=False,
         # Output
         decode=False,
         # Overrides
@@ -164,6 +166,7 @@ class RSLTXVGenerate:
                 upscale_lora=upscale_lora, upscale_lora_strength=upscale_lora_strength,
                 upscale_steps=upscale_steps, upscale_cfg=upscale_cfg,
                 upscale_denoise=upscale_denoise,
+                upscale_fallback=upscale_fallback,
                 decode=decode,
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
@@ -184,7 +187,7 @@ class RSLTXVGenerate:
         audio_cfg, stg_scale, stg_blocks, rescale, modality_scale,
         attention_mode, ffn_chunks,
         upscale, upscale_model, upscale_lora, upscale_lora_strength,
-        upscale_steps, upscale_cfg, upscale_denoise,
+        upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
         decode,
         guider, sampler, sigmas,
         max_shift, base_shift,
@@ -473,147 +476,162 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         if do_upscale:
-            # Spatial upscale is video-only (AV already separated in section 6)
-            print("[RSLTXVGenerate] Upscaling video latents (2x spatial)")
-            self._free_vram()
-
-            device = mm.get_torch_device()
-            model_dtype = next(upscale_model.parameters()).dtype
-            up_latents = output_latent["samples"]
-            input_dtype = up_latents.dtype
-
-            memory_required = mm.module_size(upscale_model)
-            memory_required += math.prod(up_latents.shape) * 3000.0
-            mm.free_memory(memory_required, device)
-
+            if upscale_fallback:
+                pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
-                upscale_model.to(device)
-                up_latents = up_latents.to(dtype=model_dtype, device=device)
-                up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
-                upsampled = upscale_model(up_latents)
-            finally:
-                upscale_model.cpu()
-
-            upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
-            upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
-            output_latent = {"samples": upsampled}
-
-            # Re-inject guide images at full resolution into upscaled latent
-            up_denoise_mask = None
-            time_sf, up_height_sf, up_width_sf = vae.downscale_index_formula
-            _, _, up_latent_t, up_lh, up_lw = upsampled.shape
-            up_target_w, up_target_h = up_lw * up_width_sf, up_lh * up_height_sf
-
-            up_guides = []
-            if first_image is not None:
-                up_guides.append((first_image, 0, first_strength, "first"))
-            if middle_image is not None:
-                mid_idx = (num_frames - 1) // 2
-                mid_idx = max(0, (mid_idx // 8) * 8)
-                if mid_idx == 0 and num_frames > 8:
-                    mid_idx = 8
-                mid_latent_idx = (mid_idx + time_sf - 1) // time_sf
-                up_guides.append((middle_image, mid_latent_idx, middle_strength, "middle"))
-            if last_image is not None:
-                up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
-
-            if up_guides:
-                up_denoise_mask = torch.ones(
-                    (upsampled.shape[0], 1, up_latent_t, 1, 1),
-                    dtype=upsampled.dtype, device=upsampled.device,
-                )
-                for img, latent_idx, strength_val, label in up_guides:
-                    src_h, src_w = img.shape[1], img.shape[2]
-                    if src_h != up_target_h or src_w != up_target_w:
-                        up_pixels = comfy.utils.common_upscale(
-                            img.movedim(-1, 1), up_target_w, up_target_h, "bilinear", "center"
-                        ).movedim(1, -1)
-                    else:
-                        up_pixels = img
-                    up_t = vae.encode(up_pixels[:, :, :, :3])
-
-                    end_idx = min(latent_idx + up_t.shape[2], up_latent_t)
-                    upsampled[:, :, latent_idx:end_idx] = up_t[:, :, :end_idx - latent_idx]
-                    up_denoise_mask[:, :, latent_idx:end_idx] = 1.0 - strength_val
-                    print(f"[RSLTXVGenerate] Upscale re-inject {label} frame at full res ({up_target_w}x{up_target_h}), latent_idx={latent_idx}")
-
-                output_latent = {"samples": upsampled}
-
-            # Re-diffusion at upscaled resolution
-            if upscale_denoise > 0 and upscale_steps > 0:
-                print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({upscale_steps} steps, cfg={upscale_cfg})")
+                # Spatial upscale is video-only (AV already separated in section 6)
+                print("[RSLTXVGenerate] Upscaling video latents (2x spatial)")
                 self._free_vram()
 
-                # Recombine video + audio for the AV model
-                if has_audio and audio_latent_out is not None:
-                    up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
-                    if up_denoise_mask is not None:
-                        audio_mask = torch.ones_like(audio_latent_out[:, :1])
-                        up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
-                else:
-                    up_combined = upsampled
+                device = mm.get_torch_device()
+                model_dtype = next(upscale_model.parameters()).dtype
+                up_latents = output_latent["samples"]
+                input_dtype = up_latents.dtype
 
-                # Apply upscale LoRA to a fresh clone
-                up_model = m.clone()
-                if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
-                    lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
-                    lora = None
-                    if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
-                        lora = self.loaded_lora[1]
-                    if lora is None:
-                        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                        self.loaded_lora = (lora_path, lora)
-                    up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
-                    print(f"[RSLTXVGenerate] Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+                memory_required = mm.module_size(upscale_model)
+                memory_required += math.prod(up_latents.shape) * 3000.0
+                mm.free_memory(memory_required, device)
 
-                up_tokens = math.prod(upsampled.shape[2:])
-                up_shift = up_tokens * mm_shift + b
+                try:
+                    upscale_model.to(device)
+                    up_latents = up_latents.to(dtype=model_dtype, device=device)
+                    up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
+                    upsampled = upscale_model(up_latents)
+                finally:
+                    upscale_model.cpu()
 
-                up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
-                up_model_sampling.set_parameters(shift=up_shift)
-                up_model.add_object_patch("model_sampling", up_model_sampling)
+                upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
+                upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+                output_latent = {"samples": upsampled}
 
-                up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1)
-                up_sig = torch.where(
-                    up_sig != 0,
-                    math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
-                    torch.zeros_like(up_sig),
-                )
-                non_zero = up_sig != 0
-                nz_sigmas = up_sig[non_zero]
-                omz = 1.0 - nz_sigmas
-                sf = omz[-1] / (1.0 - 0.1)
-                up_sig[non_zero] = 1.0 - (omz / sf)
+                # Re-inject guide images at full resolution into upscaled latent
+                up_denoise_mask = None
+                time_sf, up_height_sf, up_width_sf = vae.downscale_index_formula
+                _, _, up_latent_t, up_lh, up_lw = upsampled.shape
+                up_target_w, up_target_h = up_lw * up_width_sf, up_lh * up_height_sf
 
-                # Trim to denoise strength
-                start_step = int((1.0 - upscale_denoise) * upscale_steps)
-                up_sig = up_sig[start_step:]
+                up_guides = []
+                if first_image is not None:
+                    up_guides.append((first_image, 0, first_strength, "first"))
+                if middle_image is not None:
+                    mid_idx = (num_frames - 1) // 2
+                    mid_idx = max(0, (mid_idx // 8) * 8)
+                    if mid_idx == 0 and num_frames > 8:
+                        mid_idx = 8
+                    mid_latent_idx = (mid_idx + time_sf - 1) // time_sf
+                    up_guides.append((middle_image, mid_latent_idx, middle_strength, "middle"))
+                if last_image is not None:
+                    up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
 
-                up_guider = comfy.samplers.CFGGuider(up_model)
-                up_guider.set_conds(positive, negative)
-                up_guider.set_cfg(upscale_cfg)
+                if up_guides:
+                    up_denoise_mask = torch.ones(
+                        (upsampled.shape[0], 1, up_latent_t, 1, 1),
+                        dtype=upsampled.dtype, device=upsampled.device,
+                    )
+                    for img, latent_idx, strength_val, label in up_guides:
+                        src_h, src_w = img.shape[1], img.shape[2]
+                        if src_h != up_target_h or src_w != up_target_w:
+                            up_pixels = comfy.utils.common_upscale(
+                                img.movedim(-1, 1), up_target_w, up_target_h, "bilinear", "center"
+                            ).movedim(1, -1)
+                        else:
+                            up_pixels = img
+                        up_t = vae.encode(up_pixels[:, :, :, :3])
 
-                up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
-                up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
-                up_sampler = comfy.samplers.sampler_object("euler_ancestral")
-                up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                        end_idx = min(latent_idx + up_t.shape[2], up_latent_t)
+                        upsampled[:, :, latent_idx:end_idx] = up_t[:, :, :end_idx - latent_idx]
+                        up_denoise_mask[:, :, latent_idx:end_idx] = 1.0 - strength_val
+                        print(f"[RSLTXVGenerate] Upscale re-inject {label} frame at full res ({up_target_w}x{up_target_h}), latent_idx={latent_idx}")
 
-                up_samples = up_guider.sample(
-                    up_noise, up_latent_image, up_sampler, up_sig,
-                    denoise_mask=up_denoise_mask,
-                    callback=up_callback,
-                    disable_pbar=disable_pbar,
-                    seed=seed + 1,
-                )
-                up_samples = up_samples.to(mm.intermediate_device())
+                    output_latent = {"samples": upsampled}
 
-                # Separate AV again after re-diffusion
-                if up_samples.is_nested:
-                    up_parts = up_samples.unbind()
-                    output_latent = {"samples": up_parts[0]}
-                    audio_latent_out = up_parts[1] if len(up_parts) > 1 else audio_latent_out
-                else:
-                    output_latent = {"samples": up_samples}
+                # Re-diffusion at upscaled resolution
+                if upscale_denoise > 0 and upscale_steps > 0:
+                    print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({upscale_steps} steps, cfg={upscale_cfg})")
+                    self._free_vram()
+
+                    # Recombine video + audio for the AV model
+                    if has_audio and audio_latent_out is not None:
+                        up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
+                        if up_denoise_mask is not None:
+                            audio_mask = torch.ones_like(audio_latent_out[:, :1])
+                            up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
+                    else:
+                        up_combined = upsampled
+
+                    # Apply upscale LoRA to a fresh clone
+                    up_model = m.clone()
+                    if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                        lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                        lora = None
+                        if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
+                            lora = self.loaded_lora[1]
+                        if lora is None:
+                            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                            self.loaded_lora = (lora_path, lora)
+                        up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
+                        print(f"[RSLTXVGenerate] Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+
+                    up_tokens = math.prod(upsampled.shape[2:])
+                    up_shift = up_tokens * mm_shift + b
+
+                    up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
+                    up_model_sampling.set_parameters(shift=up_shift)
+                    up_model.add_object_patch("model_sampling", up_model_sampling)
+
+                    up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1)
+                    up_sig = torch.where(
+                        up_sig != 0,
+                        math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
+                        torch.zeros_like(up_sig),
+                    )
+                    non_zero = up_sig != 0
+                    nz_sigmas = up_sig[non_zero]
+                    omz = 1.0 - nz_sigmas
+                    sf = omz[-1] / (1.0 - 0.1)
+                    up_sig[non_zero] = 1.0 - (omz / sf)
+
+                    # Trim to denoise strength
+                    start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                    up_sig = up_sig[start_step:]
+
+                    up_guider = comfy.samplers.CFGGuider(up_model)
+                    up_guider.set_conds(positive, negative)
+                    up_guider.set_cfg(upscale_cfg)
+
+                    up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
+                    up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
+                    up_sampler = comfy.samplers.sampler_object("euler_ancestral")
+                    up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+
+                    up_samples = up_guider.sample(
+                        up_noise, up_latent_image, up_sampler, up_sig,
+                        denoise_mask=up_denoise_mask,
+                        callback=up_callback,
+                        disable_pbar=disable_pbar,
+                        seed=seed + 1,
+                    )
+                    up_samples = up_samples.to(mm.intermediate_device())
+
+                    # Separate AV again after re-diffusion
+                    if up_samples.is_nested:
+                        up_parts = up_samples.unbind()
+                        output_latent = {"samples": up_parts[0]}
+                        audio_latent_out = up_parts[1] if len(up_parts) > 1 else audio_latent_out
+                    else:
+                        output_latent = {"samples": up_samples}
+
+                if upscale_fallback:
+                    del pre_upscale_latent  # free system RAM backup
+
+            except Exception as e:
+                if not upscale_fallback:
+                    raise
+                print(f"[RSLTXVGenerate] WARNING: Upscale failed ({type(e).__name__}: {e})")
+                print("[RSLTXVGenerate] Falling back to half-resolution decode")
+                self._free_vram()
+                output_latent = pre_upscale_latent
+                decode = True
 
         # ----------------------------------------------------------------
         # 8. DECODE (optional)

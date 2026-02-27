@@ -53,6 +53,7 @@ class RSLTXVExtend:
                 "upscale_steps":     ("INT",   {"default": 10,  "min": 1,   "max": 10000}),
                 "upscale_cfg":       ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "upscale_denoise":   ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,   "step": 0.01}),
+                "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": False}),
                 # Overrides
@@ -109,6 +110,7 @@ class RSLTXVExtend:
         upscale_steps=10,
         upscale_cfg=3.0,
         upscale_denoise=0.5,
+        upscale_fallback=False,
         # Output
         decode=False,
         # Overrides
@@ -132,6 +134,7 @@ class RSLTXVExtend:
                 upscale=upscale, upscale_model=upscale_model,
                 upscale_steps=upscale_steps, upscale_cfg=upscale_cfg,
                 upscale_denoise=upscale_denoise,
+                upscale_fallback=upscale_fallback,
                 decode=decode,
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
@@ -149,7 +152,7 @@ class RSLTXVExtend:
         last_image, last_strength, overlap_strength, crf,
         audio, audio_vae,
         attention_mode, ffn_chunks,
-        upscale, upscale_model, upscale_steps, upscale_cfg, upscale_denoise,
+        upscale, upscale_model, upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
         decode,
         guider, sampler, sigmas,
         max_shift, base_shift,
@@ -395,73 +398,88 @@ class RSLTXVExtend:
         # ----------------------------------------------------------------
 
         if upscale and upscale_model is not None:
-            print("[RSLTXVExtend] Upscaling latents")
-            self._free_vram()
-
-            device = mm.get_torch_device()
-            model_dtype = next(upscale_model.parameters()).dtype
-            up_latents = output_latent["samples"]
-            input_dtype = up_latents.dtype
-
-            memory_required = mm.module_size(upscale_model)
-            memory_required += math.prod(up_latents.shape) * 3000.0
-            mm.free_memory(memory_required, device)
-
+            if upscale_fallback:
+                pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
-                upscale_model.to(device)
-                up_latents = up_latents.to(dtype=model_dtype, device=device)
-                up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
-                upsampled = upscale_model(up_latents)
-            finally:
-                upscale_model.cpu()
-
-            upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
-            upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
-            output_latent = {"samples": upsampled}
-
-            # Optional re-diffusion at upscaled resolution
-            if upscale_denoise > 0 and upscale_steps > 0:
-                print("[RSLTXVExtend] Re-sampling at upscaled resolution")
+                print("[RSLTXVExtend] Upscaling latents")
                 self._free_vram()
 
-                up_tokens = math.prod(upsampled.shape[2:])
-                up_shift = up_tokens * mm_shift + b
+                device = mm.get_torch_device()
+                model_dtype = next(upscale_model.parameters()).dtype
+                up_latents = output_latent["samples"]
+                input_dtype = up_latents.dtype
 
-                up_model_sampling = ModelSamplingAdvanced(m.model.model_config)
-                up_model_sampling.set_parameters(shift=up_shift)
-                m.add_object_patch("model_sampling", up_model_sampling)
+                memory_required = mm.module_size(upscale_model)
+                memory_required += math.prod(up_latents.shape) * 3000.0
+                mm.free_memory(memory_required, device)
 
-                up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1)
-                up_sig = torch.where(
-                    up_sig != 0,
-                    math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
-                    torch.zeros_like(up_sig),
-                )
-                non_zero = up_sig != 0
-                nz_sigmas = up_sig[non_zero]
-                omz = 1.0 - nz_sigmas
-                sf = omz[-1] / (1.0 - 0.1)
-                up_sig[non_zero] = 1.0 - (omz / sf)
+                try:
+                    upscale_model.to(device)
+                    up_latents = up_latents.to(dtype=model_dtype, device=device)
+                    up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
+                    upsampled = upscale_model(up_latents)
+                finally:
+                    upscale_model.cpu()
 
-                start_step = int((1.0 - upscale_denoise) * upscale_steps)
-                up_sig = up_sig[start_step:]
+                upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
+                upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+                output_latent = {"samples": upsampled}
 
-                up_guider = comfy.samplers.CFGGuider(m)
-                up_guider.set_conds(positive, negative)
-                up_guider.set_cfg(upscale_cfg)
+                # Optional re-diffusion at upscaled resolution
+                if upscale_denoise > 0 and upscale_steps > 0:
+                    print("[RSLTXVExtend] Re-sampling at upscaled resolution")
+                    self._free_vram()
 
-                up_noise = comfy.sample.prepare_noise(upsampled, seed + 1)
-                up_sampler = comfy.samplers.sampler_object("euler")
-                up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                    up_tokens = math.prod(upsampled.shape[2:])
+                    up_shift = up_tokens * mm_shift + b
 
-                up_samples = up_guider.sample(
-                    up_noise, upsampled, up_sampler, up_sig,
-                    callback=up_callback,
-                    disable_pbar=disable_pbar,
-                    seed=seed + 1,
-                )
-                up_samples = up_samples.to(mm.intermediate_device())
-                output_latent = {"samples": up_samples}
+                    up_model_sampling = ModelSamplingAdvanced(m.model.model_config)
+                    up_model_sampling.set_parameters(shift=up_shift)
+                    m.add_object_patch("model_sampling", up_model_sampling)
+
+                    up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1)
+                    up_sig = torch.where(
+                        up_sig != 0,
+                        math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
+                        torch.zeros_like(up_sig),
+                    )
+                    non_zero = up_sig != 0
+                    nz_sigmas = up_sig[non_zero]
+                    omz = 1.0 - nz_sigmas
+                    sf = omz[-1] / (1.0 - 0.1)
+                    up_sig[non_zero] = 1.0 - (omz / sf)
+
+                    start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                    up_sig = up_sig[start_step:]
+
+                    up_guider = comfy.samplers.CFGGuider(m)
+                    up_guider.set_conds(positive, negative)
+                    up_guider.set_cfg(upscale_cfg)
+
+                    up_noise = comfy.sample.prepare_noise(upsampled, seed + 1)
+                    up_sampler = comfy.samplers.sampler_object("euler")
+                    up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+
+                    up_samples = up_guider.sample(
+                        up_noise, upsampled, up_sampler, up_sig,
+                        callback=up_callback,
+                        disable_pbar=disable_pbar,
+                        seed=seed + 1,
+                    )
+                    up_samples = up_samples.to(mm.intermediate_device())
+                    output_latent = {"samples": up_samples}
+
+                if upscale_fallback:
+                    del pre_upscale_latent  # free system RAM backup
+
+            except Exception as e:
+                if not upscale_fallback:
+                    raise
+                print(f"[RSLTXVExtend] WARNING: Upscale failed ({type(e).__name__}: {e})")
+                print("[RSLTXVExtend] Falling back to half-resolution decode")
+                self._free_vram()
+                output_latent = pre_upscale_latent
+                decode = True
 
         # ----------------------------------------------------------------
         # 12. DECODE (optional)
