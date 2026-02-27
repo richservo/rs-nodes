@@ -2,6 +2,7 @@ from .nodes.prompt_parser import RSPromptParser
 from .nodes.audio_concat import RSAudioConcat
 from .nodes.prompt_formatter import RSPromptFormatter
 from .nodes.audio_save import RSAudioSave
+from .nodes.free_vram import RSFreeVRAM
 
 WEB_DIRECTORY = "./web"
 
@@ -10,6 +11,7 @@ NODE_CLASS_MAPPINGS = {
     "RSAudioConcat": RSAudioConcat,
     "RSPromptFormatter": RSPromptFormatter,
     "RSAudioSave": RSAudioSave,
+    "RSFreeVRAM": RSFreeVRAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -17,6 +19,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSAudioConcat": "RS Audio Concat",
     "RSPromptFormatter": "RS Prompt Formatter",
     "RSAudioSave": "RS Audio Save",
+    "RSFreeVRAM": "RS Free VRAM",
 }
 
 # MOSS-TTS batch node — only available if comfyui-moss-tts is installed
