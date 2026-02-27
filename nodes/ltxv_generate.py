@@ -213,6 +213,18 @@ class RSLTXVGenerate:
         if ffn_chunks > 0:
             self._apply_ffn_chunking(m, ffn_chunks)
 
+        # When audio is provided, derive video length from audio duration
+        if audio is not None and audio_vae is not None:
+            waveform = audio["waveform"]
+            sample_rate = audio["sample_rate"]
+            audio_duration = waveform.shape[-1] / sample_rate
+            audio_num_frames = int(audio_duration * frame_rate) + 1
+            # Round up to nearest multiple of 8 + 1 (LTXV temporal stride)
+            audio_num_frames = ((audio_num_frames - 1 + 7) // 8) * 8 + 1
+            if audio_num_frames != num_frames:
+                print(f"[RSLTXVGenerate] Audio duration {audio_duration:.2f}s → overriding num_frames: {num_frames} → {audio_num_frames}")
+                num_frames = audio_num_frames
+
         # When upscaling, generate at half resolution — the 2x latent upscaler
         # brings it to the target width x height afterwards.
         gen_width = width
@@ -252,7 +264,10 @@ class RSLTXVGenerate:
             _, _, _, lh, lw = latent_dict["samples"].shape
             target_w, target_h = lw * width_sf, lh * height_sf
 
-            if first_image.shape[1] != target_h or first_image.shape[2] != target_w:
+            src_h, src_w = first_image.shape[1], first_image.shape[2]
+            print(f"[RSLTXVGenerate] First image: {src_w}x{src_h} → encode at {target_w}x{target_h} (latent {lw}x{lh})")
+
+            if src_h != target_h or src_w != target_w:
                 pixels = comfy.utils.common_upscale(
                     first_image.movedim(-1, 1), target_w, target_h, "bilinear", "center"
                 ).movedim(1, -1)
@@ -324,7 +339,11 @@ class RSLTXVGenerate:
             video_noise_mask = latent_dict.get("noise_mask", None)
             if video_noise_mask is None:
                 video_noise_mask = torch.ones_like(video_samples)
-            audio_noise_mask = torch.ones_like(audio_samples)
+            # Audio mask: 0 = preserve input audio, 1 = generate from scratch
+            if audio is not None:
+                audio_noise_mask = torch.zeros_like(audio_samples)
+            else:
+                audio_noise_mask = torch.ones_like(audio_samples)
             combined_noise_mask = comfy.nested_tensor.NestedTensor((video_noise_mask, audio_noise_mask))
 
             latent_dict = {"samples": combined_samples, "noise_mask": combined_noise_mask}
@@ -479,6 +498,47 @@ class RSLTXVGenerate:
             upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
             output_latent = {"samples": upsampled}
 
+            # Re-inject guide images at full resolution into upscaled latent
+            up_denoise_mask = None
+            time_sf, up_height_sf, up_width_sf = vae.downscale_index_formula
+            _, _, up_latent_t, up_lh, up_lw = upsampled.shape
+            up_target_w, up_target_h = up_lw * up_width_sf, up_lh * up_height_sf
+
+            up_guides = []
+            if first_image is not None:
+                up_guides.append((first_image, 0, first_strength, "first"))
+            if middle_image is not None:
+                mid_idx = (num_frames - 1) // 2
+                mid_idx = max(0, (mid_idx // 8) * 8)
+                if mid_idx == 0 and num_frames > 8:
+                    mid_idx = 8
+                mid_latent_idx = (mid_idx + time_sf - 1) // time_sf
+                up_guides.append((middle_image, mid_latent_idx, middle_strength, "middle"))
+            if last_image is not None:
+                up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
+
+            if up_guides:
+                up_denoise_mask = torch.ones(
+                    (upsampled.shape[0], 1, up_latent_t, 1, 1),
+                    dtype=upsampled.dtype, device=upsampled.device,
+                )
+                for img, latent_idx, strength_val, label in up_guides:
+                    src_h, src_w = img.shape[1], img.shape[2]
+                    if src_h != up_target_h or src_w != up_target_w:
+                        up_pixels = comfy.utils.common_upscale(
+                            img.movedim(-1, 1), up_target_w, up_target_h, "bilinear", "center"
+                        ).movedim(1, -1)
+                    else:
+                        up_pixels = img
+                    up_t = vae.encode(up_pixels[:, :, :, :3])
+
+                    end_idx = min(latent_idx + up_t.shape[2], up_latent_t)
+                    upsampled[:, :, latent_idx:end_idx] = up_t[:, :, :end_idx - latent_idx]
+                    up_denoise_mask[:, :, latent_idx:end_idx] = 1.0 - strength_val
+                    print(f"[RSLTXVGenerate] Upscale re-inject {label} frame at full res ({up_target_w}x{up_target_h}), latent_idx={latent_idx}")
+
+                output_latent = {"samples": upsampled}
+
             # Re-diffusion at upscaled resolution
             if upscale_denoise > 0 and upscale_steps > 0:
                 print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({upscale_steps} steps, cfg={upscale_cfg})")
@@ -487,6 +547,9 @@ class RSLTXVGenerate:
                 # Recombine video + audio for the AV model
                 if has_audio and audio_latent_out is not None:
                     up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
+                    if up_denoise_mask is not None:
+                        audio_mask = torch.ones_like(audio_latent_out[:, :1])
+                        up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
                 else:
                     up_combined = upsampled
 
@@ -537,6 +600,7 @@ class RSLTXVGenerate:
 
                 up_samples = up_guider.sample(
                     up_noise, up_latent_image, up_sampler, up_sig,
+                    denoise_mask=up_denoise_mask,
                     callback=up_callback,
                     disable_pbar=disable_pbar,
                     seed=seed + 1,
