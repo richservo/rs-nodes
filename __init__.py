@@ -3,6 +3,8 @@ from .nodes.audio_concat import RSAudioConcat
 from .nodes.prompt_formatter import RSPromptFormatter
 from .nodes.audio_save import RSAudioSave
 from .nodes.free_vram import RSFreeVRAM
+from .nodes.ltxv_generate import RSLTXVGenerate
+from .nodes.ltxv_extend import RSLTXVExtend
 
 WEB_DIRECTORY = "./web"
 
@@ -12,6 +14,8 @@ NODE_CLASS_MAPPINGS = {
     "RSPromptFormatter": RSPromptFormatter,
     "RSAudioSave": RSAudioSave,
     "RSFreeVRAM": RSFreeVRAM,
+    "RSLTXVGenerate": RSLTXVGenerate,
+    "RSLTXVExtend": RSLTXVExtend,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -20,6 +24,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSPromptFormatter": "RS Prompt Formatter",
     "RSAudioSave": "RS Audio Save",
     "RSFreeVRAM": "RS Free VRAM",
+    "RSLTXVGenerate": "RS LTXV Generate",
+    "RSLTXVExtend": "RS LTXV Extend",
 }
 
 # MOSS-TTS batch node — only available if comfyui-moss-tts is installed
