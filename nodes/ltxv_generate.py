@@ -1,5 +1,6 @@
 import gc
 import math
+import random
 
 import torch
 import comfy.model_management as mm
@@ -36,7 +37,8 @@ class RSLTXVGenerate:
                 "num_frames": ("INT",   {"default": 97,   "min": 9,   "max": 8192, "step": 8}),
                 "steps":      ("INT",   {"default": 20,   "min": 1,   "max": 10000}),
                 "cfg":        ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
-                "seed":       ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff}),
+                "noise_seed": ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff}),
+                "seed_mode":  (["random", "fixed", "increment", "decrement"],),
                 "frame_rate": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 # Frame injection
                 "first_image":       ("IMAGE",),
@@ -52,6 +54,8 @@ class RSLTXVGenerate:
                 # Multimodal guidance (used when audio_vae is connected)
                 "audio_cfg":         ("FLOAT", {"default": 7.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
                 "stg_scale":         ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 10.0,  "step": 0.1}),
+                "cfg_end":           ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
+                "stg_end":           ("FLOAT", {"default": -1.0, "min": -1.0, "max": 10.0,  "step": 0.1}),
                 "stg_blocks":        ("STRING", {"default": "29"}),
                 "rescale":           ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0,   "step": 0.01}),
                 "modality_scale":    ("FLOAT", {"default": 1.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
@@ -81,11 +85,13 @@ class RSLTXVGenerate:
 
     RETURN_TYPES  = ("LATENT", "IMAGE", "AUDIO")
     RETURN_NAMES  = ("latent", "images", "audio_output")
+    OUTPUT_NODE   = True
     FUNCTION      = "generate"
     CATEGORY      = "rs-nodes"
 
     def __init__(self):
         self.loaded_lora = None
+        self._last_seed = None
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -107,7 +113,8 @@ class RSLTXVGenerate:
         num_frames=97,
         steps=20,
         cfg=3.0,
-        seed=0,
+        noise_seed=0,
+        seed_mode="random",
         frame_rate=25.0,
         # Frame injection
         first_image=None,
@@ -123,6 +130,8 @@ class RSLTXVGenerate:
         # Multimodal guidance
         audio_cfg=7.0,
         stg_scale=0.0,
+        cfg_end=-1.0,
+        stg_end=-1.0,
         stg_blocks="29",
         rescale=0.7,
         modality_scale=1.0,
@@ -149,9 +158,18 @@ class RSLTXVGenerate:
         base_shift=0.95,
         **kwargs,
     ):
-        print("[RSLTXVGenerate] Starting generation")
+        # Resolve seed based on mode (replaces broken control_after_generate)
+        seed = noise_seed
+        if seed_mode == "random":
+            seed = random.randint(0, 0xffffffffffffffff)
+        elif seed_mode == "increment" and self._last_seed is not None:
+            seed = (self._last_seed + 1) % (0xffffffffffffffff + 1)
+        elif seed_mode == "decrement" and self._last_seed is not None:
+            seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
+        self._last_seed = seed
+        print(f"[RSLTXVGenerate] Starting generation (seed={seed}, mode={seed_mode})")
         try:
-            return self._generate_impl(
+            result = self._generate_impl(
                 model, positive, negative, vae,
                 width=width, height=height, num_frames=num_frames,
                 steps=steps, cfg=cfg, seed=seed, frame_rate=frame_rate,
@@ -159,7 +177,9 @@ class RSLTXVGenerate:
                 first_strength=first_strength, middle_strength=middle_strength,
                 last_strength=last_strength, crf=crf,
                 audio=audio, audio_vae=audio_vae,
-                audio_cfg=audio_cfg, stg_scale=stg_scale, stg_blocks=stg_blocks,
+                audio_cfg=audio_cfg, stg_scale=stg_scale,
+                cfg_end=cfg_end, stg_end=stg_end,
+                stg_blocks=stg_blocks,
                 rescale=rescale, modality_scale=modality_scale,
                 attention_mode=attention_mode, ffn_chunks=ffn_chunks,
                 upscale=upscale, upscale_model=upscale_model,
@@ -171,6 +191,8 @@ class RSLTXVGenerate:
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
             )
+            # Write resolved seed back to the widget so the user can see/reuse it
+            return {"ui": {"noise_seed": [seed]}, "result": result}
         except Exception:
             print("[RSLTXVGenerate] Error during generation, cleaning up VRAM")
             raise
@@ -184,7 +206,8 @@ class RSLTXVGenerate:
         first_image, middle_image, last_image,
         first_strength, middle_strength, last_strength, crf,
         audio, audio_vae,
-        audio_cfg, stg_scale, stg_blocks, rescale, modality_scale,
+        audio_cfg, stg_scale, cfg_end, stg_end,
+        stg_blocks, rescale, modality_scale,
         attention_mode, ffn_chunks,
         upscale, upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
@@ -407,6 +430,8 @@ class RSLTXVGenerate:
                 stg_scale=stg_scale,
                 stg_blocks=[int(s.strip()) for s in stg_blocks.split(",")],
                 rescale=rescale, modality_scale=modality_scale,
+                video_cfg_end=cfg_end if cfg_end >= 0 else None,
+                stg_scale_end=stg_end if stg_end >= 0 else None,
             )
             print("[RSLTXVGenerate] Using MultimodalGuider")
 
@@ -647,7 +672,7 @@ class RSLTXVGenerate:
             temporal_compression = vae.temporal_compression_decode()
             if temporal_compression is not None:
                 tile_t = max(2, 64 // temporal_compression)
-                overlap_t = max(1, min(tile_t // 2, 8 // temporal_compression))
+                overlap_t = max(2, tile_t // 4)
             else:
                 tile_t = None
                 overlap_t = None

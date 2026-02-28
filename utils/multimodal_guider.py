@@ -114,6 +114,8 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         stg_blocks=None,
         rescale=0.7,
         modality_scale=3.0,
+        video_cfg_end=None,
+        stg_scale_end=None,
     ):
         if stg_blocks is None:
             stg_blocks = [29]
@@ -126,7 +128,11 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         self.stg_blocks = stg_blocks
         self.rescale = rescale
         self.modality_scale = modality_scale
+        self.video_cfg_end = video_cfg_end if video_cfg_end is not None else video_cfg
+        self.stg_scale_end = stg_scale_end if stg_scale_end is not None else stg_scale
         self._latent_shapes = None
+        self._current_step = 0
+        self._total_steps = 1
 
         self.inner_set_conds({"positive": positive, "negative": negative})
 
@@ -180,6 +186,8 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             self._latent_shapes = [t.shape for t in latent_image.unbind()]
         else:
             self._latent_shapes = [latent_image.shape]
+        self._current_step = 0
+        self._total_steps = max(sigmas.shape[-1] - 1, 1)
         return super().sample(noise, latent_image, sampler, sigmas, **kwargs)
 
     # ------------------------------------------------------------------
@@ -191,14 +199,22 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         negative = self.conds.get("negative", None)
         model = self.inner_model
 
+        # Per-step interpolation (plain floats — no tensor graph retention)
+        t = self._current_step / max(self._total_steps - 1, 1)
+        self._current_step += 1
+        cur_cfg = float(self.video_cfg + t * (self.video_cfg_end - self.video_cfg))
+        cur_stg = float(self.stg_scale + t * (self.stg_scale_end - self.stg_scale))
+
         is_av = self._latent_shapes is not None and len(self._latent_shapes) > 1
-        need_stg = self.stg_scale > 0
+        need_stg = self.stg_scale > 0 or self.stg_scale_end > 0
         need_mod = self.modality_scale != 1.0 and is_av
-        need_cfg = self.video_cfg != 1.0 or self.audio_cfg != 1.0
+        need_cfg = (self.video_cfg != 1.0 or self.video_cfg_end != 1.0
+                    or self.audio_cfg != 1.0)
 
         # Fast path: no STG or modality — single batched forward pass
         if not need_stg and not need_mod:
-            return self._predict_noise_fast(x, timestep, model_options, seed)
+            return self._predict_noise_fast(x, timestep, model_options, seed,
+                                            cur_cfg=cur_cfg)
 
         run_vx = True
         run_ax = is_av
@@ -289,22 +305,27 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
                 to.pop("run_ax", None)
 
         # --- Apply per-modality guidance ---
-        v_out = self._calculate(v_pos, v_neg, v_stg, v_mod, self.video_cfg)
+        v_out = self._calculate(v_pos, v_neg, v_stg, v_mod, cur_cfg, cur_stg)
 
         if is_av:
-            a_out = self._calculate(a_pos, a_neg, a_stg, a_mod, self.audio_cfg)
+            a_out = self._calculate(a_pos, a_neg, a_stg, a_mod,
+                                    self.audio_cfg, cur_stg)
             packed, _ = comfy.utils.pack_latents([v_out, a_out])
             return packed
         return v_out
 
-    def _predict_noise_fast(self, x, timestep, model_options, seed):
+    def _predict_noise_fast(self, x, timestep, model_options, seed,
+                            cur_cfg=None):
         """Single batched pass — per-modality CFG only, no STG/modality."""
         positive = self.conds.get("positive", None)
         negative = self.conds.get("negative", None)
         model = self.inner_model
 
+        if cur_cfg is None:
+            cur_cfg = self.video_cfg
+
         is_av = self._latent_shapes is not None and len(self._latent_shapes) > 1
-        need_cfg = self.video_cfg != 1.0 or self.audio_cfg != 1.0
+        need_cfg = cur_cfg != 1.0 or self.audio_cfg != 1.0
 
         if need_cfg and negative is not None:
             results = comfy.samplers.calc_cond_batch(
@@ -327,27 +348,28 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
                 v_neg, a_neg = comfy.utils.unpack_latents(
                     neg_out, self._latent_shapes
                 )
-            v_out = self._calculate(v_pos, v_neg, v_pos, v_pos, self.video_cfg)
-            a_out = self._calculate(a_pos, a_neg, a_pos, a_pos, self.audio_cfg)
+            v_out = self._calculate(v_pos, v_neg, v_pos, v_pos, cur_cfg, 0)
+            a_out = self._calculate(a_pos, a_neg, a_pos, a_pos,
+                                    self.audio_cfg, 0)
             packed, _ = comfy.utils.pack_latents([v_out, a_out])
             return packed
         else:
             return self._calculate(
-                pos_out, neg_out, pos_out, pos_out, self.video_cfg
+                pos_out, neg_out, pos_out, pos_out, cur_cfg, 0
             )
 
     # ------------------------------------------------------------------
     # Guidance math — matches official GuiderParameters.calculate
     # ------------------------------------------------------------------
 
-    def _calculate(self, pos, neg, perturbed, modality, cfg):
+    def _calculate(self, pos, neg, perturbed, modality, cfg, stg_scale):
         """Apply the full guidance formula:
         pos + (cfg-1)*(pos-neg) + stg*(pos-perturbed) + (mod-1)*(pos-modality)
         """
         noise_pred = (
             pos
             + (cfg - 1) * (pos - neg)
-            + self.stg_scale * (pos - perturbed)
+            + stg_scale * (pos - perturbed)
             + (self.modality_scale - 1) * (pos - modality)
         )
         if self.rescale != 0:
