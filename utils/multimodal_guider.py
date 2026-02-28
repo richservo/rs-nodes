@@ -309,7 +309,7 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
 
         if is_av:
             a_out = self._calculate(a_pos, a_neg, a_stg, a_mod,
-                                    self.audio_cfg, cur_stg)
+                                    self.audio_cfg, self.stg_scale)
             packed, _ = comfy.utils.pack_latents([v_out, a_out])
             return packed
         return v_out
