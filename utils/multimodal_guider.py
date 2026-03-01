@@ -6,15 +6,22 @@ CFGGuider.
 
 STG implementation matches the official ComfyUI-LTXVideo approach using
 PatchAttention context managers for global attention monkey-patching.
+
+ICLoRAGuider extends MultimodalGuider to add IC-LoRA guide frame injection,
+model sampling shift, and guide frame lifecycle management.
 """
 
 import contextlib
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
 import comfy.ldm.modules.attention
 import comfy.model_patcher
+import comfy.model_sampling
+import comfy.nested_tensor
+import comfy.sample
 import comfy.samplers
 import comfy.utils
 
@@ -377,3 +384,300 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             factor = self.rescale * factor + (1 - self.rescale)
             noise_pred = noise_pred * factor
         return noise_pred
+
+
+# ---------------------------------------------------------------------------
+# ICLoRAGuider — MultimodalGuider with IC-LoRA guide frame injection
+# ---------------------------------------------------------------------------
+
+class ICLoRAGuider(MultimodalGuider):
+    """Extends MultimodalGuider to handle IC-LoRA guide frame lifecycle.
+
+    Encoding of the control image is deferred to sample() where the actual
+    video latent dimensions are known. This ensures the guide latent spatial
+    dims always match the video latent.
+
+    Manages:
+    - Deferred VAE encoding of control pixels (at correct latent dims)
+    - Deferred ModelSamplingFlux shift (applied when latent dims known)
+    - Guide keyframe conditioning injection (keyframe_idxs metadata)
+    - Guide latent appending before sampling (video-only, NestedTensor safe)
+    - Denoise mask update for guide frames (mask ~ 0 to preserve)
+    - Noise regeneration to match expanded latent
+    - Guide frame stripping from sampled output
+    """
+
+    def __init__(
+        self,
+        model,
+        positive,
+        negative,
+        control_pixels,
+        vae,
+        guide_strength,
+        guide_frame_idx,
+        max_shift,
+        base_shift,
+        **kwargs,
+    ):
+        super().__init__(model, positive, negative, **kwargs)
+        self._control_pixels = control_pixels
+        self._vae = vae
+        self._guide_strength = guide_strength
+        self._guide_frame_idx = guide_frame_idx
+        self._max_shift = max_shift
+        self._base_shift = base_shift
+        # Set after encoding in sample()
+        self._guide_latent = None
+        self._num_guide_frames = 0
+
+    # ------------------------------------------------------------------
+    # Model sampling shift — deferred until latent dims are known
+    # ------------------------------------------------------------------
+
+    def _apply_model_sampling(self, latent_image):
+        """Apply ModelSamplingFlux shift based on actual latent dimensions.
+
+        Uses the same shift formula as ltxv_generate.py (lines 395-402).
+        """
+        # Compute token count from video latent (exclude audio if nested)
+        if latent_image.is_nested:
+            tokens = math.prod(latent_image.unbind()[0].shape[2:])
+        else:
+            tokens = math.prod(latent_image.shape[2:])
+
+        x1, x2 = 1024, 4096
+        mm_shift = (self._max_shift - self._base_shift) / (x2 - x1)
+        b = self._base_shift - mm_shift * x1
+        shift = tokens * mm_shift + b
+
+        # Build combined ModelSamplingFlux + CONST class
+        class ModelSamplingAdvanced(
+            comfy.model_sampling.ModelSamplingFlux,
+            comfy.model_sampling.CONST,
+        ):
+            pass
+
+        sampling_obj = ModelSamplingAdvanced(self.model_patcher.model.model_config)
+        sampling_obj.set_parameters(shift=shift)
+        self.model_patcher.add_object_patch("model_sampling", sampling_obj)
+        print(f"[RSICLoRAGuider] Applied model sampling shift={shift:.4f} (tokens={tokens})")
+
+    # ------------------------------------------------------------------
+    # Deferred encoding — called once at the start of sample()
+    # ------------------------------------------------------------------
+
+    def _encode_guide(self, latent_image):
+        """Encode control pixels and inject guide keyframe into conditioning.
+
+        Called at the start of sample() when the actual video latent
+        dimensions are known. Uses LTXVAddGuide.encode() which resizes
+        the control image to match the target latent spatial dims.
+        """
+        from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask
+        import node_helpers
+
+        # Get video latent dims (exclude audio if nested)
+        if latent_image.is_nested:
+            video_latent = latent_image.unbind()[0]
+        else:
+            video_latent = latent_image
+        _, _, latent_t, latent_h, latent_w = video_latent.shape
+
+        scale_factors = self._vae.downscale_index_formula
+
+        # Encode control pixels at the video latent's spatial dims
+        # LTXVAddGuide.encode() resizes pixels to match latent_w * width_sf x latent_h * height_sf
+        _, guide_latent = LTXVAddGuide.encode(
+            self._vae, latent_w, latent_h, self._control_pixels, scale_factors
+        )
+        self._guide_latent = guide_latent
+        self._num_guide_frames = guide_latent.shape[2]
+        print(f"[RSICLoRAGuider] Encoded guide latent: {list(guide_latent.shape)} "
+              f"({self._num_guide_frames} frame(s))")
+
+        # Compute the latent index for the guide frame
+        frame_idx_actual, _ = LTXVAddGuide.get_latent_index(
+            self._get_positive(), latent_t,
+            len(self._control_pixels), self._guide_frame_idx, scale_factors
+        )
+
+        # Build a dummy latent + noise_mask for append_keyframe
+        # (we only need the conditioning metadata — the actual latent
+        # concatenation is done separately in _append_guide)
+        dummy_latent = torch.zeros(
+            (1, 128, latent_t, latent_h, latent_w),
+            device=video_latent.device,
+        )
+        noise_mask = get_noise_mask({"samples": dummy_latent})
+
+        # Get current conditioning from the guider
+        positive = self._get_positive()
+        negative = self._get_negative()
+
+        # Append keyframe to conditioning (sets keyframe_idxs metadata)
+        positive, negative, _, _ = LTXVAddGuide.append_keyframe(
+            positive, negative, frame_idx_actual,
+            dummy_latent, noise_mask,
+            guide_latent, self._guide_strength, scale_factors,
+        )
+        print(f"[RSICLoRAGuider] Guide keyframe added at frame_idx={frame_idx_actual}, "
+              f"strength={self._guide_strength}")
+
+        # Update the guider's conditioning
+        self.inner_set_conds({"positive": positive, "negative": negative})
+
+        # Free references we no longer need
+        self._control_pixels = None
+        self._vae = None
+
+    def _get_positive(self):
+        """Reconstruct positive conditioning in original tuple format."""
+        return self._reconstruct_conds("positive")
+
+    def _get_negative(self):
+        """Reconstruct negative conditioning in original tuple format."""
+        return self._reconstruct_conds("negative")
+
+    def _reconstruct_conds(self, key):
+        """Convert internal conds dict format back to ComfyUI tuple format.
+
+        inner_set_conds stores: [{cross_attn: T, model_conds: {}, uuid: ..., ...}]
+        Original format is: [[T, {model_conds: {}, ...}], ...]
+        """
+        conds = self.original_conds.get(key, [])
+        result = []
+        for c in conds:
+            cross_attn = c.get("cross_attn", None)
+            metadata = {k: v for k, v in c.items()
+                        if k not in ("cross_attn", "uuid")}
+            result.append([cross_attn, metadata])
+        return result
+
+    # ------------------------------------------------------------------
+    # Guide frame lifecycle
+    # ------------------------------------------------------------------
+
+    def _append_guide(self, latent_image, denoise_mask):
+        """Append IC-LoRA guide latent frames to the video latent.
+
+        For NestedTensor (AV mode), only the video portion is extended.
+        The denoise mask is updated with ~ 0 for guide positions so they
+        are preserved during denoising.
+        """
+        guide = self._guide_latent.to(latent_image.device if not latent_image.is_nested
+                                      else latent_image.unbind()[0].device)
+
+        if latent_image.is_nested:
+            parts = latent_image.unbind()
+            video = parts[0]
+            audio = parts[1] if len(parts) > 1 else None
+
+            # Pad guide channels if video has more (e.g. AV channel padding)
+            if video.shape[1] > guide.shape[1]:
+                pad_len = video.shape[1] - guide.shape[1]
+                guide = torch.nn.functional.pad(
+                    guide, (0, 0, 0, 0, 0, 0, 0, pad_len), value=0
+                )
+
+            video = torch.cat([video, guide], dim=2)
+
+            # Update denoise mask
+            if denoise_mask is not None and denoise_mask.is_nested:
+                dm_parts = denoise_mask.unbind()
+                video_dm = dm_parts[0]
+                audio_dm = dm_parts[1] if len(dm_parts) > 1 else None
+                # Guide mask ~ 0 -> preserve guide frames
+                guide_mask = torch.full(
+                    (video_dm.shape[0], 1, self._num_guide_frames,
+                     video_dm.shape[3], video_dm.shape[4]),
+                    1.0 - self._guide_strength,
+                    dtype=video_dm.dtype, device=video_dm.device,
+                )
+                video_dm = torch.cat([video_dm, guide_mask], dim=2)
+                if audio_dm is not None:
+                    denoise_mask = comfy.nested_tensor.NestedTensor((video_dm, audio_dm))
+                else:
+                    denoise_mask = comfy.nested_tensor.NestedTensor((video_dm,))
+            elif denoise_mask is not None:
+                guide_mask = torch.full(
+                    (denoise_mask.shape[0], 1, self._num_guide_frames, 1, 1),
+                    1.0 - self._guide_strength,
+                    dtype=denoise_mask.dtype, device=denoise_mask.device,
+                )
+                denoise_mask = torch.cat([denoise_mask, guide_mask], dim=2)
+
+            if audio is not None:
+                latent_image = comfy.nested_tensor.NestedTensor((video, audio))
+            else:
+                latent_image = comfy.nested_tensor.NestedTensor((video,))
+        else:
+            # Plain tensor (video only)
+            if latent_image.shape[1] > guide.shape[1]:
+                pad_len = latent_image.shape[1] - guide.shape[1]
+                guide = torch.nn.functional.pad(
+                    guide, (0, 0, 0, 0, 0, 0, 0, pad_len), value=0
+                )
+
+            latent_image = torch.cat([latent_image, guide], dim=2)
+
+            if denoise_mask is not None:
+                guide_mask = torch.full(
+                    (denoise_mask.shape[0], 1, self._num_guide_frames,
+                     denoise_mask.shape[3], denoise_mask.shape[4]),
+                    1.0 - self._guide_strength,
+                    dtype=denoise_mask.dtype, device=denoise_mask.device,
+                )
+                denoise_mask = torch.cat([denoise_mask, guide_mask], dim=2)
+
+        return latent_image, denoise_mask
+
+    def _strip_guide(self, result):
+        """Remove appended guide frames from the sampled output."""
+        n = self._num_guide_frames
+        if n == 0:
+            return result
+
+        if result.is_nested:
+            parts = result.unbind()
+            video = parts[0][:, :, :-n]
+            if len(parts) > 1:
+                return comfy.nested_tensor.NestedTensor((video, parts[1]))
+            return comfy.nested_tensor.NestedTensor((video,))
+
+        return result[:, :, :-n]
+
+    # ------------------------------------------------------------------
+    # sample() override — full guide frame lifecycle
+    # ------------------------------------------------------------------
+
+    def sample(self, noise, latent_image, sampler, sigmas, **kwargs):
+        # 1. Apply model sampling shift (deferred until latent dims known)
+        self._apply_model_sampling(latent_image)
+
+        # 2. Encode control image and inject guide conditioning
+        #    (deferred to here because we now know the video latent dims)
+        self._encode_guide(latent_image)
+
+        # 3. Append IC-LoRA guide frames to the latent
+        denoise_mask = kwargs.get("denoise_mask", None)
+        latent_image, denoise_mask = self._append_guide(latent_image, denoise_mask)
+        if denoise_mask is not None:
+            kwargs["denoise_mask"] = denoise_mask
+
+        # 4. Regenerate noise to match expanded latent dimensions
+        noise = comfy.sample.prepare_noise(latent_image, kwargs.get("seed", 0))
+
+        print(f"[RSICLoRAGuider] Guide frames appended: {self._num_guide_frames} "
+              f"frame(s), latent temporal dim now "
+              f"{latent_image.unbind()[0].shape[2] if latent_image.is_nested else latent_image.shape[2]}")
+
+        # 5. Run parent sampling (MultimodalGuider -> CFGGuider)
+        result = super().sample(noise, latent_image, sampler, sigmas, **kwargs)
+
+        # 6. Strip guide frames from the output
+        result = self._strip_guide(result)
+        print(f"[RSICLoRAGuider] Guide frames stripped, output temporal dim: "
+              f"{result.unbind()[0].shape[2] if result.is_nested else result.shape[2]}")
+
+        return result

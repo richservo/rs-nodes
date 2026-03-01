@@ -5,6 +5,7 @@ from .nodes.audio_save import RSAudioSave
 from .nodes.free_vram import RSFreeVRAM
 from .nodes.ltxv_generate import RSLTXVGenerate
 from .nodes.ltxv_extend import RSLTXVExtend
+from .nodes.ic_lora_guider import RSICLoRAGuider
 
 WEB_DIRECTORY = "./web"
 
@@ -16,6 +17,7 @@ NODE_CLASS_MAPPINGS = {
     "RSFreeVRAM": RSFreeVRAM,
     "RSLTXVGenerate": RSLTXVGenerate,
     "RSLTXVExtend": RSLTXVExtend,
+    "RSICLoRAGuider": RSICLoRAGuider,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -26,6 +28,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSFreeVRAM": "RS Free VRAM",
     "RSLTXVGenerate": "RS LTXV Generate",
     "RSLTXVExtend": "RS LTXV Extend",
+    "RSICLoRAGuider": "RS IC-LoRA Guider",
 }
 
 # MOSS-TTS batch node — only available if comfyui-moss-tts is installed
