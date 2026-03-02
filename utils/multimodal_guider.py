@@ -298,6 +298,10 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         audio_rescale=None,
         audio_modality_scale=None,
         video_modality_scale=None,
+        # CFG-Zero* (project neg onto pos before guidance formula)
+        cfg_star_rescale=True,
+        # Skip-steps: return zeros when sigma > threshold (CFG-Zero init)
+        skip_sigma_threshold=0.0,
         # VRAM-efficient forward + attention scaling
         video_attn_scale=1.0,
     ):
@@ -335,6 +339,9 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         self.audio_rescale = audio_rescale if audio_rescale is not None else rescale
         self.audio_modality_scale = audio_modality_scale if audio_modality_scale is not None else modality_scale
         self.video_modality_scale = video_modality_scale if video_modality_scale is not None else modality_scale
+
+        self.cfg_star_rescale = cfg_star_rescale
+        self.skip_sigma_threshold = skip_sigma_threshold
 
         self._latent_shapes = None
 
@@ -432,6 +439,11 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
     # ------------------------------------------------------------------
 
     def predict_noise(self, x, timestep, model_options={}, seed=None):
+        # CFG-Zero init: skip guidance on near-pure noise (high sigma steps)
+        if self.skip_sigma_threshold > 0 and timestep > self.skip_sigma_threshold:
+            self._current_step += 1
+            return torch.zeros_like(x)
+
         positive = self.conds.get("positive", None)
         negative = self.conds.get("negative", None)
         model = self.inner_model
@@ -504,6 +516,19 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
                 noise_pred_neg = comfy.samplers.calc_cond_batch(
                     model, [negative], x, timestep, model_options
                 )[0]
+
+                # CFG-Zero* rescale: project negative onto positive direction
+                # to prevent garbage negative predictions at high sigma.
+                # Reference: https://arxiv.org/abs/2503.18886
+                if self.cfg_star_rescale:
+                    batch_size = noise_pred_pos.shape[0]
+                    pos_flat = noise_pred_pos.view(batch_size, -1)
+                    neg_flat = noise_pred_neg.view(batch_size, -1)
+                    dot = torch.sum(pos_flat * neg_flat, dim=1, keepdim=True)
+                    sq_norm = torch.sum(neg_flat ** 2, dim=1, keepdim=True) + 1e-8
+                    alpha = dot / sq_norm
+                    noise_pred_neg = alpha * noise_pred_neg
+
                 if is_av:
                     v_neg, a_neg = comfy.utils.unpack_latents(
                         noise_pred_neg, self._latent_shapes
@@ -618,6 +643,16 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
                 model, [positive, negative], x, timestep, model_options
             )
             pos_out, neg_out = results[0], results[1]
+
+            # CFG-Zero* rescale (same as multi-pass path)
+            if self.cfg_star_rescale:
+                batch_size = pos_out.shape[0]
+                pos_flat = pos_out.view(batch_size, -1)
+                neg_flat = neg_out.view(batch_size, -1)
+                dot = torch.sum(pos_flat * neg_flat, dim=1, keepdim=True)
+                sq_norm = torch.sum(neg_flat ** 2, dim=1, keepdim=True) + 1e-8
+                alpha = dot / sq_norm
+                neg_out = alpha * neg_out
         else:
             pos_out = comfy.samplers.calc_cond_batch(
                 model, [positive], x, timestep, model_options

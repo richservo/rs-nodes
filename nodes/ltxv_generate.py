@@ -61,6 +61,8 @@ class RSLTXVGenerate:
                 "rescale":           ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0,   "step": 0.01}),
                 "video_modality_scale": ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Video modality isolation (0 = match official default)"}),
                 "audio_modality_scale": ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Audio modality isolation (3 = match official default)"}),
+                "cfg_star_rescale":  ("BOOLEAN", {"default": True, "tooltip": "CFG-Zero*: project negative prediction onto positive to prevent garbage at high sigma. Recommended on."}),
+                "skip_sigma":        ("FLOAT",  {"default": 0.0,  "min": 0.0, "max": 1.0,  "step": 0.001, "tooltip": "Skip guidance when sigma > this value (CFG-Zero init). 0 = disabled, 0.997 = official default."}),
                 # Efficiency
                 "attention_mode":    (["auto", "default", "sage"],),
                 "ffn_chunks":        ("INT",   {"default": 0, "min": 0, "max": 16, "step": 1}),
@@ -141,6 +143,8 @@ class RSLTXVGenerate:
         rescale=0.7,
         video_modality_scale=0.0,
         audio_modality_scale=3.0,
+        cfg_star_rescale=True,
+        skip_sigma=0.0,
         # Efficiency
         attention_mode="auto",
         ffn_chunks=0,
@@ -192,6 +196,7 @@ class RSLTXVGenerate:
                 rescale=rescale,
                 video_modality_scale=video_modality_scale,
                 audio_modality_scale=audio_modality_scale,
+                cfg_star_rescale=cfg_star_rescale, skip_sigma=skip_sigma,
                 attention_mode=attention_mode, ffn_chunks=ffn_chunks,
                 video_attn_scale=video_attn_scale,
                 upscale=upscale, upscale_model=upscale_model,
@@ -220,6 +225,7 @@ class RSLTXVGenerate:
         audio, audio_vae,
         audio_cfg, stg_scale, audio_stg_scale, cfg_end, stg_end,
         stg_blocks, rescale, video_modality_scale, audio_modality_scale,
+        cfg_star_rescale, skip_sigma,
         attention_mode, ffn_chunks, video_attn_scale,
         upscale, upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
@@ -416,7 +422,9 @@ class RSLTXVGenerate:
 
         # Build sigmas if not provided
         if sigmas is None:
-            sig = torch.linspace(1.0, 0.0, steps + 1)
+            # Use float64 to avoid precision loss at high shift values
+            # (shift > ~20 causes exp(shift) to swallow small terms in float32)
+            sig = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
             sig = torch.where(
                 sig != 0,
                 math.exp(shift) / (math.exp(shift) + (1.0 / sig - 1.0) ** 1),
@@ -428,7 +436,7 @@ class RSLTXVGenerate:
             one_minus_z = 1.0 - non_zero_sigmas
             scale_factor = one_minus_z[-1] / (1.0 - 0.1)
             sig[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
-            sigmas = sig
+            sigmas = sig.float()  # back to float32 for sampler
 
         # Build sampler if not provided
         if sampler is None:
@@ -448,6 +456,8 @@ class RSLTXVGenerate:
                 audio_stg_scale=audio_stg_scale if audio_stg_scale >= 0 else None,
                 video_modality_scale=video_modality_scale,
                 audio_modality_scale=audio_modality_scale,
+                cfg_star_rescale=cfg_star_rescale,
+                skip_sigma_threshold=skip_sigma,
                 video_attn_scale=video_attn_scale,
             )
             print("[RSLTXVGenerate] Using MultimodalGuider")

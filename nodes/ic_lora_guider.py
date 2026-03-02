@@ -57,6 +57,8 @@ class RSICLoRAGuider:
                 "modality_scale":  ("FLOAT",  {"default": 1.0,  "min": 0.0,  "max": 100.0, "step": 0.1}),
                 "cfg_end":         ("FLOAT",  {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
                 "stg_end":         ("FLOAT",  {"default": -1.0, "min": -1.0, "max": 10.0,  "step": 0.1}),
+                "cfg_star_rescale": ("BOOLEAN", {"default": True, "tooltip": "CFG-Zero*: project negative onto positive to prevent garbage at high sigma."}),
+                "skip_sigma":      ("FLOAT",  {"default": 0.0,  "min": 0.0,  "max": 1.0,  "step": 0.001, "tooltip": "Skip guidance when sigma > this value. 0 = disabled, 0.997 = official default."}),
                 # Scheduler
                 "max_shift":       ("FLOAT",  {"default": 2.05, "min": 0.0,  "max": 100.0, "step": 0.01}),
                 "base_shift":      ("FLOAT",  {"default": 0.95, "min": 0.0,  "max": 100.0, "step": 0.01}),
@@ -93,6 +95,8 @@ class RSICLoRAGuider:
         modality_scale=1.0,
         cfg_end=-1.0,
         stg_end=-1.0,
+        cfg_star_rescale=True,
+        skip_sigma=0.0,
         max_shift=2.05,
         base_shift=0.95,
         video_attn_scale=1.0,
@@ -153,6 +157,8 @@ class RSICLoRAGuider:
             modality_scale=modality_scale,
             video_cfg_end=cfg_end if cfg_end >= 0 else None,
             stg_scale_end=stg_end if stg_end >= 0 else None,
+            cfg_star_rescale=cfg_star_rescale,
+            skip_sigma_threshold=skip_sigma,
             video_attn_scale=video_attn_scale,
         )
 
