@@ -631,7 +631,7 @@ class RSLTXVGenerate:
                     up_model_sampling.set_parameters(shift=up_shift)
                     up_model.add_object_patch("model_sampling", up_model_sampling)
 
-                    up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1)
+                    up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
                     up_sig = torch.where(
                         up_sig != 0,
                         math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
@@ -642,6 +642,7 @@ class RSLTXVGenerate:
                     omz = 1.0 - nz_sigmas
                     sf = omz[-1] / (1.0 - 0.1)
                     up_sig[non_zero] = 1.0 - (omz / sf)
+                    up_sig = up_sig.float()
 
                     # Trim to denoise strength
                     start_step = int((1.0 - upscale_denoise) * upscale_steps)
