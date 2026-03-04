@@ -24,8 +24,11 @@ class RSFilmGrain:
         if intensity == 0:
             return (images,)
 
+        import comfy.model_management as mm
+        device = mm.get_torch_device()
+        images = images.to(device)
+
         B, H, W, C = images.shape
-        device = images.device
 
         # Rec.709 luminance
         lum_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device)
@@ -49,7 +52,6 @@ class RSFilmGrain:
             gen = torch.Generator(device="cpu").manual_seed(seed + i)
 
             if need_upscale:
-                # Generate at reduced resolution, upscale for organic clustering
                 small_mono = torch.randn(1, 1, noise_h, noise_w, generator=gen)
                 mono_noise[i] = F.interpolate(small_mono, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1).squeeze(0).to(device)
 
@@ -63,4 +65,5 @@ class RSFilmGrain:
         noise = mono_noise * (1.0 - color_amount) + color_noise * color_amount
 
         result = torch.clamp(images + noise * intensity * mask, 0.0, 1.0)
-        return (result,)
+        # Return on CPU (ComfyUI IMAGE convention)
+        return (result.cpu(),)

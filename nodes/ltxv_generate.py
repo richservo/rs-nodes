@@ -65,8 +65,8 @@ class RSLTXVGenerate:
                 "skip_sigma":        ("FLOAT",  {"default": 0.0,  "min": 0.0, "max": 1.0,  "step": 0.001, "tooltip": "Skip guidance when sigma > this value (CFG-Zero init). 0 = disabled, 0.997 = official default."}),
                 # Efficiency
                 "attention_mode":    (["auto", "default", "sage"],),
-                "ffn_chunks":        ("INT",   {"default": 0, "min": 0, "max": 16, "step": 1}),
-                "video_attn_scale":  ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Video attention scale (1.03 recommended). Also enables VRAM-efficient block forward for longer generation."}),
+                "ffn_chunks":        ("INT",   {"default": 4, "min": 0, "max": 16, "step": 1}),
+                "video_attn_scale":  ("FLOAT", {"default": 1.03, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Video attention scale (1.03 recommended). Also enables VRAM-efficient block forward for longer generation."}),
                 # Upscale
                 "upscale":           ("BOOLEAN", {"default": False}),
                 "upscale_model":     ("LATENT_UPSCALE_MODEL",),
@@ -76,6 +76,8 @@ class RSLTXVGenerate:
                 "upscale_cfg":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "upscale_denoise":   ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,   "step": 0.01}),
                 "upscale_fallback":  ("BOOLEAN", {"default": False}),
+                "upscale_tiling":    ("BOOLEAN", {"default": False, "tooltip": "Enable temporal tiling for upscale. Reduces VRAM but will cause temporal instability in fine details. Use ffn_chunks instead if possible."}),
+                "upscale_tile_t":    ("INT",     {"default": 4, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size (latent frames) when upscale_tiling is enabled (0 = auto). Reduce if OOM during upscale."}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": True}),
                 "tile_t":            ("INT",     {"default": 0, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size for VAE decode (0 = auto). Lower values reduce VRAM but may cause seams."}),
@@ -147,8 +149,8 @@ class RSLTXVGenerate:
         skip_sigma=0.0,
         # Efficiency
         attention_mode="auto",
-        ffn_chunks=0,
-        video_attn_scale=1.0,
+        ffn_chunks=4,
+        video_attn_scale=1.03,
         # Upscale
         upscale=False,
         upscale_model=None,
@@ -158,6 +160,8 @@ class RSLTXVGenerate:
         upscale_cfg=1.0,
         upscale_denoise=0.5,
         upscale_fallback=False,
+        upscale_tiling=False,
+        upscale_tile_t=4,
         # Output
         decode=False,
         tile_t=0,
@@ -204,6 +208,8 @@ class RSLTXVGenerate:
                 upscale_steps=upscale_steps, upscale_cfg=upscale_cfg,
                 upscale_denoise=upscale_denoise,
                 upscale_fallback=upscale_fallback,
+                upscale_tiling=upscale_tiling,
+                upscale_tile_t=upscale_tile_t,
                 decode=decode, tile_t=tile_t,
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
@@ -229,6 +235,7 @@ class RSLTXVGenerate:
         attention_mode, ffn_chunks, video_attn_scale,
         upscale, upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
+        upscale_tiling, upscale_tile_t,
         decode, tile_t,
         guider, sampler, sigmas,
         max_shift, base_shift,
@@ -546,9 +553,37 @@ class RSLTXVGenerate:
 
                 try:
                     upscale_model.to(device)
-                    up_latents = up_latents.to(dtype=model_dtype, device=device)
-                    up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
-                    upsampled = upscale_model(up_latents)
+                    if upscale_tiling:
+                        # Temporal chunking with overlap context for temporal convolutions
+                        latent_t = up_latents.shape[2]
+                        us_chunk_t = upscale_tile_t if upscale_tile_t > 0 else latent_t
+                        us_overlap = min(2, us_chunk_t // 2) if us_chunk_t < latent_t else 0
+                        if us_chunk_t < latent_t:
+                            print(f"[RSLTXVGenerate] Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
+                        chunks_out = []
+                        t_pos = 0
+                        while t_pos < latent_t:
+                            ctx_start = max(0, t_pos - us_overlap)
+                            ctx_end = min(t_pos + us_chunk_t + us_overlap, latent_t)
+                            if ctx_end < latent_t and (latent_t - ctx_end) < us_overlap + 1:
+                                ctx_end = latent_t
+                            chunk = up_latents[:, :, ctx_start:ctx_end]
+                            chunk = chunk.to(dtype=model_dtype, device=device)
+                            chunk = vae.first_stage_model.per_channel_statistics.un_normalize(chunk)
+                            out = upscale_model(chunk).to(device=mm.intermediate_device())
+                            trim_start = t_pos - ctx_start
+                            keep_end = min(t_pos + us_chunk_t, latent_t) - ctx_start
+                            if ctx_end == latent_t and t_pos + us_chunk_t < latent_t:
+                                keep_end = out.shape[2]
+                            chunks_out.append(out[:, :, trim_start:keep_end])
+                            t_pos = ctx_start + keep_end
+                        upsampled = torch.cat(chunks_out, dim=2)
+                        del chunks_out
+                    else:
+                        # Original single-pass
+                        up_latents = up_latents.to(dtype=model_dtype, device=device)
+                        up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
+                        upsampled = upscale_model(up_latents)
                 finally:
                     upscale_model.cpu()
 
@@ -626,23 +661,28 @@ class RSLTXVGenerate:
 
                     up_tokens = math.prod(upsampled.shape[2:])
                     up_shift = up_tokens * mm_shift + b
+                    print(f"[RSLTXVGenerate] Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
 
                     up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
                     up_model_sampling.set_parameters(shift=up_shift)
                     up_model.add_object_patch("model_sampling", up_model_sampling)
 
-                    up_sig = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
-                    up_sig = torch.where(
-                        up_sig != 0,
-                        math.exp(up_shift) / (math.exp(up_shift) + (1.0 / up_sig - 1.0) ** 1),
-                        torch.zeros_like(up_sig),
-                    )
-                    non_zero = up_sig != 0
-                    nz_sigmas = up_sig[non_zero]
-                    omz = 1.0 - nz_sigmas
-                    sf = omz[-1] / (1.0 - 0.1)
-                    up_sig[non_zero] = 1.0 - (omz / sf)
-                    up_sig = up_sig.float()
+                    # Build sigma schedule with numerically stable computation.
+                    # sig = exp(s) / (exp(s) + (1/t - 1)) and 1-sig = (1/t - 1) / (exp(s) + (1/t - 1))
+                    # Computing 1-sig directly avoids catastrophic cancellation when sig ≈ 1.0
+                    # (at high shift, sig is so close to 1.0 that 1.0-sig rounds to 0 in float64)
+                    exp_shift = math.exp(up_shift)
+                    t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                    non_zero = t != 0
+                    inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
+                    # omz = 1 - sigma, computed directly
+                    omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
+                    # Stretch so terminal sigma = 0.1 (i.e., terminal omz = 0.9)
+                    nz_omz = omz[non_zero]
+                    sf = nz_omz[-1] / (1.0 - 0.1)
+                    omz[non_zero] = nz_omz / sf
+                    # sigma = 1 - omz; t=0 maps to sigma=0
+                    up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
 
                     # Trim to denoise strength
                     start_step = int((1.0 - upscale_denoise) * upscale_steps)
@@ -655,16 +695,115 @@ class RSLTXVGenerate:
                     up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
                     up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
                     up_sampler = comfy.samplers.sampler_object("euler_ancestral")
-                    up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
 
-                    up_samples = up_guider.sample(
-                        up_noise, up_latent_image, up_sampler, up_sig,
-                        denoise_mask=up_denoise_mask,
-                        callback=up_callback,
-                        disable_pbar=disable_pbar,
-                        seed=seed + 1,
-                    )
-                    up_samples = up_samples.to(mm.intermediate_device())
+                    # Determine temporal tiling for re-diffusion
+                    video_t = upsampled.shape[2]
+                    if not upscale_tiling:
+                        rd_chunk_t = video_t  # single pass (original behavior)
+                    elif upscale_tile_t > 0:
+                        rd_chunk_t = min(upscale_tile_t, video_t)
+                    else:
+                        # Auto: estimate from free VRAM
+                        try:
+                            free_mem = mm.get_free_memory(device)
+                            _, _, _, up_h, up_w = upsampled.shape
+                            per_frame_bytes = 128 * up_h * up_w * 4 * 40
+                            estimated_tiles = max(2, int(free_mem * 0.6 / per_frame_bytes))
+                            rd_chunk_t = min(estimated_tiles, video_t)
+                        except Exception:
+                            rd_chunk_t = min(4, video_t)
+
+                    if rd_chunk_t >= video_t:
+                        # No chunking needed — run as single pass
+                        up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                        up_samples = up_guider.sample(
+                            up_noise, up_latent_image, up_sampler, up_sig,
+                            denoise_mask=up_denoise_mask,
+                            callback=up_callback,
+                            disable_pbar=disable_pbar,
+                            seed=seed + 1,
+                        )
+                        up_samples = up_samples.to(mm.intermediate_device())
+                    else:
+                        # Temporal tiling: process with overlap context, trim to core
+                        rd_overlap = min(2, rd_chunk_t // 2)
+                        print(f"[RSLTXVGenerate] Re-diffusion tiling: {video_t} latent frames, chunk_t={rd_chunk_t}, overlap={rd_overlap}")
+
+                        # Decompose AV for video-only tiling
+                        is_av = up_latent_image.is_nested
+                        if is_av:
+                            vid_latent, aud_latent = up_latent_image.unbind()
+                            vid_noise, aud_noise = up_noise.unbind()
+                            vid_mask = up_denoise_mask.unbind()[0] if up_denoise_mask is not None and up_denoise_mask.is_nested else None
+                            aud_mask = up_denoise_mask.unbind()[1] if up_denoise_mask is not None and up_denoise_mask.is_nested else None
+                        else:
+                            vid_latent = up_latent_image
+                            vid_noise = up_noise
+                            vid_mask = up_denoise_mask
+
+                        chunks_out = []
+                        chunk_idx = 0
+                        t_pos = 0
+                        while t_pos < video_t:
+                            # Expand window to include overlap context
+                            ctx_start = max(0, t_pos - rd_overlap) if chunk_idx > 0 else 0
+                            ctx_end = min(t_pos + rd_chunk_t + rd_overlap, video_t)
+                            if ctx_end < video_t and (video_t - ctx_end) < rd_overlap + 1:
+                                ctx_end = video_t
+
+                            # Slice video tensors for this chunk
+                            chunk_vid = vid_latent[:, :, ctx_start:ctx_end]
+                            chunk_noise = vid_noise[:, :, ctx_start:ctx_end]
+                            chunk_mask = vid_mask[:, :, ctx_start:ctx_end] if vid_mask is not None else None
+
+                            # Recombine with full audio for AV model
+                            if is_av:
+                                chunk_input = comfy.nested_tensor.NestedTensor((chunk_vid, aud_latent))
+                                chunk_n = comfy.nested_tensor.NestedTensor((chunk_noise, aud_noise))
+                                chunk_dm = comfy.nested_tensor.NestedTensor((chunk_mask, aud_mask)) if chunk_mask is not None else None
+                            else:
+                                chunk_input = chunk_vid
+                                chunk_n = chunk_noise
+                                chunk_dm = chunk_mask
+
+                            print(f"[RSLTXVGenerate]   Chunk {chunk_idx}: ctx=[{ctx_start}:{ctx_end}], core=[{t_pos}:{min(t_pos + rd_chunk_t, video_t)}]")
+                            up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                            chunk_out = up_guider.sample(
+                                chunk_n, chunk_input, up_sampler, up_sig,
+                                denoise_mask=chunk_dm,
+                                callback=up_callback,
+                                disable_pbar=disable_pbar,
+                                seed=seed + 1,
+                            )
+                            chunk_out = chunk_out.to(mm.intermediate_device())
+
+                            # Extract video portion
+                            if chunk_out.is_nested:
+                                chunk_vid_out = chunk_out.unbind()[0]
+                                audio_latent_out = chunk_out.unbind()[1] if len(chunk_out.unbind()) > 1 else audio_latent_out
+                            else:
+                                chunk_vid_out = chunk_out
+
+                            print(f"[RSLTXVGenerate]   Chunk {chunk_idx} output: shape={chunk_vid_out.shape}, min={chunk_vid_out.min():.4f}, max={chunk_vid_out.max():.4f}, mean={chunk_vid_out.mean():.4f}")
+
+                            # Trim overlap — keep only the core frames
+                            trim_start = t_pos - ctx_start
+                            keep_end = min(t_pos + rd_chunk_t, video_t) - ctx_start
+                            if ctx_end == video_t and t_pos + rd_chunk_t < video_t:
+                                keep_end = chunk_vid_out.shape[2]
+                            chunks_out.append(chunk_vid_out[:, :, trim_start:keep_end])
+
+                            t_pos = ctx_start + keep_end
+                            chunk_idx += 1
+                            self._free_vram()
+
+                        up_samples = torch.cat(chunks_out, dim=2)
+                        print(f"[RSLTXVGenerate] Re-diffusion result: shape={up_samples.shape}, min={up_samples.min():.4f}, max={up_samples.max():.4f}, mean={up_samples.mean():.4f}")
+                        del chunks_out
+
+                        # Re-wrap as nested if AV
+                        if is_av:
+                            up_samples = comfy.nested_tensor.NestedTensor((up_samples, audio_latent_out))
 
                     # Separate AV again after re-diffusion
                     if up_samples.is_nested:
@@ -686,13 +825,16 @@ class RSLTXVGenerate:
                 output_latent = pre_upscale_latent
                 decode = True
 
+        # Free model clones to reclaim CPU RAM from offloaded weights
+        del m
+        self._free_vram()
+
         # ----------------------------------------------------------------
         # 8. DECODE (optional)
         # ----------------------------------------------------------------
 
         if decode:
             print("[RSLTXVGenerate] Decoding latents to images (tiled)")
-            self._free_vram()
             # Tiled decode — LTXV VAE has 32x spatial compression
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression

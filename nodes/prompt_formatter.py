@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -61,6 +62,9 @@ class RSPromptFormatter:
             },
             "optional": {
                 "reference_image": ("IMAGE",),
+                "lock": ("BOOLEAN", {"default": False, "tooltip": "When enabled, reads cached output from file instead of calling Ollama."}),
+                "cache_file": ("STRING", {"default": "formatted_prompt.txt", "tooltip": "Filename for cached output (saved in output_dir)."}),
+                "output_dir": ("STRING", {"default": "", "tooltip": "Directory to save cached prompt. Empty = ComfyUI output folder."}),
             },
         }
 
@@ -143,7 +147,28 @@ class RSPromptFormatter:
         cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
         return cleaned
 
-    def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str, reference_image=None):
+    def _resolve_cache_path(self, output_dir, cache_file):
+        if output_dir.strip():
+            d = output_dir.strip()
+        else:
+            import folder_paths
+            d = folder_paths.get_output_directory()
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, cache_file)
+
+    def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str,
+                      reference_image=None, lock=False, cache_file="formatted_prompt.txt", output_dir=""):
+        cache_path = self._resolve_cache_path(output_dir, cache_file)
+
+        # Lock mode: read from cache file
+        if lock:
+            if not os.path.exists(cache_path):
+                raise RuntimeError(f"Lock enabled but cache file not found: {cache_path}")
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = f.read().strip()
+            print(f"[RS Prompt Formatter] Locked — using cached output from {cache_path}")
+            return (cached,)
+
         base = ollama_url.rstrip("/")
 
         images = None
@@ -191,4 +216,11 @@ class RSPromptFormatter:
         if not formatted:
             raise RuntimeError("Ollama returned an empty response")
 
-        return (formatted.strip(),)
+        formatted = formatted.strip()
+
+        # Save to cache file
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(formatted)
+        print(f"[RS Prompt Formatter] Saved output to {cache_path}")
+
+        return (formatted,)
