@@ -40,7 +40,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSFilmGrain": "RS Film Grain",
 }
 
-# MOSS-TTS batch node — only available if comfyui-moss-tts is installed
+# MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
+try:
+    from .nodes.moss_tts_loader import RSMossTTSLoader
+    NODE_CLASS_MAPPINGS["RSMossTTSLoader"] = RSMossTTSLoader
+    NODE_DISPLAY_NAME_MAPPINGS["RSMossTTSLoader"] = "RS MOSS TTS Loader"
+except ImportError:
+    pass
+
 try:
     from .nodes.moss_tts_save import RSMossTTSSave
     NODE_CLASS_MAPPINGS["RSMossTTSSave"] = RSMossTTSSave
