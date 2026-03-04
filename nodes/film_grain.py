@@ -24,46 +24,58 @@ class RSFilmGrain:
         if intensity == 0:
             return (images,)
 
+        import gc
         import comfy.model_management as mm
-        device = mm.get_torch_device()
-        images = images.to(device)
 
+        # Free VRAM from prior inference so GPU is available
+        mm.unload_all_models()
+        gc.collect()
+        torch.cuda.empty_cache()
+        mm.soft_empty_cache()
+
+        device = mm.get_torch_device()
         B, H, W, C = images.shape
 
-        # Rec.709 luminance
-        lum_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device)
-        luminance = (images * lum_weights).sum(dim=-1)  # (B, H, W)
-
-        # Midtone mask: parabola peaks at 0.5, zero at 0 and 1
-        midtone_mask = 4.0 * luminance * (1.0 - luminance)
-        # Blend between uniform (1.0) and midtone-only based on highlight_protection
-        mask = 1.0 - highlight_protection + highlight_protection * midtone_mask  # (B, H, W)
-        mask = mask.unsqueeze(-1)  # (B, H, W, 1)
-
-        # Generate grain per frame
         noise_h = max(1, round(H / grain_size))
         noise_w = max(1, round(W / grain_size))
         need_upscale = noise_h != H or noise_w != W
 
-        mono_noise = torch.empty(B, H, W, 1, device=device)
-        color_noise = torch.empty(B, H, W, C, device=device)
+        lum_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device)
 
-        for i in range(B):
-            gen = torch.Generator(device="cpu").manual_seed(seed + i)
+        # Process in batches — 8 frames ≈ 200 MB image data + noise overhead
+        batch_size = 8
+        result = torch.empty_like(images)  # output stays on CPU
 
-            if need_upscale:
-                small_mono = torch.randn(1, 1, noise_h, noise_w, generator=gen)
-                mono_noise[i] = F.interpolate(small_mono, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1).squeeze(0).to(device)
+        for start in range(0, B, batch_size):
+            end = min(start + batch_size, B)
+            chunk = images[start:end].to(device)
+            n = end - start
 
-                small_color = torch.randn(1, C, noise_h, noise_w, generator=gen)
-                color_noise[i] = F.interpolate(small_color, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1).squeeze(0).to(device)
-            else:
-                mono_noise[i] = torch.randn(H, W, 1, generator=gen).to(device)
-                color_noise[i] = torch.randn(H, W, C, generator=gen).to(device)
+            # Luminance and mask
+            luminance = (chunk * lum_weights).sum(dim=-1)
+            midtone_mask = 4.0 * luminance * (1.0 - luminance)
+            mask = (1.0 - highlight_protection + highlight_protection * midtone_mask).unsqueeze(-1)
+            del luminance, midtone_mask
 
-        # Blend mono/color grain
-        noise = mono_noise * (1.0 - color_amount) + color_noise * color_amount
+            # Generate and apply noise per frame — all on GPU
+            for i in range(n):
+                gen = torch.Generator(device=device).manual_seed(seed + start + i)
 
-        result = torch.clamp(images + noise * intensity * mask, 0.0, 1.0)
-        # Return on CPU (ComfyUI IMAGE convention)
-        return (result.cpu(),)
+                if need_upscale:
+                    small_mono = torch.randn(1, 1, noise_h, noise_w, device=device, generator=gen)
+                    mono = F.interpolate(small_mono, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1).squeeze(0)
+                    small_color = torch.randn(1, C, noise_h, noise_w, device=device, generator=gen)
+                    color = F.interpolate(small_color, size=(H, W), mode="bilinear", align_corners=False).permute(0, 2, 3, 1).squeeze(0)
+                    del small_mono, small_color
+                else:
+                    mono = torch.randn(H, W, 1, device=device, generator=gen)
+                    color = torch.randn(H, W, C, device=device, generator=gen)
+
+                noise = mono.lerp(color, color_amount)
+                chunk[i].add_(noise.mul_(intensity).mul_(mask[i]))
+                del mono, color, noise
+
+            result[start:end] = chunk.clamp_(0.0, 1.0).cpu()
+            del chunk, mask
+
+        return (result,)
