@@ -835,23 +835,27 @@ class RSLTXVGenerate:
 
         if decode:
             print("[RSLTXVGenerate] Decoding latents to images (tiled)")
-            # Tiled decode — LTXV VAE has 32x spatial compression
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression
-            overlap = 64 // compression
+            overlap = 128 // compression  # larger overlap to reduce tile seams
             temporal_compression = vae.temporal_compression_decode()
             if tile_t > 0:
                 # User override
                 decode_tile_t = tile_t
-                overlap_t = max(2, decode_tile_t // 4)
+                overlap_t = max(2, decode_tile_t // 2)
             elif temporal_compression is not None:
                 decode_tile_t = max(2, 64 // temporal_compression)
-                overlap_t = max(2, decode_tile_t // 4)
+                overlap_t = max(2, decode_tile_t // 2)
             else:
                 decode_tile_t = None
                 overlap_t = None
+
+            # Add tiny noise to break up tile boundary artifacts
+            samples = output_latent["samples"]
+            samples = samples + torch.randn_like(samples) * 1e-5
+
             images = vae.decode_tiled(
-                output_latent["samples"],
+                samples,
                 tile_x=tile_size, tile_y=tile_size, overlap=overlap,
                 tile_t=decode_tile_t, overlap_t=overlap_t,
             )
