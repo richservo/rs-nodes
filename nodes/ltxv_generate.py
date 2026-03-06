@@ -879,6 +879,107 @@ class RSLTXVGenerate:
                     else:
                         output_latent = {"samples": up_samples}
 
+                # T2V pass 2: decode first frame from pass 1, sharpen, use as
+                # I2V-style guidance for a second re-diffusion.  This gives T2V
+                # the same anchor-based quality as the I2V upscale path.
+                if not has_image_guides and do_rediffusion and upscale_denoise > 0 and upscale_steps > 0:
+                    print("[RSLTXVGenerate] T2V pass 2: decoding first frame for I2V guidance")
+                    self._free_vram()
+
+                    video_latent = output_latent["samples"]
+
+                    # Decode just the first latent frame
+                    first_pixels = vae.decode(video_latent[:, :, :1])
+                    if len(first_pixels.shape) == 5:
+                        first_pixels = first_pixels.reshape(
+                            -1, first_pixels.shape[-3], first_pixels.shape[-2], first_pixels.shape[-1]
+                        )
+
+                    # Sharpen + grain to enhance detail before using as anchor
+                    first_pixels = self._sharpen_and_grain(first_pixels)
+
+                    # Encode sharpened frame and inject at position 0
+                    _, height_sf, width_sf = vae.downscale_index_formula
+                    _, _, _, p2_lh, p2_lw = video_latent.shape
+                    p2_tw, p2_th = p2_lw * width_sf, p2_lh * height_sf
+                    if first_pixels.shape[1] != p2_th or first_pixels.shape[2] != p2_tw:
+                        first_pixels = comfy.utils.common_upscale(
+                            first_pixels.movedim(-1, 1), p2_tw, p2_th, "bilinear", "center"
+                        ).movedim(1, -1)
+                    first_encoded = vae.encode(first_pixels[:, :, :, :3])
+
+                    video_latent = video_latent.clone()
+                    video_latent[:, :, :first_encoded.shape[2]] = first_encoded
+
+                    # Denoise mask: preserve first frame (0.0), denoise rest (1.0)
+                    p2_denoise_mask = torch.ones(
+                        (video_latent.shape[0], 1, video_latent.shape[2], 1, 1),
+                        dtype=video_latent.dtype, device=video_latent.device,
+                    )
+                    p2_denoise_mask[:, :, :first_encoded.shape[2]] = 0.0
+
+                    # Recombine with audio if needed
+                    if has_audio and audio_latent_out is not None:
+                        p2_combined = comfy.nested_tensor.NestedTensor((video_latent, audio_latent_out))
+                        audio_mask = torch.ones_like(audio_latent_out[:, :1])
+                        p2_denoise_mask = comfy.nested_tensor.NestedTensor((p2_denoise_mask, audio_mask))
+                    else:
+                        p2_combined = video_latent
+
+                    # I2V-style model + sigmas (computed from actual upscaled tokens)
+                    p2_model = m.clone()
+                    if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                        lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                        lora = self.loaded_lora[1] if self.loaded_lora and self.loaded_lora[0] == lora_path else None
+                        if lora is None:
+                            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                            self.loaded_lora = (lora_path, lora)
+                        p2_model, _ = comfy.sd.load_lora_for_models(p2_model, None, lora, upscale_lora_strength, 0)
+
+                    p2_tokens = math.prod(video_latent.shape[2:])
+                    p2_shift = p2_tokens * mm_shift + b
+                    p2_ms = ModelSamplingAdvanced(p2_model.model.model_config)
+                    p2_ms.set_parameters(shift=p2_shift)
+                    p2_model.add_object_patch("model_sampling", p2_ms)
+
+                    exp_s = math.exp(p2_shift)
+                    t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                    nz = t != 0
+                    inv = torch.where(nz, 1.0 / t - 1.0, torch.zeros_like(t))
+                    omz = torch.where(nz, inv / (exp_s + inv), torch.ones_like(t))
+                    nz_omz = omz[nz]
+                    omz[nz] = nz_omz / (nz_omz[-1] / (1.0 - 0.1))
+                    p2_sig = torch.where(nz, 1.0 - omz, torch.zeros_like(omz)).float()
+                    p2_sig = p2_sig[int((1.0 - upscale_denoise) * upscale_steps):]
+
+                    print(f"[RSLTXVGenerate] T2V pass 2: {upscale_steps} steps, denoise={upscale_denoise}, shift={p2_shift:.3f}")
+
+                    p2_guider = comfy.samplers.CFGGuider(p2_model)
+                    p2_guider.set_conds(positive, negative)
+                    p2_guider.set_cfg(upscale_cfg)
+
+                    p2_latent = comfy.sample.fix_empty_latent_channels(p2_guider.model_patcher, p2_combined)
+                    p2_noise = comfy.sample.prepare_noise(p2_latent, seed + 2)
+                    p2_sampler = comfy.samplers.sampler_object("euler_ancestral")
+
+                    p2_cb = latent_preview.prepare_callback(p2_guider.model_patcher, p2_sig.shape[-1] - 1)
+                    p2_out = p2_guider.sample(
+                        p2_noise, p2_latent, p2_sampler, p2_sig,
+                        denoise_mask=p2_denoise_mask,
+                        callback=p2_cb,
+                        disable_pbar=disable_pbar,
+                        seed=seed + 2,
+                    )
+                    p2_out = p2_out.to(mm.intermediate_device())
+
+                    if p2_out.is_nested:
+                        p2_parts = p2_out.unbind()
+                        output_latent = {"samples": p2_parts[0]}
+                        audio_latent_out = p2_parts[1] if len(p2_parts) > 1 else audio_latent_out
+                    else:
+                        output_latent = {"samples": p2_out}
+                    print("[RSLTXVGenerate] T2V pass 2 complete")
+
                 if upscale_fallback:
                     del pre_upscale_latent  # free system RAM backup
 
@@ -969,6 +1070,54 @@ class RSLTXVGenerate:
         gc.collect()
         torch.cuda.empty_cache()
         mm.soft_empty_cache()
+
+    @staticmethod
+    def _sharpen_and_grain(image, sharpen_amount=0.15,
+                           grain_intensity=0.05, grain_size=1.2,
+                           grain_color_amount=0.30, grain_highlight_protection=0.50):
+        """Subtle sharpen + film grain for T2V upscale guidance frame.
+        image: [B, H, W, C] float 0-1."""
+        device = image.device
+
+        # Unsharp mask
+        x = image.movedim(-1, 1)  # BCHW
+        blurred = torch.nn.functional.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        x = (x + sharpen_amount * (x - blurred)).clamp(0, 1)
+        image = x.movedim(1, -1)  # BHWC
+        del x, blurred
+
+        # Film grain (from RSFilmGrain, single-frame fast path)
+        if grain_intensity > 0:
+            B, H, W, C = image.shape
+            noise_h = max(1, round(H / grain_size))
+            noise_w = max(1, round(W / grain_size))
+            need_upscale = noise_h != H or noise_w != W
+
+            lum_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device)
+            luminance = (image * lum_weights).sum(dim=-1)
+            midtone_mask = 4.0 * luminance * (1.0 - luminance)
+            mask = (1.0 - grain_highlight_protection + grain_highlight_protection * midtone_mask).unsqueeze(-1)
+
+            for i in range(B):
+                if need_upscale:
+                    small_mono = torch.randn(1, 1, noise_h, noise_w, device=device)
+                    mono = torch.nn.functional.interpolate(
+                        small_mono, size=(H, W), mode="bilinear", align_corners=False
+                    ).permute(0, 2, 3, 1).squeeze(0)
+                    small_color = torch.randn(1, C, noise_h, noise_w, device=device)
+                    color = torch.nn.functional.interpolate(
+                        small_color, size=(H, W), mode="bilinear", align_corners=False
+                    ).permute(0, 2, 3, 1).squeeze(0)
+                else:
+                    mono = torch.randn(H, W, 1, device=device)
+                    color = torch.randn(H, W, C, device=device)
+
+                noise = mono.lerp(color, grain_color_amount)
+                image[i].add_(noise.mul_(grain_intensity).mul_(mask[i]))
+
+            image = image.clamp(0, 1)
+
+        return image
 
     @staticmethod
     def _apply_ffn_chunking(model_clone, num_chunks):
