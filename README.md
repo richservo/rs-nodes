@@ -454,6 +454,8 @@ Load MOSS-TTS model variants for text-to-speech generation.
 - Models cached in `{models_dir}/moss-tts/`
 - Clears VRAM before loading
 
+> **Security Note:** MOSS-TTS models use `trust_remote_code=True` when loading via HuggingFace `transformers`. This is required because the model defines custom architecture code not natively included in the `transformers` library. Without it, the model cannot load. No data is sent externally — the flag only allows the model's bundled Python code to execute locally during loading.
+
 ---
 
 #### RS MOSS TTS Batch Save
