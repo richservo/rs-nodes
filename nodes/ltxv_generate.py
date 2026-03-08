@@ -637,8 +637,6 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         if do_upscale:
-            # Preserve original audio from first pass — re-diffusion degrades it
-            original_audio_latent = audio_latent_out
             if upscale_fallback:
                 pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
@@ -780,11 +778,12 @@ class RSLTXVGenerate:
                     self._free_vram()
 
                     # Recombine video + audio for the AV model
-                    # Audio mask=0 preserves audio for lip sync / timing guidance
+                    # Input audio: mask=0 (preserve for guidance), generated: mask=1 (regenerate at full res)
                     if has_audio and audio_latent_out is not None:
                         up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
+                        audio_mask_val = 0.0 if audio_is_input else 1.0
                         if up_denoise_mask is not None:
-                            audio_mask = torch.zeros_like(audio_latent_out[:, :1])
+                            audio_mask = torch.full_like(audio_latent_out[:, :1], audio_mask_val)
                             up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
                     else:
                         up_combined = upsampled
@@ -1008,10 +1007,11 @@ class RSLTXVGenerate:
                     )
                     p2_denoise_mask[:, :, :first_encoded.shape[2]] = 0.0
 
-                    # Recombine with audio for lip sync guidance (mask=0 preserves audio)
+                    # Input audio: preserve (mask=0), generated: regenerate at full res (mask=1)
                     if has_audio and audio_latent_out is not None:
                         p2_combined = comfy.nested_tensor.NestedTensor((video_latent, audio_latent_out))
-                        audio_mask = torch.zeros_like(audio_latent_out[:, :1])
+                        p2_audio_mask_val = 0.0 if audio_is_input else 1.0
+                        audio_mask = torch.full_like(audio_latent_out[:, :1], p2_audio_mask_val)
                         p2_denoise_mask = comfy.nested_tensor.NestedTensor((p2_denoise_mask, audio_mask))
                     else:
                         p2_combined = video_latent
@@ -1069,9 +1069,6 @@ class RSLTXVGenerate:
                     else:
                         output_latent = {"samples": p2_out}
                     print("[RSLTXVGenerate] T2V pass 2 complete")
-
-                # Restore original audio — re-diffusion passes degrade audio quality
-                audio_latent_out = original_audio_latent
 
                 if upscale_fallback:
                     del pre_upscale_latent  # free system RAM backup

@@ -9,6 +9,7 @@ from .nodes.ic_lora_guider import RSICLoRAGuider
 from .nodes.canny_preprocessor import RSCannyPreprocessor
 from .nodes.video_trim import RSVideoTrim
 from .nodes.film_grain import RSFilmGrain
+from .nodes.ltxv_upscale import RSLTXVUpscale
 
 WEB_DIRECTORY = "./web"
 
@@ -24,6 +25,7 @@ NODE_CLASS_MAPPINGS = {
     "RSCannyPreprocessor": RSCannyPreprocessor,
     "RSVideoTrim": RSVideoTrim,
     "RSFilmGrain": RSFilmGrain,
+    "RSLTXVUpscale": RSLTXVUpscale,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -38,6 +40,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSCannyPreprocessor": "RS Canny Preprocessor",
     "RSVideoTrim": "RS Video Trim",
     "RSFilmGrain": "RS Film Grain",
+    "RSLTXVUpscale": "RS LTXV Upscale",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
