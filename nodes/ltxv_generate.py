@@ -291,6 +291,94 @@ class RSLTXVGenerate:
             gen_height = height // 2
             print(f"[RSLTXVGenerate] Upscale enabled: generating at {gen_width}x{gen_height}, target {width}x{height}")
 
+        # T2V first-frame bootstrap: generate a short clip at full resolution,
+        # decode the first frame, and use it as I2V guidance for the main generation.
+        # This converts T2V→I2V so the upscale path only needs one re-diffusion pass.
+        if do_upscale and first_image is None and last_image is None and middle_image is None:
+            print(f"[RSLTXVGenerate] T2V bootstrap: generating 9 frames at {width}x{height} for first frame")
+            bootstrap_frames = 9
+            bootstrap_latent = torch.zeros(
+                [1, 128, ((bootstrap_frames - 1) // 8) + 1, height // 32, width // 32],
+                device=mm.intermediate_device(),
+            )
+
+            # Build shift + sigmas for bootstrap resolution
+            sampling_base = comfy.model_sampling.ModelSamplingFlux
+            sampling_type = comfy.model_sampling.CONST
+
+            class _BootstrapSampling(sampling_base, sampling_type):
+                pass
+
+            boot_tokens = math.prod(bootstrap_latent.shape[2:])
+            x1, x2 = 1024, 4096
+            boot_mm = (max_shift - base_shift) / (x2 - x1)
+            boot_b = base_shift - boot_mm * x1
+            boot_shift = boot_tokens * boot_mm + boot_b
+
+            boot_model = m.clone()
+            boot_ms = _BootstrapSampling(boot_model.model.model_config)
+            boot_ms.set_parameters(shift=boot_shift)
+            boot_model.add_object_patch("model_sampling", boot_ms)
+
+            boot_sig = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
+            boot_sig = torch.where(
+                boot_sig != 0,
+                math.exp(boot_shift) / (math.exp(boot_shift) + (1.0 / boot_sig - 1.0) ** 1),
+                torch.zeros_like(boot_sig),
+            )
+            nz = boot_sig != 0
+            omz = 1.0 - boot_sig[nz]
+            boot_sig[nz] = 1.0 - (omz / (omz[-1] / (1.0 - 0.1)))
+            boot_sig = boot_sig.float()
+
+            # Stamp full frame rate for bootstrap
+            boot_pos = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+            boot_neg = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+
+            from ..utils.multimodal_guider import MultimodalGuider
+            boot_guider = MultimodalGuider(
+                boot_model, boot_pos, boot_neg,
+                video_cfg=cfg, audio_cfg=audio_cfg,
+                stg_scale=stg_scale,
+                stg_blocks=[int(s.strip()) for s in stg_blocks.split(",")],
+                rescale=rescale,
+                video_cfg_end=cfg_end if cfg_end >= 0 else None,
+                stg_scale_end=stg_end if stg_end >= 0 else None,
+                audio_stg_scale=audio_stg_scale if audio_stg_scale >= 0 else None,
+                video_modality_scale=video_modality_scale,
+                audio_modality_scale=audio_modality_scale,
+                cfg_star_rescale=cfg_star_rescale,
+                skip_sigma_threshold=skip_sigma,
+                video_attn_scale=video_attn_scale,
+            )
+
+            boot_latent = comfy.sample.fix_empty_latent_channels(boot_guider.model_patcher, bootstrap_latent)
+            boot_noise = comfy.sample.prepare_noise(boot_latent, seed)
+            boot_sampler = comfy.samplers.sampler_object("euler_ancestral")
+            boot_cb = latent_preview.prepare_callback(boot_guider.model_patcher, boot_sig.shape[-1] - 1)
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+            print("[RSLTXVGenerate] T2V bootstrap: sampling first frame...")
+            boot_out = boot_guider.sample(
+                boot_noise, boot_latent, boot_sampler, boot_sig,
+                denoise_mask=None, callback=boot_cb,
+                disable_pbar=disable_pbar, seed=seed,
+            )
+            boot_out = boot_out.to(mm.intermediate_device())
+
+            # Decode first frame
+            first_pixels = vae.decode(boot_out[:, :, :1])
+            if len(first_pixels.shape) == 5:
+                first_pixels = first_pixels.reshape(
+                    -1, first_pixels.shape[-3], first_pixels.shape[-2], first_pixels.shape[-1]
+                )
+            first_image = first_pixels
+            first_strength = 1.0
+            print(f"[RSLTXVGenerate] T2V bootstrap: first frame {first_image.shape[2]}x{first_image.shape[1]} ready")
+
+            del boot_out, boot_model, boot_guider
+            self._free_vram()
+
         # Temporal upscale: generate at half frame count, then 2x temporal upscale
         do_temporal_upscale = do_upscale and temporal_upscale_model is not None
         gen_num_frames = num_frames
