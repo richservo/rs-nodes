@@ -1,6 +1,7 @@
 import gc
 import math
 import random
+import uuid
 
 import torch
 import comfy.model_management as mm
@@ -86,6 +87,9 @@ class RSFlux2Generate:
                 "lora_strength":  ("FLOAT", {"default": 1.0,  "min": -10.0, "max": 10.0,  "step": 0.01}),
                 "attention_mode": (["auto", "default", "sage"],),
                 "ffn_chunks":     ("INT",   {"default": 4,    "min": 0,     "max": 16,    "step": 1}),
+                "latent_upscale": (["off", "on"],),
+                "upscale_denoise": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01,
+                                              "tooltip": "Denoise strength for the second pass at full resolution"}),
             },
         }
 
@@ -101,7 +105,7 @@ class RSFlux2Generate:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        return float("nan")
+        return uuid.uuid4().hex
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -131,6 +135,8 @@ class RSFlux2Generate:
         lora_strength=1.0,
         attention_mode="auto",
         ffn_chunks=4,
+        latent_upscale="off",
+        upscale_denoise=0.45,
         **kwargs,
     ):
         # Resolve seed
@@ -155,6 +161,7 @@ class RSFlux2Generate:
                 cfg=cfg, denoise=denoise,
                 lora=lora, lora_strength=lora_strength,
                 attention_mode=attention_mode, ffn_chunks=ffn_chunks,
+                latent_upscale=latent_upscale, upscale_denoise=upscale_denoise,
             )
             return {"ui": {"seed": [actual_seed]}, "result": (images,)}
         except Exception:
@@ -175,6 +182,7 @@ class RSFlux2Generate:
         negative_prompt, cfg, denoise,
         lora, lora_strength,
         attention_mode, ffn_chunks,
+        latent_upscale="off", upscale_denoise=0.45,
     ):
         # ----------------------------------------------------------------
         # 1. TEXT ENCODE
@@ -251,23 +259,80 @@ class RSFlux2Generate:
             m.model_options.setdefault("transformer_options", {})[
                 "optimized_attention_override"
             ] = lambda func, *args, **kwargs: attn_func(*args, **kwargs)
+            print("[RSFlux2Generate] Using SageAttention")
+        else:
+            print("[RSFlux2Generate] Using default attention")
 
         # FFN chunking (double blocks only — single blocks have fused MLP)
         if ffn_chunks > 0:
             self._apply_ffn_chunking(m, ffn_chunks)
 
         # ----------------------------------------------------------------
-        # 4. EMPTY LATENT
+        # 4. FIRST PASS (half res if upscaling, otherwise full res)
         # ----------------------------------------------------------------
 
-        latent = torch.zeros(
-            [1, 16, height // 8, width // 8],
-            device=mm.intermediate_device(),
+        if latent_upscale == "on":
+            first_w = ((width // 2) // 16) * 16
+            first_h = ((height // 2) // 16) * 16
+            print(f"[RSFlux2Generate] Latent upscale: first pass {first_w}x{first_h} → {width}x{height}")
+        else:
+            first_w = width
+            first_h = height
+
+        samples = self._sample_pass(
+            m, positive, negative, cfg, seed,
+            first_w, first_h, steps, denoise,
         )
 
         # ----------------------------------------------------------------
-        # 5. SCHEDULE (Flux2 empirical mu)
+        # 5. SECOND PASS (upscale latent + re-diffuse)
         # ----------------------------------------------------------------
+
+        if latent_upscale == "on" and upscale_denoise > 0:
+            # Bilinear upscale latent to full resolution
+            samples = torch.nn.functional.interpolate(
+                samples, size=(height // 8, width // 8),
+                mode="bilinear", align_corners=False,
+            )
+            print(f"[RSFlux2Generate] Latent upscaled, re-diffusing at denoise={upscale_denoise}")
+
+            samples = self._sample_pass(
+                m, positive, negative, cfg, seed + 1,
+                width, height, steps, upscale_denoise,
+                init_latent=samples,
+            )
+
+        samples = samples.to(mm.intermediate_device())
+
+        # Free model clones before decode
+        del m
+        self._free_vram()
+
+        # ----------------------------------------------------------------
+        # 6. VAE DECODE
+        # ----------------------------------------------------------------
+
+        print("[RSFlux2Generate] Decoding latents...")
+        pixel_count = samples.shape[2] * 8 * samples.shape[3] * 8
+        if pixel_count > 1024 * 1024:
+            print(f"[RSFlux2Generate] Large image ({samples.shape[3]*8}x{samples.shape[2]*8}), using tiled decode")
+            images = vae.decode_tiled(samples)
+        else:
+            images = vae.decode(samples)
+
+        print("[RSFlux2Generate] Done")
+        return images
+
+    def _sample_pass(self, m, positive, negative, cfg, seed, width, height, steps, denoise, init_latent=None):
+        """Run a single sampling pass. If init_latent is provided, use it instead of empty latent."""
+
+        if init_latent is not None:
+            latent = init_latent
+        else:
+            latent = torch.zeros(
+                [1, 16, height // 8, width // 8],
+                device=mm.intermediate_device(),
+            )
 
         image_seq_len = (width * height) // (16 * 16)
         mu = compute_empirical_mu(image_seq_len, steps)
@@ -275,16 +340,11 @@ class RSFlux2Generate:
         sigmas = torch.linspace(1, 0, steps + 1)
         sigmas = generalized_time_snr_shift(sigmas, mu, 1.0)
 
-        # Trim for denoise < 1.0
         if denoise < 1.0:
             start_step = int((1.0 - denoise) * steps)
             sigmas = sigmas[start_step:]
 
         print(f"[RSFlux2Generate] Schedule: seq_len={image_seq_len}, mu={mu:.4f}, {len(sigmas)-1} steps")
-
-        # ----------------------------------------------------------------
-        # 6. SAMPLE
-        # ----------------------------------------------------------------
 
         guider = comfy.samplers.CFGGuider(m)
         guider.set_conds(positive, negative)
@@ -306,21 +366,8 @@ class RSFlux2Generate:
             disable_pbar=disable_pbar,
             seed=seed,
         )
-        samples = samples.to(mm.intermediate_device())
-
-        # Free model clones before decode
-        del m, guider
-        self._free_vram()
-
-        # ----------------------------------------------------------------
-        # 7. VAE DECODE
-        # ----------------------------------------------------------------
-
-        print("[RSFlux2Generate] Decoding latents...")
-        images = vae.decode(samples)
-
-        print("[RSFlux2Generate] Done")
-        return images
+        del guider
+        return samples
 
     # ------------------------------------------------------------------
     # Helpers

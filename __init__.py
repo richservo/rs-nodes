@@ -12,6 +12,7 @@ from .nodes.film_grain import RSFilmGrain
 from .nodes.ltxv_upscale import RSLTXVUpscale
 from .nodes.flux2_generate import RSFlux2Generate
 from .nodes.prompt_formatter_local import RSPromptFormatterLocal
+from .nodes.z_image_generate import RSZImageGenerate
 
 WEB_DIRECTORY = "./web"
 
@@ -30,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVUpscale": RSLTXVUpscale,
     "RSFlux2Generate": RSFlux2Generate,
     "RSPromptFormatterLocal": RSPromptFormatterLocal,
+    "RSZImageGenerate": RSZImageGenerate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -47,6 +49,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVUpscale": "RS LTXV Upscale",
     "RSFlux2Generate": "RS Flux2 Generate",
     "RSPromptFormatterLocal": "RS Prompt Formatter Local",
+    "RSZImageGenerate": "RS Z-Image Generate",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed

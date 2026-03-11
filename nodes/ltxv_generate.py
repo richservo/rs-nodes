@@ -1,6 +1,7 @@
 import gc
 import math
 import random
+import uuid
 
 import torch
 import comfy.model_management as mm
@@ -104,7 +105,7 @@ class RSLTXVGenerate:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        return float("nan")
+        return uuid.uuid4().hex
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -706,18 +707,20 @@ class RSLTXVGenerate:
                 _, _, up_latent_t, up_lh, up_lw = upsampled.shape
                 up_target_w, up_target_h = up_lw * up_width_sf, up_lh * up_height_sf
 
+                # Only use a single guide for re-diffusion to avoid snapping.
+                # Priority: first > last > middle
                 up_guides = []
                 if first_image is not None:
                     up_guides.append((first_image, 0, first_strength, "first"))
-                if middle_image is not None:
+                elif last_image is not None:
+                    up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
+                elif middle_image is not None:
                     mid_idx = (num_frames - 1) // 2
                     mid_idx = max(0, (mid_idx // 8) * 8)
                     if mid_idx == 0 and num_frames > 8:
                         mid_idx = 8
                     mid_latent_idx = (mid_idx + time_sf - 1) // time_sf
                     up_guides.append((middle_image, mid_latent_idx, middle_strength, "middle"))
-                if last_image is not None:
-                    up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
 
                 if up_guides:
                     up_denoise_mask = torch.ones(
