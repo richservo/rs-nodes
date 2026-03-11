@@ -707,19 +707,19 @@ class RSLTXVGenerate:
 
                 up_scale_factors = vae.downscale_index_formula
 
-                # Only use a single guide for re-diffusion to avoid snapping.
-                # Priority: first > last > middle
+                # Re-inject all guides at upscaled resolution (crop guides handle
+                # positioning correctly, so multiple guides no longer cause snapping)
                 up_guides = []
                 if first_image is not None:
                     up_guides.append((first_image, 0, first_strength, "first"))
-                elif last_image is not None:
-                    up_guides.append((last_image, -1, last_strength, "last"))
-                elif middle_image is not None:
+                if middle_image is not None:
                     mid_idx = (num_frames - 1) // 2
                     mid_idx = max(0, (mid_idx // 8) * 8)
                     if mid_idx == 0 and num_frames > 8:
                         mid_idx = 8
                     up_guides.append((middle_image, mid_idx, middle_strength, "middle"))
+                if last_image is not None:
+                    up_guides.append((last_image, -1, last_strength, "last"))
 
                 up_noise_mask = None
 
