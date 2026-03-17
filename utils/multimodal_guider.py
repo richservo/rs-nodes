@@ -781,9 +781,11 @@ class ICLoRAGuider(MultimodalGuider):
         self._max_shift = max_shift
         self._base_shift = base_shift
         # Set after encoding in sample()
-        self._guide_latent = None
-        self._guide_mask = None   # sparse dilation mask (None if dsf=1)
         self._num_guide_frames = 0
+        # Save original conds so we can reset before each encode pass
+        # (prevents keyframe_idxs from accumulating across re-runs)
+        self._orig_positive = positive
+        self._orig_negative = negative
 
     # ------------------------------------------------------------------
     # Model sampling shift — deferred until latent dims are known
@@ -831,6 +833,13 @@ class ICLoRAGuider(MultimodalGuider):
         final ones used for sampling.
         """
         from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask
+
+        # Reset conditioning to original state (prevents keyframe_idxs
+        # from accumulating across re-runs when guider is reused)
+        self.inner_set_conds({
+            "positive": self._orig_positive,
+            "negative": self._orig_negative,
+        })
 
         # --- Extract video latent (handle NestedTensor for AV) ---
         if latent_image.is_nested:
@@ -932,9 +941,6 @@ class ICLoRAGuider(MultimodalGuider):
                     f"causal_fix={causal_fix}")
 
         self.inner_set_conds({"positive": positive, "negative": negative})
-        self._control_pixels = None
-        self._vae = None
-
         # --- Reassemble NestedTensor if AV ---
         if audio is not None:
             latent_out = comfy.nested_tensor.NestedTensor((video_out, audio))
@@ -1004,7 +1010,6 @@ class ICLoRAGuider(MultimodalGuider):
         self._apply_model_sampling(latent_image)
 
         # 2. Encode guide + inject into latent and conditioning
-        #    Uses append_keyframe with the REAL latent (matching official flow)
         denoise_mask = kwargs.get("denoise_mask", None)
         latent_image, denoise_mask = self._encode_and_inject_guide(
             latent_image, denoise_mask
