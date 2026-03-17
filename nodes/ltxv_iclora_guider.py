@@ -66,6 +66,15 @@ class RSLTXVICLoRAGuider:
                 "upscale":           ("BOOLEAN", {"default": False}),
                 "width":             ("INT",   {"default": 768, "min": 64,    "max": 8192, "step": 32}),
                 "height":            ("INT",   {"default": 512, "min": 64,    "max": 8192, "step": 32}),
+                # Audio/modality
+                "audio_stg_scale":   ("FLOAT", {"default": -1.0, "min": -1.0, "max": 10.0, "step": 0.1,
+                                                "tooltip": "Audio STG scale (-1 = use video stg_scale)"}),
+                "video_modality_scale": ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 100.0, "step": 0.1,
+                                                   "tooltip": "Video modality isolation (0 = match official default)"}),
+                "audio_modality_scale": ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1,
+                                                   "tooltip": "Audio modality isolation (3 = match official default)"}),
+                "video_attn_scale":  ("FLOAT", {"default": 1.03, "min": 0.0, "max": 10.0, "step": 0.01,
+                                                "tooltip": "Video attention scale (1.03 recommended)"}),
             },
         }
 
@@ -83,6 +92,8 @@ class RSLTXVICLoRAGuider:
         max_shift=2.2, base_shift=0.95,
         frame_rate=25.0, attention_mode="auto",
         upscale=False, width=768, height=512,
+        audio_stg_scale=-1.0, video_modality_scale=0.0,
+        audio_modality_scale=3.0, video_attn_scale=1.03,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -174,6 +185,10 @@ class RSLTXVICLoRAGuider:
             stg_scale_end=stg_end if stg_end >= 0 else None,
             cfg_star_rescale=cfg_star_rescale,
             skip_sigma_threshold=skip_sigma,
+            audio_stg_scale=audio_stg_scale if audio_stg_scale >= 0 else None,
+            video_modality_scale=video_modality_scale,
+            audio_modality_scale=audio_modality_scale,
+            video_attn_scale=video_attn_scale,
         )
 
         # Attach control_info for upscale rebuild

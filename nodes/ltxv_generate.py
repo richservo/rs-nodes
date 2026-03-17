@@ -462,6 +462,10 @@ class RSLTXVGenerate:
                     guider_neg, {"keyframe_idxs": kf_idxs})
                 guider.inner_set_conds(
                     {"positive": guider_pos, "negative": guider_neg})
+                # Also update the guider's reset baseline so
+                # _encode_and_inject_guide doesn't wipe these on re-run
+                guider._orig_positive = guider_pos
+                guider._orig_negative = guider_neg
                 logger.info(f"Propagated keyframe_idxs to guider")
 
         # ----------------------------------------------------------------
