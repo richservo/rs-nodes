@@ -448,6 +448,22 @@ class RSLTXVGenerate:
                 )
                 latent_dict = {"samples": latent_samples, "noise_mask": noise_mask}
 
+        # Propagate keyframe_idxs to external guider so it knows about
+        # first/middle/last image guide frame positions (RoPE mapping).
+        if guides and guider is not None:
+            from comfy_extras.nodes_lt import get_keyframe_idxs
+            kf_idxs, _ = get_keyframe_idxs(positive)
+            if kf_idxs is not None:
+                guider_pos = guider._get_positive()
+                guider_neg = guider._get_negative()
+                guider_pos = node_helpers.conditioning_set_values(
+                    guider_pos, {"keyframe_idxs": kf_idxs})
+                guider_neg = node_helpers.conditioning_set_values(
+                    guider_neg, {"keyframe_idxs": kf_idxs})
+                guider.inner_set_conds(
+                    {"positive": guider_pos, "negative": guider_neg})
+                logger.info(f"Propagated keyframe_idxs to guider")
+
         # ----------------------------------------------------------------
         # 3. AUDIO (requires audio_vae for the AV dual-tower model)
         # ----------------------------------------------------------------
@@ -857,7 +873,7 @@ class RSLTXVGenerate:
 
                     # Use IC-LoRA guider if original guider had control_info
                     _iclora_info = getattr(guider, 'control_info', None)
-                    if _iclora_info and _iclora_info.get("controls"):
+                    if _iclora_info and _iclora_info.get("control_image") is not None:
                         _, _, up_lt, up_lh, up_lw = upsampled.shape
                         up_guider = self._rebuild_iclora_guider(
                             up_model, positive, negative, vae,
@@ -1074,7 +1090,7 @@ class RSLTXVGenerate:
 
                     # Use IC-LoRA guider if original guider had control_info
                     _iclora_info = getattr(guider, 'control_info', None)
-                    if _iclora_info and _iclora_info.get("controls"):
+                    if _iclora_info and _iclora_info.get("control_image") is not None:
                         _, _, p2_lt, p2_lh2, p2_lw2 = video_latent.shape
                         p2_guider = self._rebuild_iclora_guider(
                             p2_model, positive, negative, vae,
@@ -1209,18 +1225,14 @@ class RSLTXVGenerate:
     def _rebuild_iclora_guider(up_model, positive, negative, vae,
                                control_info, upscale_cfg, latent_h, latent_w,
                                latent_t):
-        """Rebuild an ICLoRAMultimodalGuider at upscaled resolution.
+        """Rebuild an ICLoRAGuider at upscaled resolution.
 
-        Re-encodes original control images at the new latent dimensions and
-        reconstructs the full IC-LoRA guider so structural control is preserved
-        during upscale rediffusion.
-
-        Args:
-            latent_h, latent_w: upscaled latent spatial dims
-            latent_t: upscaled latent temporal length (for keyframe indexing)
+        Uses ICLoRAGuider with deferred encoding — the control image is
+        stored and re-encoded at sample() time at the actual upscaled
+        latent dimensions, following the official LTXVAddGuide approach.
         """
-        from comfy_extras.nodes_lt import LTXVAddGuide
-        from .ltxv_iclora_guider import ICLoRAMultimodalGuider
+        from ..utils.multimodal_guider import ICLoRAGuider
+        from comfy_extras.nodes_lt import preprocess as ltxv_preprocess
 
         ci = control_info
         lora_path = folder_paths.get_full_path_or_raise("loras", ci["lora_name"])
@@ -1234,7 +1246,7 @@ class RSLTXVGenerate:
 
         # Attention override
         attn_func = None
-        attn_mode = ci["attention_mode"]
+        attn_mode = ci.get("attention_mode", "auto")
         if attn_mode != "default":
             if attn_mode == "sage":
                 from comfy.ldm.modules.attention import attention_sage
@@ -1248,108 +1260,43 @@ class RSLTXVGenerate:
                 lambda func, *args, **kwargs: attn_func(*args, **kwargs)
             )
 
-        scale_factors = vae.downscale_index_formula
-        time_sf, height_sf, width_sf = scale_factors
-        dsf = int(ci["latent_downscale_factor"])
-
-        control_latents = []
-        control_masks = []
-        num_control_frames = 0
-        virtual_latent_length = latent_t
-
-        for img, frame_idx, label in ci["controls"]:
-            # Crop to valid frame count
-            num_keep = ((img.shape[0] - 1) // time_sf) * time_sf + 1
-            img_cropped = img[:num_keep]
-
-            # Encode at reduced resolution if downscale_factor > 1
-            enc_w = latent_w // dsf if dsf > 1 else latent_w
-            enc_h = latent_h // dsf if dsf > 1 else latent_h
-
-            _, guide_latent = LTXVAddGuide.encode(
-                vae, enc_w, enc_h, img_cropped, scale_factors
-            )
-            logger.info(f"IC-LoRA re-encoded {label}: enc {enc_w}x{enc_h} → latent {list(guide_latent.shape)}")
-
-            # Dilate if downscale factor > 1
-            guide_mask = None
-            if dsf > 1:
-                enc_h_actual = guide_latent.shape[3]
-                enc_w_actual = guide_latent.shape[4]
-                dil_h = enc_h_actual * dsf
-                dil_w = enc_w_actual * dsf
-
-                dilated = torch.zeros(
-                    guide_latent.shape[:3] + (dil_h, dil_w),
-                    device=guide_latent.device, dtype=guide_latent.dtype,
-                )
-                dilated[..., ::dsf, ::dsf] = guide_latent
-                guide_mask = torch.full(
-                    (dilated.shape[0], 1, dilated.shape[2], dil_h, dil_w),
-                    -1.0, device=guide_latent.device, dtype=guide_latent.dtype,
-                )
-                guide_mask[..., ::dsf, ::dsf] = 1.0
-
-                # Pad to actual latent dims if needed
-                pad_h = latent_h - dil_h
-                pad_w = latent_w - dil_w
-                if pad_h > 0 or pad_w > 0:
-                    dilated = torch.nn.functional.pad(dilated, (0, pad_w, 0, pad_h))
-                    guide_mask = torch.nn.functional.pad(guide_mask, (0, pad_w, 0, pad_h), value=-1.0)
-
-                guide_latent = dilated
-
-            # Stamp keyframe indices on conditioning (for positional encoding)
-            frame_idx_actual, latent_idx = LTXVAddGuide.get_latent_index(
-                positive, virtual_latent_length,
-                len(img_cropped), frame_idx, scale_factors,
-            )
-            positive = LTXVAddGuide.add_keyframe_index(
-                positive, frame_idx_actual, guide_latent, scale_factors,
-            )
-            negative = LTXVAddGuide.add_keyframe_index(
-                negative, frame_idx_actual, guide_latent, scale_factors,
-            )
-
-            # Pre-compute control noise mask
-            if guide_mask is not None:
-                ctrl_mask = guide_mask - ci["control_strength"]
-            else:
-                ctrl_mask = torch.full(
-                    (1, 1, guide_latent.shape[2], 1, 1),
-                    1.0 - ci["control_strength"],
-                    dtype=guide_latent.dtype,
-                )
-
-            control_latents.append(guide_latent.cpu())
-            control_masks.append(ctrl_mask.cpu())
-            num_control_frames += guide_latent.shape[2]
-            virtual_latent_length += guide_latent.shape[2]
+        # CRF preprocess control image
+        control_image = ci["control_image"]
+        crf = ci.get("crf", 35)
+        if crf > 0:
+            processed_frames = []
+            for i in range(control_image.shape[0]):
+                processed_frames.append(ltxv_preprocess(control_image[i], crf))
+            control_image = torch.stack(processed_frames)
 
         # Stamp frame rate
-        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": ci["frame_rate"]})
-        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": ci["frame_rate"]})
+        fr = ci.get("frame_rate", 25.0)
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": fr})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": fr})
 
-        # Build guider
-        stg_blocks_str = ci["stg_blocks"]
-        up_iclora_guider = ICLoRAMultimodalGuider(
+        stg_blocks_str = ci.get("stg_blocks", "29")
+        up_guider = ICLoRAGuider(
             up_model, positive, negative,
-            control_latents=control_latents,
-            control_masks=control_masks,
-            num_control_frames=num_control_frames,
+            control_pixels=control_image,
+            vae=vae,
+            downscale_factor=ci["downscale_factor"],
+            guide_strength=ci["control_strength"],
+            guide_frame_idx=ci.get("guide_frame_idx", 0),
             max_shift=ci.get("max_shift", 2.2),
             base_shift=ci.get("base_shift", 0.95),
             video_cfg=upscale_cfg,
-            audio_cfg=ci["audio_cfg"],
-            stg_scale=ci["stg_scale"],
+            audio_cfg=ci.get("audio_cfg", 7.0),
+            stg_scale=ci.get("stg_scale", 0.0),
             stg_blocks=[int(s.strip()) for s in stg_blocks_str.split(",")],
-            rescale=ci["rescale"],
-            modality_scale=ci["modality_scale"],
-            video_cfg_end=ci["cfg_end"] if ci["cfg_end"] >= 0 else None,
-            stg_scale_end=ci["stg_end"] if ci["stg_end"] >= 0 else None,
+            rescale=ci.get("rescale", 0.7),
+            video_cfg_end=ci["cfg_end"] if ci.get("cfg_end", -1) >= 0 else None,
+            stg_scale_end=ci["stg_end"] if ci.get("stg_end", -1) >= 0 else None,
+            cfg_star_rescale=ci.get("cfg_star_rescale", True),
+            skip_sigma_threshold=ci.get("skip_sigma", 0.0),
         )
-        logger.info(f"IC-LoRA guider rebuilt for upscale ({num_control_frames} control frames)")
-        return up_iclora_guider
+        up_guider.control_info = ci
+        logger.info("IC-LoRA guider rebuilt for upscale (deferred encoding)")
+        return up_guider
 
     def _free_vram(self):
         """Unload models and flush all VRAM/RAM caches."""
