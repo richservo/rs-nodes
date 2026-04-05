@@ -158,6 +158,7 @@ class InProcessTrainer:
         # Runtime state set during train()
         self._optimizer = None
         self._lr_scheduler = None
+        self._pending_optimizer_state: Path | None = None
         self._global_step = 0
         self._checkpoint_paths: list[Path] = []
         self._lora_applied = False
@@ -270,6 +271,40 @@ class InProcessTrainer:
 
         self._optimizer = self._create_optimizer(trainable_params)
         self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+
+        # On resume: restore optimizer state (Adam momentum, etc.) from the
+        # sidecar .pt saved alongside the LoRA weights.  Without this, Adam's
+        # first and second moments are fresh, producing a brief burst of
+        # outsized parameter updates that destabilise the resumed weights.
+        if self._pending_optimizer_state is not None:
+            try:
+                resume_state = torch.load(
+                    self._pending_optimizer_state, map_location="cpu", weights_only=False
+                )
+                saved_opt_type = resume_state.get("optimizer_type")
+                if saved_opt_type != self._optimizer_type:
+                    logger.warning(
+                        f"Optimizer type changed ({saved_opt_type} → "
+                        f"{self._optimizer_type}) — skipping optimizer state restore"
+                    )
+                else:
+                    self._optimizer.load_state_dict(resume_state["optimizer"])
+                    if resume_state.get("torch_rng") is not None:
+                        torch.set_rng_state(resume_state["torch_rng"])
+                    if (
+                        resume_state.get("cuda_rng") is not None
+                        and torch.cuda.is_available()
+                    ):
+                        torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
+                    logger.info(
+                        f"Restored optimizer + RNG state from "
+                        f"{self._pending_optimizer_state.name}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to restore optimizer state ({e}) — continuing with "
+                    f"fresh optimizer"
+                )
 
         # On resume: fast-forward the LR scheduler to match the resumed step.
         # Otherwise the scheduler starts at step 0 with max LR, slamming the
@@ -707,7 +742,13 @@ class InProcessTrainer:
         logger.info("Base model quantized (LoRA weights preserved in float)")
 
     def _load_resume_checkpoint(self) -> None:
-        """Load LoRA weights from a resume checkpoint into the current PEFT model."""
+        """Load LoRA weights from a resume checkpoint into the current PEFT model.
+
+        Strips ComfyUI-compatibility additions (the "diffusion_model." prefix
+        and any alpha keys) before handing the state_dict to PEFT.  Also
+        stashes the path to the optimizer-state sidecar for later restore
+        (the optimizer doesn't exist yet at this point in train()).
+        """
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
 
@@ -719,6 +760,9 @@ class InProcessTrainer:
         state_dict = load_file(str(ckpt_path))
         # Strip ComfyUI "diffusion_model." prefix that was added on save
         state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+        # Strip alpha keys — they are metadata for ComfyUI's LoRA loader, not
+        # part of PEFT's adapter state dict (alpha is in LoraConfig, not weights).
+        state_dict = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
         base_model = self._transformer.get_base_model()
         set_peft_model_state_dict(base_model, state_dict)
 
@@ -729,6 +773,15 @@ class InProcessTrainer:
             self._global_step = int(step_match.group(1))
         elif "step" in (load_file(str(ckpt_path), metadata=True) or {}):
             self._global_step = int(load_file(str(ckpt_path), metadata=True)["step"])
+
+        # Stash optimizer sidecar path — loaded later once optimizer exists.
+        sidecar = ckpt_path.with_suffix(".state.pt")
+        self._pending_optimizer_state = sidecar if sidecar.is_file() else None
+        if self._pending_optimizer_state is None:
+            logger.warning(
+                f"No optimizer sidecar found at {sidecar.name} — optimizer "
+                f"momentum will be fresh on resume (may cause brief instability)"
+            )
 
         logger.info(f"Resumed from checkpoint: {ckpt_path} (step {self._global_step})")
         print(f"Resumed from checkpoint: {ckpt_path} (step {self._global_step})")
@@ -911,8 +964,12 @@ class InProcessTrainer:
             return None
 
     def _save_checkpoint(self, step: int) -> Path:
-        """Save intermediate LoRA checkpoint and prune old ones."""
-        from peft import get_peft_model_state_dict
+        """Save intermediate LoRA checkpoint and prune old ones.
+
+        Also saves a sidecar .pt file with optimizer + RNG state so resume
+        can continue with proper Adam momentum and LR progression rather
+        than starting from scratch (which destabilises trained weights).
+        """
         from safetensors.torch import save_file
 
         ckpt_dir = self._output_dir / "checkpoints"
@@ -922,6 +979,22 @@ class InProcessTrainer:
         state_dict = self._extract_lora_state_dict()
         save_file(state_dict, save_path, metadata={"step": str(step)})
         logger.info(f"Checkpoint saved: {save_path.name}")
+
+        # Sidecar: optimizer state + RNG state for proper resume
+        try:
+            sidecar_path = save_path.with_suffix(".state.pt")
+            resume_state = {
+                "step": step,
+                "optimizer_type": self._optimizer_type,
+                "optimizer": self._optimizer.state_dict() if self._optimizer else None,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": (
+                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                ),
+            }
+            torch.save(resume_state, sidecar_path)
+        except Exception as e:
+            logger.warning(f"Failed to save optimizer sidecar ({e}) — resume will use fresh optimizer")
 
         self._checkpoint_paths.append(save_path)
         self._cleanup_old_checkpoints()
