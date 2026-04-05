@@ -453,15 +453,14 @@ class InProcessTrainer:
             except Exception:
                 pass
 
-        # Remove LoRA wrapping so the transformer is clean for future use
+        # Remove LoRA wrapping so the transformer is clean for future use.
+        # PeftModel.base_model is the LoraModel tuner, which has .unload() —
+        # it walks every submodule and replaces each LoRA layer with its
+        # original base_layer in place on the underlying transformer.
         if self._lora_applied:
             try:
-                from peft import get_peft_model_state_dict
-                if hasattr(self._transformer, "get_base_model"):
-                    # merge_and_unload removes LoRA and returns the clean base model,
-                    # but we don't reassign self._transformer because the caller still holds
-                    # a reference to the original ComfyUI model wrapper — so just unload.
-                    self._transformer.unload_adapter()
+                if hasattr(self._transformer, "base_model"):
+                    self._transformer.base_model.unload()
             except Exception as e:
                 logger.warning(f"Could not cleanly unload LoRA adapter: {e}")
             self._lora_applied = False
