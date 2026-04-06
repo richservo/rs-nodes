@@ -43,12 +43,6 @@ A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous
 
 ## Installation
 
-### Via ComfyUI Manager (Recommended)
-
-Search for **RS Nodes** in the ComfyUI Manager and click Install.
-
-### Manual Installation
-
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/richservo/rs-nodes.git rs_nodes
