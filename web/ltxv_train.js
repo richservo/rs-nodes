@@ -198,19 +198,27 @@ function drawLossChart(canvas, data) {
         return;
     }
 
-    const steps = data.steps;
-    const losses = data.losses;
+    // Compute EMA over the full dataset first (so smoothing is warm),
+    // then slice to the visible trailing window for display.
+    const allSteps = data.steps;
+    const allLosses = data.losses;
+    const allSmoothed = [];
+    const alpha = Math.min(0.95, 1 - 2 / (Math.max(allLosses.length / 5, 2) + 1));
+    allSmoothed[0] = allLosses[0];
+    for (let i = 1; i < allLosses.length; i++) {
+        allSmoothed[i] = alpha * allSmoothed[i - 1] + (1 - alpha) * allLosses[i];
+    }
+
+    // Trailing window: show last 500 points (or all if fewer)
+    const maxVisible = 500;
+    const visStart = Math.max(0, allSteps.length - maxVisible);
+    const steps = allSteps.slice(visStart);
+    const losses = allLosses.slice(visStart);
+    const smoothed = allSmoothed.slice(visStart);
+
     const minStep = steps[0];
     const maxStep = steps[steps.length - 1];
     const stepRange = maxStep - minStep || 1;
-
-    // Use EMA-smoothed losses for display, raw for min/max
-    const smoothed = [];
-    const alpha = Math.min(0.95, 1 - 2 / (Math.max(losses.length / 5, 2) + 1));
-    smoothed[0] = losses[0];
-    for (let i = 1; i < losses.length; i++) {
-        smoothed[i] = alpha * smoothed[i - 1] + (1 - alpha) * losses[i];
-    }
 
     // Y range with padding
     let minLoss = Infinity, maxLoss = -Infinity;
@@ -276,19 +284,26 @@ function drawLossChart(canvas, data) {
     }
     ctx.stroke();
 
-    // Linear trend line (least-squares regression on smoothed values)
-    if (steps.length >= 10) {
+    // Trailing trend line — regression over the last 25% of data (min 50 points)
+    // Uses a trailing window so the trend reflects current direction, not
+    // where the session happened to start.
+    const trendMinPts = 50;
+    if (steps.length >= trendMinPts) {
+        const windowSize = Math.max(trendMinPts, Math.floor(steps.length * 0.75));
+        const startIdx = steps.length - windowSize;
+
         let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-        const n = steps.length;
-        for (let i = 0; i < n; i++) {
+        for (let i = startIdx; i < steps.length; i++) {
             sumX += steps[i];
             sumY += smoothed[i];
             sumXY += steps[i] * smoothed[i];
             sumXX += steps[i] * steps[i];
         }
+        const n = windowSize;
         const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
         const intercept = (sumY - slope * sumX) / n;
 
+        // Draw trend line across the full chart width
         const x0 = pad.left;
         const x1 = pad.left + plotW;
         const y0 = pad.top + ((maxLoss - (slope * minStep + intercept)) / yRange) * plotH;

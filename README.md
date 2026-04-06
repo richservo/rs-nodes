@@ -1,6 +1,6 @@
 # RS Nodes for ComfyUI
 
-A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) focused on **LTXV audio-video generation**, **TTS pipelines**, **prompt engineering**, and **post-processing**. Built for real-world production workflows with emphasis on VRAM efficiency and quality control.
+A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) focused on **LTXV audio-video generation**, **LoRA training**, **image generation**, **prompt engineering**, and **post-processing**. Built for real-world production workflows with emphasis on VRAM efficiency and quality control.
 
 ---
 
@@ -11,12 +11,21 @@ A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous
   - [Video Generation](#video-generation)
     - [RS LTXV Generate](#rs-ltxv-generate)
     - [RS LTXV Extend](#rs-ltxv-extend)
+    - [RS LTXV Upscale](#rs-ltxv-upscale)
+  - [Image Generation](#image-generation)
+    - [RS Flux2 Generate](#rs-flux2-generate)
+    - [RS Z-Image Generate](#rs-z-image-generate)
+  - [LoRA Training](#lora-training)
+    - [RS LTXV Prepare Dataset](#rs-ltxv-prepare-dataset)
+    - [RS LTXV Train LoRA](#rs-ltxv-train-lora)
   - [Guidance & Control](#guidance--control)
     - [RS IC-LoRA Guider](#rs-ic-lora-guider)
+    - [RS LTXV TTM Guider](#rs-ltxv-ttm-guider)
     - [RS Canny Preprocessor](#rs-canny-preprocessor)
   - [Prompt Engineering](#prompt-engineering)
     - [RS Prompt Parser](#rs-prompt-parser)
     - [RS Prompt Formatter](#rs-prompt-formatter)
+    - [RS Prompt Formatter Local](#rs-prompt-formatter-local)
   - [Audio](#audio)
     - [RS Audio Concat](#rs-audio-concat)
     - [RS Audio Save](#rs-audio-save)
@@ -26,6 +35,7 @@ A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous
     - [RS Film Grain](#rs-film-grain)
     - [RS Video Trim](#rs-video-trim)
     - [RS Free VRAM](#rs-free-vram)
+    - [RS Counter](#rs-counter)
 - [Workflow Examples](#workflow-examples)
 - [Tips & Troubleshooting](#tips--troubleshooting)
 
@@ -51,21 +61,16 @@ pip install -r rs_nodes/requirements.txt
 |---|---|---|
 | `openai-whisper` | Yes | Word-level alignment for TTS segmentation |
 | `transformers` | Optional | MOSS-TTS model loading |
+| `peft` | For training | LoRA adapter creation |
+| `optimum-quanto` | For training | FP8/INT8 quantization |
 | PyTorch + CUDA | Provided by ComfyUI | GPU computation |
-| OpenCV (`cv2`) | Provided by ComfyUI | Canny edge detection |
-
-To enable the optional MOSS-TTS nodes:
-
-```bash
-pip install transformers
-```
-
-Models are downloaded from HuggingFace on first use, then run fully offline.
+| OpenCV (`cv2`) | Provided by ComfyUI | Canny edge detection, face detection |
 
 ### External Dependencies
 
 - **[Ollama](https://ollama.com/)** — Required for RS Prompt Formatter. Install and run locally. The node auto-pulls models on first use.
 - **LTXV Models** — The LTXV generation/extension nodes require LTXV model checkpoints and VAEs loaded through ComfyUI's standard model loading nodes.
+- **LTX-2 Submodule** — Required for LoRA training. Run `git submodule update --init` after cloning.
 
 ---
 
@@ -101,7 +106,7 @@ All-in-one LTXV video generation with optional audio, keyframe injection, multim
 | `cfg` | FLOAT | 3.0 | Video classifier-free guidance scale |
 | `noise_seed` | INT | 0 | Random seed |
 | `seed_mode` | ENUM | random | `random`, `fixed`, `increment`, `decrement` |
-| `frame_rate` | FLOAT | 25.0 | Video frame rate (stamped onto conditioning) |
+| `frame_rate` | FLOAT | 25.0 | Video frame rate |
 
 **Optional Inputs — Frame Injection:**
 
@@ -123,15 +128,8 @@ All-in-one LTXV video generation with optional audio, keyframe injection, multim
 | `audio_vae` | VAE | — | Audio VAE (enables AV dual-tower mode) |
 | `audio_cfg` | FLOAT | 7.0 | Audio CFG scale |
 | `stg_scale` | FLOAT | 0.0 | Spatiotemporal guidance scale (0 = disabled) |
-| `audio_stg_scale` | FLOAT | -1.0 | Per-audio STG (-1 = use video value) |
 | `stg_blocks` | STRING | "29" | Comma-separated transformer block indices for STG |
 | `rescale` | FLOAT | 0.7 | CFG rescaling factor |
-| `video_modality_scale` | FLOAT | 0.0 | Video modality isolation (0 = off) |
-| `audio_modality_scale` | FLOAT | 3.0 | Audio modality isolation |
-| `cfg_end` | FLOAT | -1.0 | End CFG for interpolation (-1 = same as start) |
-| `stg_end` | FLOAT | -1.0 | End STG for interpolation |
-| `cfg_star_rescale` | BOOLEAN | True | CFG-Zero* rescaling (prevents high-sigma artifacts) |
-| `skip_sigma` | FLOAT | 0.0 | Sigma threshold for skipping guidance |
 
 **Optional Inputs — Efficiency:**
 
@@ -147,26 +145,9 @@ All-in-one LTXV video generation with optional audio, keyframe injection, multim
 |---|---|---|---|
 | `upscale` | BOOLEAN | False | Enable 2x spatial upscaling |
 | `upscale_model` | LATENT_UPSCALE_MODEL | — | Latent upscale model |
-| `upscale_lora` | ENUM | none | LoRA to apply during upscale re-diffusion |
-| `upscale_lora_strength` | FLOAT | 1.0 | LoRA strength |
 | `upscale_steps` | INT | 4 | Re-diffusion steps at upscaled resolution |
 | `upscale_cfg` | FLOAT | 1.0 | CFG during re-diffusion |
 | `upscale_denoise` | FLOAT | 0.5 | Denoise strength (0 = no re-diffuse, 1 = full) |
-| `upscale_fallback` | BOOLEAN | False | Fall back to half-res decode on OOM |
-| `upscale_tiling` | BOOLEAN | False | Temporal tiling during upscale (saves VRAM) |
-| `upscale_tile_t` | INT | 4 | Temporal tile size (0 = auto) |
-
-**Optional Inputs — Output & Overrides:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `decode` | BOOLEAN | True | Decode latents to images |
-| `tile_t` | INT | 0 | VAE decode temporal tile size (0 = auto) |
-| `guider` | GUIDER | — | Custom guider (e.g., from RS IC-LoRA Guider) |
-| `sampler` | SAMPLER | — | Custom sampler (default: euler_ancestral) |
-| `sigmas` | SIGMAS | — | Custom sigma schedule |
-| `max_shift` | FLOAT | 2.05 | Scheduler max shift |
-| `base_shift` | FLOAT | 0.95 | Scheduler base shift |
 
 **Outputs:**
 
@@ -176,12 +157,6 @@ All-in-one LTXV video generation with optional audio, keyframe injection, multim
 | `audio_latent` | LATENT | Audio latent (if audio_vae used) |
 | `images` | IMAGE | Decoded video frames `[B*T, H, W, C]` |
 | `audio_output` | AUDIO | Output audio (passthrough or decoded) |
-
-**Key Behaviors:**
-- When `audio` + `audio_vae` are connected, `num_frames` is auto-calculated from audio duration
-- When `upscale` is enabled, generation happens at half resolution then 2x upscaled
-- First image is re-injected at full resolution during upscale re-diffusion
-- The node always re-executes (no caching)
 
 ---
 
@@ -199,7 +174,7 @@ Extend an existing video with seamless temporal continuation using overlap blend
 | `vae` | VAE | Video VAE |
 | `latent` | LATENT | Input video latent to extend |
 
-**Optional Inputs — Extension:**
+**Optional Inputs:**
 
 | Input | Type | Default | Description |
 |---|---|---|---|
@@ -207,14 +182,9 @@ Extend an existing video with seamless temporal continuation using overlap blend
 | `overlap_frames` | INT | 16 | Frames of overlap for blending (step: 8) |
 | `steps` | INT | 20 | Denoising steps |
 | `cfg` | FLOAT | 3.0 | Video CFG scale |
-| `seed` | INT | 0 | Random seed |
-| `frame_rate` | FLOAT | 25.0 | Video FPS |
 | `last_image` | IMAGE | — | Keyframe for end of extension |
-| `last_strength` | FLOAT | 1.0 | Last frame preservation |
-| `overlap_strength` | FLOAT | 1.0 | Overlap region preservation |
-| `crf` | INT | 35 | LTXV preprocessing quality |
 
-Also accepts the same **Audio**, **Efficiency**, **Upscale**, **Output**, **Overrides**, and **Scheduler** inputs as RS LTXV Generate.
+Also accepts the same Audio, Efficiency, Upscale, and Scheduler inputs as RS LTXV Generate.
 
 **Outputs:**
 
@@ -224,11 +194,220 @@ Also accepts the same **Audio**, **Efficiency**, **Upscale**, **Output**, **Over
 | `images` | IMAGE | Decoded extension frames |
 | `audio_output` | AUDIO | Decoded audio (if audio_vae used) |
 
+---
+
+#### RS LTXV Upscale
+
+Standalone 2x video upscaler with optional temporal upscaling and first-frame I2V re-diffusion.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | LTXV diffusion model |
+| `positive` | CONDITIONING | Positive conditioning |
+| `negative` | CONDITIONING | Negative conditioning |
+| `vae` | VAE | Video VAE |
+| `images` | IMAGE | Input video frames |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `upscale_model` | LATENT_UPSCALE_MODEL | — | Spatial 2x upscale model |
+| `temporal_upscale_model` | LATENT_UPSCALE_MODEL | — | Temporal 2x upscale model |
+| `upscale_steps` | INT | 4 | Re-diffusion steps |
+| `upscale_cfg` | FLOAT | 1.0 | CFG during re-diffusion |
+| `upscale_denoise` | FLOAT | 0.5 | Denoise strength |
+| `upscale_lora` | ENUM | none | LoRA for re-diffusion pass |
+| `attention_mode` | ENUM | auto | Attention optimization |
+| `ffn_chunks` | INT | 4 | FFN chunking for memory |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `latent` | LATENT | Upscaled video latent |
+| `images` | IMAGE | Decoded upscaled frames |
+| `audio_output` | AUDIO | Audio passthrough |
+
 **Key Behaviors:**
-- Extracts overlap region from the tail of the input latent
-- Generates extension with overlap as a guide frame
-- Linear alpha blending in the overlap region for seamless continuation
-- Concatenates original (trimmed) + blended extension
+- Encodes input, applies spatial 2x via upscale model, re-diffuses with first-frame I2V guidance
+- Optional temporal 2x increases frame count before spatial upscaling
+- Tiled encoding/decoding for memory efficiency
+
+---
+
+### Image Generation
+
+#### RS Flux2 Generate
+
+All-in-one Flux2.dev image generation with Kontext reference images, empirical mu scheduling, and optional two-pass latent upscaling.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | Flux2 model |
+| `clip` | CLIP | Text encoder |
+| `vae` | VAE | Image VAE |
+| `prompt` | STRING | Generation prompt |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `width` | INT | 1024 | Image width |
+| `height` | INT | 1024 | Image height |
+| `steps` | INT | 50 | Sampling steps |
+| `guidance` | FLOAT | 4.0 | Guidance scale |
+| `seed` | INT | 0 | Random seed |
+| `ref_image_1..4` | IMAGE | — | Up to 4 Kontext reference images |
+| `lora` | ENUM | none | LoRA adapter |
+| `attention_mode` | ENUM | auto | Attention optimization |
+| `ffn_chunks` | INT | 4 | FFN chunking (double blocks only) |
+| `latent_upscale` | ENUM | off | Two-pass latent upscaling |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `images` | IMAGE | Generated image |
+
+**Key Behaviors:**
+- Kontext reference images auto-scaled to optimal aspect ratios and appended to conditioning
+- Empirical mu scheduling based on image dimensions
+- Optional two-pass: half-res first pass, then full-res re-diffusion
+
+---
+
+#### RS Z-Image Generate
+
+All-in-one Z-Image Turbo generation with Qwen3-4B text encoder, RenormCFG, and system prompt support.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | Z-Image Turbo model |
+| `clip` | CLIP | Qwen3-4B text encoder |
+| `vae` | VAE | Image VAE |
+| `prompt` | STRING | Generation prompt |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `width` | INT | 1024 | Image width |
+| `height` | INT | 1024 | Image height |
+| `steps` | INT | 10 | Sampling steps (4 for turbo) |
+| `system_prompt` | ENUM | superior | System prompt variant |
+| `cfg` | FLOAT | 1.5 | CFG scale |
+| `renorm_cfg` | FLOAT | 1.0 | RenormCFG norm limit (0=off) |
+| `lora` | ENUM | none | LoRA adapter |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `images` | IMAGE | Generated image |
+
+---
+
+### LoRA Training
+
+#### RS LTXV Prepare Dataset
+
+Scans a folder of videos/images, optionally detects and crops faces, generates captions via Ollama, and preprocesses latents for LoRA training.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `media_folder` | STRING | Path to folder of videos and/or images |
+| `model_path` | CHECKPOINT | LTX-2 checkpoint |
+| `text_encoder_path` | STRING | Gemma-3 HF directory (auto-download available) |
+| `output_name` | STRING | Name for preprocessed output folder |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `resolution_buckets` | STRING | "576x576x49" | WxHxF resolution buckets (semicolon-separated) |
+| `lora_trigger` | STRING | "" | Trigger word prepended to all captions |
+| `caption_mode` | ENUM | ollama | `ollama`, `skip`, `auto_filename` |
+| `caption_style` | ENUM | subject | `subject`, `subject + style`, `style`, `motion`, `general` |
+| `ollama_model` | STRING | "gemma3:27b" | Vision model for captioning |
+| `face_detection` | BOOLEAN | True | Enable face detection and cropping |
+| `target_face` | IMAGE | — | Reference face for identity matching |
+| `face_similarity` | FLOAT | 0.40 | Face match threshold |
+| `conditioning_folder` | STRING | "" | IC-LoRA conditioning inputs folder |
+| `clip` | CLIP | — | Text encoder for in-process encoding |
+| `vae` | VAE | — | VAE for in-process latent encoding |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `preprocessed_path` | STRING | Path to preprocessed data root |
+| `dataset_json_path` | STRING | Path to dataset JSON |
+
+**Key Behaviors:**
+- Two-phase processing: clip generation then latent preprocessing
+- Face detection via OpenCV DNN with optional identity matching
+- Incremental: skips already-processed clips, tracks rejections
+- Caption styles control what gets described (environment vs subject vs both)
+
+---
+
+#### RS LTXV Train LoRA
+
+In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer. Includes a **live loss chart** rendered directly on the node during training.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | LTX-2 model (from CheckpointLoaderSimple) |
+| `output_name` | STRING | Name for the output LoRA file |
+| `preprocessed_data_root` | STRING | Path from RS LTXV Prepare Dataset |
+| `model_path` | CHECKPOINT | LTX-2 checkpoint (for EmbeddingsProcessor/VAE) |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `vae` | VAE | — | VAE for validation (avoids loading from checkpoint) |
+| `preset` | ENUM | subject | `custom`, `subject`, `style`, `motion`, `subject + style`, `all video`, `audio + video` |
+| `lora_rank` | INT | 16 | LoRA rank |
+| `lora_alpha` | INT | 16 | LoRA alpha |
+| 8 module toggles | BOOLEAN | varies | Select which layers to train (self-attn, cross-attn, FFN, audio) |
+| `learning_rate` | FLOAT | 1e-4 | Learning rate |
+| `steps` | INT | 2000 | Total training steps |
+| `optimizer` | ENUM | adamw8bit | `adamw8bit` or `adamw` |
+| `scheduler` | ENUM | linear | LR schedule: `linear`, `constant`, `cosine`, `cosine_with_restarts`, `polynomial` |
+| `quantization` | ENUM | fp8-quanto | `fp8-quanto`, `int8-quanto`, `int4-quanto`, `none` |
+| `clip` | CLIP | — | Text encoder for validation prompt |
+| `validation_prompt` | STRING | "" | Prompt for validation video generation |
+| `validation_interval` | INT | 250 | Steps between validations |
+| `checkpoint_interval` | INT | 500 | Steps between checkpoints |
+| `resume` | BOOLEAN | False | Resume from latest checkpoint |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `status` | STRING | Training status message |
+| `lora_path` | STRING | Path to saved LoRA file |
+
+**Key Behaviors:**
+- **In-process**: reuses the loaded 22B transformer — no reload, no double memory
+- **Live loss chart**: streams loss/LR data via websocket to a live-updating Canvas chart on the node, with EMA smoothing and color-coded trend line
+- **Layer offloading**: streams transformer blocks CPU↔GPU one at a time (~0.5 GB VRAM instead of ~11 GB)
+- **FP8 quantization**: reduces model memory while preserving LoRA weights in float
+- **Resume support**: restores optimizer state, RNG, and rebuilds LR schedule for the new total steps
+- **Presets**: auto-configure module toggles and rank for common use cases (subject, style, motion)
+- Quantization modifies the transformer in-place — reload checkpoint after training
 
 ---
 
@@ -236,7 +415,7 @@ Also accepts the same **Audio**, **Efficiency**, **Upscale**, **Output**, **Over
 
 #### RS IC-LoRA Guider
 
-Structural control for LTXV generation using IC-LoRA (In-Context LoRA) with preprocessed control images (canny edges, depth maps, pose).
+Structural control for LTXV using IC-LoRA (In-Context LoRA) with preprocessed control images.
 
 **Required Inputs:**
 
@@ -247,29 +426,46 @@ Structural control for LTXV generation using IC-LoRA (In-Context LoRA) with prep
 | `negative` | CONDITIONING | Negative conditioning |
 | `vae` | VAE | Video VAE |
 | `control_image` | IMAGE | Preprocessed control map (e.g., canny edges) |
-| `ic_lora` | ENUM | IC-LoRA safetensors file (from loras directory) |
-
-**Optional Inputs:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `lora_strength` | FLOAT | 1.0 | LoRA blend strength |
-| `guide_strength` | FLOAT | 1.0 | Frame preservation (1.0 = exact) |
-| `guide_frame_idx` | INT | 0 | Which frame to inject guide (0 = first, -1 = last) |
-| `crf` | INT | 35 | LTXV preprocessing quality |
-
-Also accepts the same guidance parameters as RS LTXV Generate (`video_cfg`, `audio_cfg`, `stg_scale`, `stg_blocks`, `rescale`, modality scales, scheduler shifts, etc.).
+| `ic_lora` | ENUM | IC-LoRA safetensors file |
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
-| `guider` | GUIDER | Connect to the `guider` input of RS LTXV Generate or RS LTXV Extend |
+| `guider` | GUIDER | Connect to the `guider` input of RS LTXV Generate |
 
-**Key Behaviors:**
-- Reads `reference_downscale_factor` from LoRA metadata for sparse dilation
-- Defers VAE encoding to sample time (when target latent dimensions are known)
-- Clones the model and applies IC-LoRA with specified strength
+---
+
+#### RS LTXV TTM Guider
+
+Time-to-Move (TTM) motion control guider for LTXV. Enforces reference motion via dual-clock denoising with mask-based control.
+
+**Required Inputs:**
+
+| Input | Type | Description |
+|---|---|---|
+| `model` | MODEL | LTXV diffusion model |
+| `positive` | CONDITIONING | Positive conditioning |
+| `negative` | CONDITIONING | Negative conditioning |
+| `vae` | VAE | Video VAE |
+| `reference_video` | IMAGE | Reference video for motion |
+| `mask` | IMAGE | Motion mask (1.0 = enforce reference, 0.0 = free generation) |
+
+**Optional Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `ttm_strength` | FLOAT | 0.5 | Fraction of steps to apply TTM |
+| `cfg` | FLOAT | 3.0 | CFG scale |
+| `stg_scale` | FLOAT | 0.0 | Spatiotemporal guidance |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `guider` | GUIDER | Connect to RS LTXV Generate's guider input |
+| `width` | INT | Generation width |
+| `height` | INT | Generation height |
 
 ---
 
@@ -284,20 +480,16 @@ Canny edge detection with automatic LTXV-safe resolution (128-aligned).
 | `image` | IMAGE | — | Input image |
 | `width` | INT | 768 | Target width (step: 128) |
 | `height` | INT | 512 | Target height (step: 128) |
-| `low_threshold` | INT | 100 | Canny low threshold (0–255) |
-| `high_threshold` | INT | 200 | Canny high threshold (0–255) |
+| `low_threshold` | INT | 100 | Canny low threshold |
+| `high_threshold` | INT | 200 | Canny high threshold |
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
-| `image` | IMAGE | Edge map (grayscale replicated to RGB) |
-| `width` | INT | Computed 128-aligned width |
-| `height` | INT | Computed 128-aligned height |
-
-**Key Behaviors:**
-- Preserves aspect ratio and computes the closest 128-aligned resolution from the pixel budget
-- Output resolution is LTXV-compatible and can feed directly into RS IC-LoRA Guider
+| `image` | IMAGE | Edge map (grayscale to RGB) |
+| `width` | INT | 128-aligned width |
+| `height` | INT | 128-aligned height |
 
 ---
 
@@ -311,9 +503,9 @@ Parse structured dialogue scripts with `[s]`tyle, `[a]`ction, and `[d]`ialogue t
 
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `script` | STRING | "" | Multiline script with tags (see format below) |
-| `dialogue_mode` | ENUM | individual | `individual` (one line) or `all` (concatenate all) |
-| `dialogue_index` | INT | 1 | Which dialogue line to select (auto-increments) |
+| `script` | STRING | "" | Multiline script with tags |
+| `dialogue_mode` | ENUM | individual | `individual` or `all` |
+| `dialogue_index` | INT | 1 | Which dialogue line to select |
 
 **Script Format:**
 
@@ -321,41 +513,32 @@ Parse structured dialogue scripts with `[s]`tyle, `[a]`ction, and `[d]`ialogue t
 [s] cinematic, natural lighting, handheld camera
 [a] a man walks into a room and sits down
 [d] Hello, how are you doing today?
-[a] the camera pans to reveal another person
-[d] I'm doing great, thanks for asking.
 ```
-
-- `[s]` — **Style**: visual style description (prepended as "Style: ...")
-- `[a]` — **Action**: scene description (auto-capitalized, auto-punctuated)
-- `[d]` — **Dialogue**: spoken text (quoted in video prompt, plain in audio prompt)
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
-| `video_prompt` | STRING | Combined visual prompt (style + actions + quoted dialogue) |
-| `audio_prompt` | STRING | TTS text (selected dialogue or all concatenated) |
-| `dialogue_count` | INT | Total number of `[d]` segments |
-| `current_index` | INT | Current dialogue index (clamped to valid range) |
-| `dialogue_list` | STRING | Numbered list of all dialogue lines |
+| `video_prompt` | STRING | Combined visual prompt |
+| `audio_prompt` | STRING | TTS text |
+| `dialogue_count` | INT | Total dialogue segments |
+| `current_index` | INT | Current dialogue index |
+| `dialogue_list` | STRING | Numbered list of all dialogue |
 
 ---
 
 #### RS Prompt Formatter
 
-AI-powered prompt enhancement using a local Ollama model, with optional reference image context and output caching.
+AI-powered prompt enhancement using a local Ollama model with reference image support and output caching.
 
 **Inputs:**
 
 | Input | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | STRING | "" | Raw prompt to enhance |
-| `system_prompt` | STRING | *(built-in)* | Instructions for the Ollama model |
+| `system_prompt` | STRING | *(built-in)* | Instructions for the model |
 | `model` | STRING | "gemma3:12b" | Ollama model name |
-| `ollama_url` | STRING | "http://localhost:11434" | Ollama server URL |
 | `reference_image` | IMAGE | — | *(optional)* Image for visual context |
-| `cache_file` | STRING | "formatted_prompt.json" | JSON cache file (stores prompt + output) |
-| `output_dir` | STRING | "" | Cache directory (empty = ComfyUI output) |
 
 **Outputs:**
 
@@ -364,13 +547,41 @@ AI-powered prompt enhancement using a local Ollama model, with optional referenc
 | `formatted_prompt` | STRING | Enhanced prompt text |
 
 **Key Behaviors:**
-- Streams responses from Ollama with live token printing to console
-- Auto-pulls missing models from the Ollama registry
-- Strips `<think>` reasoning blocks from the response
-- Caches prompt + output as JSON — automatically skips Ollama when the input prompt hasn't changed
-- Falls back gracefully on Ollama connection errors
+- Streams responses from Ollama with live token printing
+- Auto-pulls missing models, strips `<think>` blocks
+- Caches prompt + output as JSON — skips Ollama when input unchanged
 
 **Requires:** [Ollama](https://ollama.com/) running locally.
+
+---
+
+#### RS Prompt Formatter Local
+
+Ollama-free prompt formatter reusing Gemma3 12B from ComfyUI's DualCLIPLoader. Supports optional reference images via vision embeddings.
+
+**Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `text_encoder` | STRING | — | Gemma3 text encoder file |
+| `prompt` | STRING | "" | Prompt to format |
+| `system_prompt` | STRING | — | System prompt for generation |
+| `first_image` | IMAGE | — | *(optional)* Opening image |
+| `middle_image` | IMAGE | — | *(optional)* Mid-scene image |
+| `last_image` | IMAGE | — | *(optional)* Ending image |
+| `max_tokens` | INT | 1024 | Maximum output tokens |
+| `temperature` | FLOAT | 0.8 | Sampling temperature |
+
+**Outputs:**
+
+| Output | Type | Description |
+|---|---|---|
+| `formatted_prompt` | STRING | Enhanced prompt text |
+
+**Key Behaviors:**
+- No Ollama dependency — loads Gemma3 12B weights directly
+- Vision support for up to 3 reference images
+- JSON caching (text-only prompts)
 
 ---
 
@@ -380,52 +591,19 @@ AI-powered prompt enhancement using a local Ollama model, with optional referenc
 
 Concatenate up to 20 audio clips with per-clip trimming and configurable pauses.
 
-**Inputs:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `clip_count` | INT | 1 | Number of clips to use (1–20) |
-
-For each clip `i` (shown dynamically based on `clip_count`):
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `audio_file_{i}` | ENUM | — | Audio file from ComfyUI input directory (.wav, .mp3, .flac, .ogg, .m4a, .aac) |
-| `start_time_{i}` | FLOAT | 0.0 | Seconds to trim from start |
-| `end_time_{i}` | FLOAT | 0.0 | Seconds to trim from end |
-| `pause_after_{i}` | FLOAT | 0.0 | Silence to insert after clip (0–10s) |
+**Inputs:** For each clip: audio file, start/end trim, pause after.
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
-| `audio` | AUDIO | Concatenated waveform `{"waveform": Tensor, "sample_rate": int}` |
-
-**Key Behaviors:**
-- Auto-resamples all clips to match the first clip's sample rate
-- Supports 6+ audio formats
-- Caches based on file modification times
+| `audio` | AUDIO | Concatenated waveform |
 
 ---
 
 #### RS Audio Save
 
-Export audio to disk with format selection.
-
-**Inputs:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `audio` | AUDIO | — | Audio to save |
-| `filename_prefix` | STRING | "clip" | Base filename |
-| `index` | INT | 1 | File index (zero-padded in filename) |
-| `format` | ENUM | wav | `wav`, `flac`, `mp3`, `ogg` |
-
-**Outputs:** Audio preview widget in ComfyUI UI.
-
-**Key Behaviors:**
-- Falls back to WAV if MP3/OGG encoding fails
-- Always re-executes (output node)
+Export audio to disk with format selection (`wav`, `flac`, `mp3`, `ogg`).
 
 ---
 
@@ -435,89 +613,13 @@ Export audio to disk with format selection.
 
 Load MOSS-TTS model variants for text-to-speech generation.
 
-**Inputs:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `model_variant` | ENUM | — | Model selection: "MOSS-TTS (Delay 8B)", "MOSS-TTS (Local 1.7B)", "MOSS-TTSD v1.0", "MOSS-VoiceGenerator", "MOSS-SoundEffect" |
-| `local_model_path` | STRING | "" | Local path override (empty = download from HuggingFace) |
-| `codec_local_path` | STRING | "" | Local codec path (for TTSD models) |
-
-**Outputs:**
-
-| Output | Type | Description |
-|---|---|---|
-| `MOSS_TTS_PIPE` | PIPE | Model pipeline tuple for RS MOSS TTS Batch Save |
-
-**Key Behaviors:**
-- Auto-detects Flash Attention availability
-- Models cached in `{models_dir}/moss-tts/`
-- Clears VRAM before loading
-
-> **Security Note:** MOSS-TTS models use `trust_remote_code=True` when loading via HuggingFace `transformers`. This is required because the model defines custom architecture code not natively included in the `transformers` library. Without it, the model cannot load. No data is sent externally — the flag only allows the model's bundled Python code to execute locally during loading.
-
 ---
 
 #### RS MOSS TTS Batch Save
 
 *(Optional — requires `transformers`)*
 
-Generate TTS audio from a dialogue list with automatic segmentation, per-clip trimming, and batch export.
-
-**Inputs — Core:**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `run_inference` | BOOLEAN | True | Enable/disable generation (False = use existing files) |
-| `filename_prefix` | STRING | "clip" | Output file prefix |
-| `format` | ENUM | wav | `wav`, `flac`, `mp3`, `ogg` |
-| `mode` | ENUM | one_shot | `one_shot`, `all`, `single` (see below) |
-
-**Inputs — TTS (when `run_inference=True`):**
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `moss_pipe` | MOSS_TTS_PIPE | — | From RS MOSS TTS Loader |
-| `dialogue_list` | STRING | — | Numbered dialogue list (from RS Prompt Parser) |
-| `reference_audio` | AUDIO | — | Reference voice for few-shot cloning |
-| `select_index` | INT | 1 | Line to generate in "single" mode |
-| `language` | ENUM | auto | `auto`, `zh`, `en`, `ja`, `ko` |
-| `seed` | INT | 0 | RNG seed |
-| `temperature` | FLOAT | 1.7 | Sampling temperature |
-| `top_p` | FLOAT | 0.8 | Nucleus sampling threshold |
-| `top_k` | INT | 25 | Top-K sampling |
-| `repetition_penalty` | FLOAT | 1.0 | Repetition penalty |
-| `max_new_tokens` | INT | 4096 | Max generation tokens |
-| `head_handle` | FLOAT | 0.0 | Silence padding before audio (seconds) |
-| `tail_handle` | FLOAT | 0.0 | Silence padding after audio (seconds) |
-
-**Inputs — Per-Clip Trim/Pause** (for each clip `i`, 1–20):
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| `pause_before_{i}` | FLOAT | 0.0 | Silence before clip |
-| `start_time_{i}` | FLOAT | 0.0 | Trim from start (seconds) |
-| `end_time_{i}` | FLOAT | 0.0 | Trim from end (seconds) |
-| `pause_after_{i}` | FLOAT | 0.0 | Silence after clip |
-
-**Outputs:**
-
-| Output | Type | Description |
-|---|---|---|
-| `audio` | AUDIO | All clips concatenated |
-
-**Generation Modes:**
-
-| Mode | Behavior |
-|---|---|
-| `one_shot` | Generate all dialogue as a single audio clip, then segment into individual clips using Whisper word alignment or silence-based dynamic programming |
-| `all` | Generate each dialogue line as a separate inference call |
-| `single` | Generate only the line at `select_index` |
-
-**Key Behaviors:**
-- Saves individual clips as `{prefix}_{001}.{format}` and full concatenation as `{prefix}_full.{format}`
-- Whisper-based word alignment for intelligent one-shot segmentation with DP fallback
-- When `run_inference=False`, loads existing files from disk (useful for re-trimming)
+Generate TTS audio from a dialogue list with automatic segmentation, per-clip trimming, and batch export. Supports `one_shot`, `all`, and `single` generation modes with Whisper-based word alignment.
 
 ---
 
@@ -533,23 +635,15 @@ Add realistic film grain with color variation and luminance-aware highlight prot
 |---|---|---|---|
 | `images` | IMAGE | — | Input video frames |
 | `intensity` | FLOAT | 0.05 | Grain strength (0–1) |
-| `grain_size` | FLOAT | 1.5 | Grain frequency (1.0 = pixel-level, 8.0 = large blobs) |
-| `color_amount` | FLOAT | 0.3 | Color noise ratio (0 = monochrome, 1 = full color) |
-| `highlight_protection` | FLOAT | 0.5 | Protect bright/dark areas (0 = uniform, 1 = midtones only) |
-| `seed` | INT | 0 | RNG seed (deterministic per frame) |
+| `grain_size` | FLOAT | 1.5 | Grain frequency |
+| `color_amount` | FLOAT | 0.3 | Color noise ratio |
+| `highlight_protection` | FLOAT | 0.5 | Protect bright/dark areas |
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
 | `images` | IMAGE | Grained video frames |
-
-**Key Behaviors:**
-- Frees all model VRAM before processing (safe to place after inference nodes)
-- Processes in batches of 8 frames on GPU (~200 MB peak VRAM)
-- Noise generated directly on GPU for speed
-- Uses Rec.709 luminance weighting for midtone masking
-- Low-res noise with bilinear upscale creates organic grain texture at larger `grain_size` values
 
 ---
 
@@ -561,11 +655,11 @@ Trim video frames and/or audio by time range.
 
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `fps` | FLOAT | 24.0 | Frame rate for time-to-frame conversion |
-| `in_point` | FLOAT | 0.0 | Start time in seconds |
-| `out_point` | FLOAT | 0.0 | End time in seconds (0 = end of clip) |
-| `images` | IMAGE | — | *(optional)* Video frames to trim |
-| `audio` | AUDIO | — | *(optional)* Audio to trim |
+| `fps` | FLOAT | 24.0 | Frame rate |
+| `in_point` | FLOAT | 0.0 | Start time (seconds) |
+| `out_point` | FLOAT | 0.0 | End time (0 = end of clip) |
+| `images` | IMAGE | — | *(optional)* Video frames |
+| `audio` | AUDIO | — | *(optional)* Audio |
 
 **Outputs:**
 
@@ -573,32 +667,38 @@ Trim video frames and/or audio by time range.
 |---|---|---|
 | `images` | IMAGE | Trimmed frames |
 | `audio` | AUDIO | Trimmed audio |
-| `fps` | FLOAT | Frame rate (passthrough) |
-| `frame_count` | INT | Number of frames after trim |
 
 ---
 
 #### RS Free VRAM
 
-Passthrough utility node that forces VRAM cleanup between pipeline stages.
-
-**Inputs:**
+Passthrough utility that forces VRAM cleanup between pipeline stages.
 
 | Input | Type | Description |
 |---|---|---|
-| `any_input` | * (wildcard) | *(optional)* Any data type — passed through unchanged |
+| `any_input` | * (wildcard) | Any data — passed through unchanged |
+
+Unloads all models, runs garbage collection, clears CUDA cache.
+
+---
+
+#### RS Counter
+
+Persistent incrementing counter. State stored in `counter_state.json` across workflow executions.
+
+**Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `start` | INT | 0 | Starting value (used on reset) |
+| `step` | INT | 1 | Increment amount |
+| `reset` | BOOLEAN | False | Reset to start value |
 
 **Outputs:**
 
 | Output | Type | Description |
 |---|---|---|
-| `output` | * (wildcard) | Same data as input |
-
-**Key Behaviors:**
-- Unloads all models, runs garbage collection, clears CUDA cache
-- Prints VRAM freed (GB before/after) to console
-- Clones tensor data before cleanup to preserve output
-- Always re-executes (no caching)
+| `value` | INT | Current counter value (increments after output) |
 
 ---
 
@@ -613,6 +713,15 @@ Passthrough utility node that forces VRAM cleanup between pipeline stages.
 [Load VAE] ──────────┘
 ```
 
+### LoRA Training Pipeline
+
+```
+[Load LTXV Model] ──┐
+[Load VAE] ──────────┼──→ [RS LTXV Prepare Dataset] ──→ [RS LTXV Train LoRA]
+[Load CLIP] ─────────┘                                         │
+                                                          (live loss chart)
+```
+
 ### Audio-Driven Video with TTS
 
 ```
@@ -621,30 +730,18 @@ Passthrough utility node that forces VRAM cleanup between pipeline stages.
         └──→ [RS MOSS TTS Loader] ──→ [RS MOSS TTS Batch Save] ──┐    │
                                               │                    │    │
                                       [RS Audio Concat] ──────────┼────┼──→ [RS LTXV Generate]
-                                                                  │    │
-                                                          (audio) ┘    └── (conditioning)
 ```
 
 ### IC-LoRA Structural Control
 
 ```
 [Load Image] ──→ [RS Canny Preprocessor] ──→ [RS IC-LoRA Guider] ──→ [RS LTXV Generate]
-                                                     │                       ↑
-                                              (guider output) ──────→ (guider input)
 ```
 
-### Video Extension
+### Video Extension + Upscale
 
 ```
-[RS LTXV Generate] ──→ (latent output) ──→ [RS LTXV Extend] ──→ [Save Video]
-                                                   ↑
-                                           [New Conditioning]
-```
-
-### Post-Processing Pipeline
-
-```
-[RS LTXV Generate] ──→ [RS Film Grain] ──→ [RS Video Trim] ──→ [Save Video]
+[RS LTXV Generate] ──→ [RS LTXV Extend] ──→ [RS LTXV Upscale] ──→ [Save Video]
 ```
 
 ---
@@ -654,31 +751,31 @@ Passthrough utility node that forces VRAM cleanup between pipeline stages.
 ### VRAM Management
 
 - **Place RS Free VRAM** between heavy inference nodes and post-processing to reclaim GPU memory.
-- RS Film Grain and RS LTXV Generate both auto-clean VRAM before their GPU work.
 - Use **`ffn_chunks`** (default: 4) and **`video_attn_scale`** (default: 1.03) to reduce VRAM during generation.
-- Enable **`upscale_tiling`** for temporal tiling during upscale if running out of memory on long videos.
-- Set **`upscale_fallback=True`** to gracefully fall back to half-res decode if upscale OOMs.
+- Enable **`upscale_tiling`** for temporal tiling during upscale on long videos.
+- LoRA training uses **layer offloading** to stream blocks one at a time (~0.5 GB instead of ~11 GB).
 
 ### Generation Quality
 
 - **`cfg`**: 2.5–4.0 works well for video; higher values can cause artifacts.
-- **`audio_cfg`**: 5.0–9.0 is typical; audio benefits from higher guidance than video.
-- **`stg_scale`**: Start at 0 (disabled). Small values (0.1–0.5) can improve temporal consistency.
-- **`rescale`**: 0.7 is a good default. Lower values reduce CFG artifacts at the cost of prompt adherence.
-- **`cfg_star_rescale`**: Keep enabled to prevent high-sigma initialization artifacts.
-- **Upscaling**: `upscale_denoise=0.3–0.6` balances sharpness vs. faithfulness. Steps of 3–6 are usually sufficient.
+- **`audio_cfg`**: 5.0–9.0 is typical for audio.
+- **`stg_scale`**: Start at 0. Small values (0.1–0.5) can improve temporal consistency.
+- **`rescale`**: 0.7 is a good default.
+- **Upscaling**: `upscale_denoise=0.3–0.6` balances sharpness vs. faithfulness.
+
+### LoRA Training
+
+- Use **`fp8-quanto`** quantization (no C++ build tools needed).
+- **Subject LoRAs**: enable self-attention + cross-attention. Captions should describe everything *except* the subject.
+- **Style LoRAs**: enable self-attention + feed-forward. Captions should describe the visual style in detail.
+- **Resume**: set the target total steps before resuming — the LR schedule is rebuilt for the new total.
+- The live loss chart shows raw dots, EMA-smoothed line, and a green (decreasing) or red (increasing) trend line.
 
 ### Prompt Workflow
 
 - Write scripts with `[s]`, `[a]`, `[d]` tags and feed into RS Prompt Parser.
-- RS Prompt Formatter automatically caches to JSON — if the input prompt hasn't changed, Ollama is skipped entirely.
-- The `dialogue_index` on RS Prompt Parser auto-increments, making it easy to iterate through dialogue lines in batch workflows.
-
-### Audio
-
-- When `audio` + `audio_vae` are both connected to RS LTXV Generate, the `num_frames` parameter is automatically overridden to match the audio duration.
-- RS Audio Concat resamples all clips to the first clip's sample rate.
-- RS MOSS TTS Batch Save's `one_shot` mode produces the most natural-sounding results for multi-line dialogue.
+- RS Prompt Formatter caches to JSON — if the input prompt hasn't changed, Ollama is skipped.
+- RS Prompt Formatter Local avoids Ollama entirely by loading Gemma3 12B directly.
 
 ---
 
