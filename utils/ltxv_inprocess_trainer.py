@@ -120,6 +120,7 @@ class InProcessTrainer:
         seed: int = 42,
         resume_checkpoint: str = "",
         layer_offloading: bool = True,
+        node_id: str = "",
     ):
         _setup_ltx_paths()
 
@@ -154,6 +155,7 @@ class InProcessTrainer:
         self._seed = seed
         self._resume_checkpoint = resume_checkpoint
         self._layer_offloading = layer_offloading
+        self._node_id = node_id
 
         # Runtime state set during train()
         self._optimizer = None
@@ -306,16 +308,24 @@ class InProcessTrainer:
                     f"fresh optimizer"
                 )
 
-        # On resume: fast-forward the LR scheduler to match the resumed step.
-        # Otherwise the scheduler starts at step 0 with max LR, slamming the
-        # resumed LoRA weights with a learning rate much higher than when they
-        # were saved — which destabilises training and undoes prior progress.
-        if self._global_step > 0 and self._lr_scheduler is not None:
-            for _ in range(self._global_step):
-                self._lr_scheduler.step()
+        # On resume: reset base LR and rebuild the scheduler for the NEW
+        # total_steps, then fast-forward to the resumed step.
+        # The optimizer state restore above overwrites param group LRs with
+        # the old decayed values from the previous run. We must reset to the
+        # configured learning_rate so the scheduler computes from a clean base.
+        if self._global_step > 0:
+            for pg in self._optimizer.param_groups:
+                pg["lr"] = self._learning_rate
+                pg["initial_lr"] = self._learning_rate
+            # Rebuild scheduler with current total_steps
+            self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+            if self._lr_scheduler is not None:
+                for _ in range(self._global_step):
+                    self._lr_scheduler.step()
             resumed_lr = self._optimizer.param_groups[0]["lr"]
             logger.info(
-                f"Fast-forwarded LR scheduler by {self._global_step} steps "
+                f"LR schedule reset for {self._total_steps} total steps, "
+                f"fast-forwarded to step {self._global_step} "
                 f"(resumed LR = {resumed_lr:.2e})"
             )
 
@@ -398,9 +408,23 @@ class InProcessTrainer:
 
             # Loss logging (print directly — logger.info duplicates in ComfyUI)
             loss_val = loss.item()
+            lr = self._optimizer.param_groups[0]["lr"]
             if step % 10 == 0:
-                lr = self._optimizer.param_groups[0]["lr"]
                 print(f"Step {step}/{self._total_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
+
+            # Live chart update via websocket
+            if self._node_id:
+                try:
+                    from server import PromptServer
+                    PromptServer.instance.send_sync("rs-training-update", {
+                        "node_id": self._node_id,
+                        "step": step,
+                        "total_steps": self._total_steps,
+                        "loss": loss_val,
+                        "lr": lr,
+                    })
+                except Exception:
+                    pass
 
             # Validation (save checkpoint first so progress is safe)
             if (

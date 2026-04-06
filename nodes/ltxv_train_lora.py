@@ -154,6 +154,9 @@ class RSLTXVTrainLoRA:
                 # Debug
                 "validation_only": ("BOOLEAN", {"default": False, "tooltip": "TEMP: Skip training, just run one validation step using latest checkpoint"}),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -226,6 +229,7 @@ class RSLTXVTrainLoRA:
         resume: bool = False,
         validation_only: bool = False,
         vae=None,
+        unique_id=None,
     ):
         validate_submodule()
 
@@ -471,6 +475,7 @@ class RSLTXVTrainLoRA:
             seed=42,
             resume_checkpoint=self._find_latest_checkpoint(output_dir) if resume else "",
             layer_offloading=True,
+            node_id=str(unique_id) if unique_id is not None else "",
         )
 
         pbar = comfy.utils.ProgressBar(steps)
