@@ -394,18 +394,54 @@ class InProcessTrainer:
             # Forward + backward.
             # NOTE: inference_mode is exited at the top level (ltxv_train_lora.py)
             # so all operations here have full autograd support.
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss = self._training_step(batch, device)
+            oom_skipped = False
+            try:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss = self._training_step(batch, device)
 
-            if not loss.requires_grad:
-                raise RuntimeError(
-                    "Loss has no grad_fn — the forward pass did not create a computation graph. "
-                    "This usually means PEFT LoRA layers are not active or quanto quantization "
-                    "is incompatible with this PEFT version. Try quantization='none'."
-                )
-            loss.backward()
-            loss_val = loss.item()
-            del loss  # Release computation graph immediately
+                if not loss.requires_grad:
+                    raise RuntimeError(
+                        "Loss has no grad_fn — the forward pass did not create a computation graph. "
+                        "This usually means PEFT LoRA layers are not active or quanto quantization "
+                        "is incompatible with this PEFT version. Try quantization='none'."
+                    )
+                loss.backward()
+                loss_val = loss.item()
+                del loss  # Release computation graph immediately
+            except torch.cuda.OutOfMemoryError:
+                # OOM on a hard sample — double FFN chunks and retry once
+                loss = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                self._optimizer.zero_grad(set_to_none=True)
+
+                original_chunks = self._ffn_chunks
+                self._ffn_chunks = max(original_chunks * 2, 8)
+                print(f"Step {step}: OOM — retrying with ffn_chunks={self._ffn_chunks} (was {original_chunks})")
+
+                try:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        loss = self._training_step(batch, device)
+                    loss.backward()
+                    loss_val = loss.item()
+                    del loss
+                except torch.cuda.OutOfMemoryError:
+                    # Still OOM even with more chunks — skip this step
+                    print(f"Step {step}: OOM even with ffn_chunks={self._ffn_chunks} — skipping step")
+                    loss = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self._optimizer.zero_grad(set_to_none=True)
+                    oom_skipped = True
+                finally:
+                    self._ffn_chunks = original_chunks
+
+            del batch  # Release batch tensors
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if oom_skipped:
+                continue
 
             # With layer offloading, LoRA grads were moved to CPU by the
             # backward hooks.  Ensure param/grad device agreement for the
@@ -422,11 +458,6 @@ class InProcessTrainer:
             if self._lr_scheduler is not None:
                 self._lr_scheduler.step()
             self._optimizer.zero_grad(set_to_none=True)
-            del batch  # Release batch tensors before next allocation
-
-            # VRAM defragmentation every step — running near the 16GB ceiling,
-            # even small fragmentation can cause sudden allocation failures
-            torch.cuda.empty_cache()
 
             self._global_step = step
 
@@ -594,6 +625,9 @@ class InProcessTrainer:
         FFN intermediate tensors into smaller chunks.  Same technique as the
         inference node but applied directly to the raw transformer (no ComfyUI
         model clone / add_object_patch).
+
+        The chunk count is read from self._ffn_chunks at call time, so it can
+        be changed dynamically (e.g. doubled on OOM, then restored).
         """
         base = (
             self._transformer.get_base_model()
@@ -606,12 +640,13 @@ class InProcessTrainer:
             logger.warning("Could not find transformer_blocks for FFN chunking")
             return
 
-        num_chunks = self._ffn_chunks
         patched = 0
+        trainer = self  # capture for closure
 
-        def _make_chunked_forward(original_forward, chunks):
+        def _make_chunked_forward(original_forward):
             def chunked_forward(x, *args, **kwargs):
-                if x.shape[1] <= chunks:
+                chunks = trainer._ffn_chunks
+                if chunks <= 0 or x.shape[1] <= chunks:
                     return original_forward(x, *args, **kwargs)
                 chunk_size = (x.shape[1] + chunks - 1) // chunks
                 output_chunks = []
@@ -624,10 +659,10 @@ class InProcessTrainer:
 
         for block in blocks:
             if hasattr(block, "ff"):
-                block.ff.forward = _make_chunked_forward(block.ff.forward, num_chunks)
+                block.ff.forward = _make_chunked_forward(block.ff.forward)
                 patched += 1
 
-        logger.info(f"FFN chunking enabled: {num_chunks} chunks across {patched} blocks")
+        logger.info(f"FFN chunking enabled: {self._ffn_chunks} chunks across {patched} blocks")
 
     def _enable_input_require_grads(self) -> None:
         """Force the first patchify layer's output to require grad.
