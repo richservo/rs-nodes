@@ -12,6 +12,6 @@ imageio>=2.37.0
 imageio-ffmpeg>=0.6.0
 safetensors>=0.5.0
 scenedetect>=0.6.5.2
-av>=14.2.1
+av>=14.2.1,<15
 psutil
 einops

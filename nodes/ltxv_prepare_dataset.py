@@ -447,6 +447,7 @@ class RSLTXVPrepareDataset:
 
             for i, item in enumerate(new_media):
                 source_path = str(item["path"])
+                produced_clips = False
                 if item["type"] == "image":
                     result = self._process_image(
                         item["path"], clips_dir, target_w, target_h, face_detection,
@@ -454,6 +455,7 @@ class RSLTXVPrepareDataset:
                         crop_mode=crop_mode,
                     )
                     if result:
+                        produced_clips = True
                         entry = {"caption": "", "media_path": str(result), "source_file": source_path}
                         if ref_folder and ref_folder.exists():
                             for ext in VIDEO_EXTENSIONS:
@@ -469,6 +471,8 @@ class RSLTXVPrepareDataset:
                         target_embedding=target_embedding, face_similarity=face_similarity,
                         crop_mode=crop_mode,
                     )
+                    if results:
+                        produced_clips = True
                     for result in results:
                         entry = {"caption": "", "media_path": str(result), "source_file": source_path}
                         if ref_folder and ref_folder.exists():
@@ -478,6 +482,24 @@ class RSLTXVPrepareDataset:
                                     entry["reference_path"] = str(ref_file)
                                     break
                         existing_entries.append(entry)
+
+                # Record fully-rejected source files so they aren't reprocessed
+                if not produced_clips:
+                    rejected_path = output_dir / "rejected.json"
+                    rejected = []
+                    if rejected_path.exists():
+                        try:
+                            with open(rejected_path) as rf:
+                                rejected = json.load(rf)
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    rejected.append({
+                        "source_file": source_path,
+                        "reason": "no clips produced (all chunks rejected)",
+                    })
+                    with open(rejected_path, "w") as rf:
+                        json.dump(rejected, rf, indent=2)
+                    logger.info(f"No clips from {item['path'].name} — added to rejected.json")
 
                 # Save JSON after each source file so progress isn't lost
                 with open(dataset_json_path, "w") as f:
@@ -546,7 +568,8 @@ class RSLTXVPrepareDataset:
 
         # Phase 3b: VAE encoding
         if vae is not None:
-            self._encode_latents_inprocess(vae, dataset_json_path, latents_dir, existing_entries)
+            self._encode_latents_inprocess(vae, dataset_json_path, latents_dir, existing_entries,
+                                             target_w=target_w, target_h=target_h)
         else:
             need_subprocess = True
 
@@ -679,7 +702,8 @@ class RSLTXVPrepareDataset:
         logger.info(f"Encoded {len(to_encode)} captions in-process")
 
     def _encode_latents_inprocess(
-        self, vae, dataset_json_path: Path, latents_dir: Path, existing_entries: list[dict]
+        self, vae, dataset_json_path: Path, latents_dir: Path, existing_entries: list[dict],
+        target_w: int = 0, target_h: int = 0,
     ):
         """Encode video/image clips in-process using ComfyUI's already-loaded VAE.
 
@@ -710,6 +734,7 @@ class RSLTXVPrepareDataset:
         pbar = comfy.utils.ProgressBar(len(to_encode))
 
         for i, (entry, media_path, output_file) in enumerate(to_encode):
+            print(f"[VAE encode {i+1}/{len(to_encode)}] {media_path.name}")
             ext = media_path.suffix.lower()
 
             if ext in IMAGE_EXTENSIONS:
@@ -727,6 +752,33 @@ class RSLTXVPrepareDataset:
                 if pixels is None:
                     logger.warning(f"Could not read video: {media_path}")
                     continue
+
+            # Resize to target resolution if needed (allows re-encoding at different res
+            # without re-extracting clips). Images keep native resolution (tiny tensors).
+            if target_w > 0 and target_h > 0 and pixels.shape[0] > 1:
+                _, cur_h, cur_w, _ = pixels.shape
+                if cur_w != target_w or cur_h != target_h:
+                    # Aspect-preserving scale + letterbox (handles full_frame clips
+                    # that may have different aspect ratios than target)
+                    scale = min(target_w / cur_w, target_h / cur_h)
+                    new_w = int(cur_w * scale)
+                    new_h = int(cur_h * scale)
+                    scaled = torch.nn.functional.interpolate(
+                        pixels.permute(0, 3, 1, 2),  # [F, C, H, W]
+                        size=(new_h, new_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    if new_w == target_w and new_h == target_h:
+                        pixels = scaled.permute(0, 2, 3, 1)
+                    else:
+                        # Pad to exact target size with black
+                        padded = torch.zeros(pixels.shape[0], 3, target_h, target_w,
+                                             dtype=scaled.dtype, device=scaled.device)
+                        pad_y = (target_h - new_h) // 2
+                        pad_x = (target_w - new_w) // 2
+                        padded[:, :, pad_y:pad_y + new_h, pad_x:pad_x + new_w] = scaled
+                        pixels = padded.permute(0, 2, 3, 1)  # [F, H, W, C]
 
             # VAE.encode() expects [F, H, W, C] and returns [1, C, F', H', W']
             latents = vae.encode(pixels)
@@ -868,23 +920,18 @@ class RSLTXVPrepareDataset:
                     return None
 
         if crop_mode == "full_frame":
-            # Images: use native resolution (32-aligned) since 1-frame tensors are tiny
-            h, w = frame.shape[:2]
-            native_w = (w // 32) * 32
-            native_h = (h // 32) * 32
-            if native_w < 32 or native_h < 32:
-                native_w, native_h = target_w, target_h
-            resized = cv2.resize(frame, (native_w, native_h), interpolation=cv2.INTER_LANCZOS4)
+            # Keep native resolution — VAE encode step handles resize
+            output = frame
         else:
+            # Crop to target aspect ratio but keep source resolution — no downscale
             crop = self._get_face_crop(frame, target_w, target_h, face_detection)
             if crop is None:
                 logger.info(f"No face detected, skipping: {img_path.name}")
                 return None
             cx, cy, cw, ch = crop
-            cropped = frame[cy:cy+ch, cx:cx+cw]
-            resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            output = frame[cy:cy+ch, cx:cx+cw]
 
-        cv2.imwrite(str(out_path), resized)
+        cv2.imwrite(str(out_path), output)
         logger.info(f"Processed image: {img_path.name} -> {out_path.name}")
         return out_path
 
@@ -972,21 +1019,22 @@ class RSLTXVPrepareDataset:
                 num_frames = end_frame - start_frame
 
                 if crop_mode == "full_frame":
-                    # Scale full frame to fit target, preserving aspect ratio, pad with black
-                    vf = (
-                        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-                        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
-                    )
+                    # No resize — keep source resolution, VAE encode step handles resize
+                    vf = None
                 else:
+                    # Crop to target aspect ratio at source resolution (no downscale)
                     cx, cy, cw, ch = crop
-                    vf = f"crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{target_h}:flags=lanczos"
+                    vf = f"crop={cw}:{ch}:{cx}:{cy}"
 
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", f"{start_time:.4f}",
                     "-i", str(video_path),
                     "-frames:v", str(num_frames),
-                    "-vf", vf,
+                ]
+                if vf:
+                    cmd += ["-vf", vf]
+                cmd += [
                     "-c:v", "libx264",
                     "-pix_fmt", "yuv420p",
                     "-an",
@@ -1033,24 +1081,6 @@ class RSLTXVPrepareDataset:
         fx, fy, fw, fh = face
         frame_h, frame_w = frame.shape[:2]
         return _compute_face_crop(fx, fy, fw, fh, frame_w, frame_h, target_w, target_h)
-
-    def _scale_to_fit(
-        self, frame: np.ndarray, target_w: int, target_h: int,
-    ) -> np.ndarray:
-        """Scale frame to fit within target dimensions, preserving aspect ratio.
-        Pads with black to reach exact target size."""
-        h, w = frame.shape[:2]
-        scale = min(target_w / w, target_h / h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
-        # Pad to exact target size
-        result = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        pad_x = (target_w - new_w) // 2
-        pad_y = (target_h - new_h) // 2
-        result[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
-        return result
 
     def _center_crop(
         self, frame_w: int, frame_h: int, target_w: int, target_h: int,
