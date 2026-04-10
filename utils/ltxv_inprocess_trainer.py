@@ -124,6 +124,7 @@ class InProcessTrainer:
         diverge_detect_steps: int = 150,
         diverge_stop_steps: int = 300,
         ffn_chunks: int = 0,
+        auto_stop: bool = False,
     ):
         _setup_ltx_paths()
 
@@ -143,7 +144,7 @@ class InProcessTrainer:
         self._dropout = dropout
         self._target_modules = target_modules or ["attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0"]
         self._learning_rate = learning_rate
-        self._total_steps = total_steps
+        self._total_steps = len(dataset) if auto_stop else total_steps
         self._optimizer_type = optimizer_type
         self._scheduler_type = scheduler_type
         self._max_grad_norm = max_grad_norm
@@ -173,6 +174,10 @@ class InProcessTrainer:
         self._diverge_detect_steps = diverge_detect_steps
         self._diverge_stop_steps = diverge_stop_steps
         self._ffn_chunks = ffn_chunks
+        self._auto_stop = auto_stop
+        # LR schedule epoch length: always one full pass through the dataset.
+        # The schedule resets each epoch for proper per-epoch decay curves.
+        self._step_epoch = len(dataset)
         self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
         self._best_ema_loss = None      # Lowest EMA loss seen
         self._best_ema_step = 0         # Step at which best EMA was recorded
@@ -329,24 +334,29 @@ class InProcessTrainer:
                     f"fresh optimizer"
                 )
 
-        # On resume: reset base LR and rebuild the scheduler for the NEW
-        # total_steps, then fast-forward to the resumed step.
-        # The optimizer state restore above overwrites param group LRs with
-        # the old decayed values from the previous run. We must reset to the
-        # configured learning_rate so the scheduler computes from a clean base.
+        # On resume with auto_stop: extend total_steps to cover the next epoch
+        if self._global_step > 0 and self._auto_stop:
+            epochs_done = self._global_step // self._step_epoch
+            self._total_steps = (epochs_done + 1) * self._step_epoch
+
+        # On resume: reset base LR and rebuild scheduler for the CURRENT epoch,
+        # then fast-forward to position within epoch. Each epoch has its own
+        # decay curve, so we only FF by the offset within the current epoch.
         if self._global_step > 0:
             for pg in self._optimizer.param_groups:
                 pg["lr"] = self._learning_rate
                 pg["initial_lr"] = self._learning_rate
-            # Rebuild scheduler with current total_steps
             self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+            # Fast-forward within current epoch only
+            steps_into_epoch = self._global_step % self._step_epoch
             if self._lr_scheduler is not None:
-                for _ in range(self._global_step):
+                for _ in range(steps_into_epoch):
                     self._lr_scheduler.step()
             resumed_lr = self._optimizer.param_groups[0]["lr"]
+            epoch_num = self._global_step // self._step_epoch + 1
             logger.info(
-                f"LR schedule reset for {self._total_steps} total steps, "
-                f"fast-forwarded to step {self._global_step} "
+                f"LR schedule reset for epoch {epoch_num} ({self._step_epoch} steps/epoch), "
+                f"fast-forwarded {steps_into_epoch} steps into epoch "
                 f"(resumed LR = {resumed_lr:.2e})"
             )
 
@@ -379,9 +389,12 @@ class InProcessTrainer:
         for _h in _root_logger.handlers:
             _h.addFilter(_sage_filter)
 
-        logger.info(f"Starting training: {start_step} → {self._total_steps} steps")
+        logger.info(f"Starting training: {start_step} → {self._total_steps} steps"
+                    f"{f' (auto_stop, epoch={self._step_epoch} samples)' if self._auto_stop else ''}")
 
-        for step in range(start_step + 1, self._total_steps + 1):
+        step = start_step
+        while step < self._total_steps:
+            step += 1
             # Cancellation check
             if cancel_check is not None:
                 cancel_check()
@@ -480,6 +493,7 @@ class InProcessTrainer:
             if self._node_id:
                 try:
                     from server import PromptServer
+                    epoch = (step - 1) // self._step_epoch + 1
                     PromptServer.instance.send_sync("rs-training-update", {
                         "node_id": self._node_id,
                         "step": step,
@@ -489,6 +503,8 @@ class InProcessTrainer:
                         "ema_loss": self._ema_loss,
                         "monitoring": self._diverge_monitoring,
                         "checkpoint_interval": self._checkpoint_interval,
+                        "epoch": epoch,
+                        "step_epoch": self._step_epoch,
                     })
                 except Exception:
                     pass
@@ -566,6 +582,23 @@ class InProcessTrainer:
             # Checkpoint
             if self._checkpoint_interval > 0 and step % self._checkpoint_interval == 0:
                 self._save_checkpoint(step)
+
+            # Epoch boundary: rebuild LR scheduler for per-epoch decay.
+            # For auto_stop, also extend total_steps by one more epoch.
+            if step > 0 and step % self._step_epoch == 0:
+                epoch_num = step // self._step_epoch
+                if self._auto_stop:
+                    self._total_steps = step + self._step_epoch
+                # Reset base LR and rebuild scheduler for next epoch
+                for pg in self._optimizer.param_groups:
+                    pg["lr"] = self._learning_rate
+                    pg["initial_lr"] = self._learning_rate
+                self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+                new_lr = self._optimizer.param_groups[0]["lr"]
+                print(
+                    f"[epoch {epoch_num} complete] LR schedule reset (lr={new_lr:.2e})"
+                    f"{f', extending to step {self._total_steps}' if self._auto_stop else ''}"
+                )
 
         # Restore sage attention logging
         _root_logger.removeFilter(_sage_filter)
@@ -1143,7 +1176,7 @@ class InProcessTrainer:
         )
 
         t = self._scheduler_type
-        steps = self._total_steps
+        steps = self._step_epoch  # schedule per epoch, not total training
 
         if t is None or t == "constant":
             return None

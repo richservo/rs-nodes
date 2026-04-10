@@ -128,8 +128,8 @@ class RSLTXVTrainLoRA:
                 "audio_attends_to_video": ("BOOLEAN", {"default": False}),
                 # Training
                 "learning_rate":          ("FLOAT", {"default": 1e-4,  "min": 1e-7, "max": 1e-1, "step": 1e-5}),
-                "steps":                  ("INT",   {"default": 2000,  "min": 1,    "max": 100000}),
-                "auto_stop":              ("BOOLEAN", {"default": False, "tooltip": "Ignore step count — train until divergence detection stops it"}),
+                "epochs":                 ("INT",   {"default": 3,     "min": 1,    "max": 1000, "tooltip": "Number of passes through the full dataset. Each epoch = len(dataset) steps."}),
+                "auto_stop":              ("BOOLEAN", {"default": False, "tooltip": "Ignore epoch count — train until divergence detection stops it"}),
                 "optimizer":              (["adamw8bit", "adamw"], {"default": "adamw8bit"}),
                 "scheduler":              (["linear", "constant", "cosine", "cosine_with_restarts", "polynomial"],),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
@@ -217,7 +217,7 @@ class RSLTXVTrainLoRA:
         video_attends_to_audio: bool = False,
         audio_attends_to_video: bool = False,
         learning_rate: float = 1e-4,
-        steps: int = 2000,
+        epochs: int = 3,
         auto_stop: bool = False,
         optimizer: str = "adamw8bit",
         scheduler: str = "linear",
@@ -448,6 +448,11 @@ class RSLTXVTrainLoRA:
             data_sources=data_sources,
         )
         logger.info(f"Dataset loaded: {len(dataset)} samples")
+        total_steps = epochs * len(dataset)
+        if auto_stop:
+            logger.info(f"Training plan: {len(dataset)} samples/epoch — epochs will continue until divergence detection stops it")
+        else:
+            logger.info(f"Training plan: {epochs} epochs × {len(dataset)} samples = {total_steps} steps")
 
         # Default: shifted logit-normal sampler (matches official config)
         timestep_sampler = ShiftedLogitNormalTimestepSampler()
@@ -471,7 +476,8 @@ class RSLTXVTrainLoRA:
             dropout=lora_dropout,
             target_modules=target_modules,
             learning_rate=learning_rate,
-            total_steps=1_000_000 if auto_stop else steps,
+            total_steps=total_steps,
+            auto_stop=auto_stop,
             optimizer_type=optimizer,
             scheduler_type=scheduler,
             max_grad_norm=1.0,
@@ -492,7 +498,7 @@ class RSLTXVTrainLoRA:
             ffn_chunks=ffn_chunks,
         )
 
-        pbar = comfy.utils.ProgressBar(steps)
+        pbar = comfy.utils.ProgressBar(total_steps)
         cancel_check = mm.throw_exception_if_processing_interrupted
 
         lora_path = ""
@@ -509,7 +515,7 @@ class RSLTXVTrainLoRA:
             else:
                 with torch.inference_mode(False):
                     lora_path = trainer.train(progress_bar=pbar, cancel_check=cancel_check)
-                status = f"Training complete! {steps} steps. LoRA saved to: {lora_path}"
+                status = f"Training complete! {total_steps} steps ({epochs} epochs). LoRA saved to: {lora_path}"
         except Exception as e:
             status = f"Training failed: {e}"
             logger.error(f"Training failed: {e}", exc_info=True)

@@ -33,7 +33,7 @@ class _OffloadCheckpointFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, vx, ax, block, block_kwargs, device, has_audio):
+    def forward(ctx, vx, ax, block, block_kwargs, device, has_audio, block_idx):
         # Clone inputs BEFORE the block mutates them in-place (addcmul_ etc.)
         # IMPORTANT: always clone both — never return an input tensor from
         # a custom Function (PyTorch forbids it and silently breaks the graph).
@@ -47,6 +47,7 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         ctx.block_kwargs = block_kwargs
         ctx.device = device
         ctx.has_audio = has_audio
+        ctx.block_idx = block_idx
 
         block.to(device, non_blocking=True)
         torch.cuda.synchronize(device)
@@ -66,6 +67,14 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         block = ctx.block
         device = ctx.device
         has_audio = ctx.has_audio
+
+        # Periodically clear VRAM cache during backward to prevent
+        # fragmentation-induced OOM (which runs in C++ autograd and
+        # can't be caught by Python try/except).  Every 12 blocks
+        # balances overhead (~4 clears per backward) vs safety.
+        block_idx = getattr(ctx, 'block_idx', -1)
+        if block_idx >= 0 and block_idx % 12 == 0:
+            torch.cuda.empty_cache()
 
         block.to(device, non_blocking=True)
         # Move saved hidden states back to GPU for recomputation
@@ -151,11 +160,11 @@ class _OffloadCheckpointFn(torch.autograd.Function):
             else:
                 p.grad.add_(g)
 
-        # Returns for: vx, ax, block, block_kwargs, device, has_audio
+        # Returns for: vx, ax, block, block_kwargs, device, has_audio, block_idx
         return (
             vx_grad_out,
             ax_grad_out,
-            None, None, None, None,
+            None, None, None, None, None,
         )
 
 
@@ -223,7 +232,7 @@ def _offloaded_process_blocks(
         cur_ax = ax
 
         new_vx, new_ax = _OffloadCheckpointFn.apply(
-            vx, cur_ax, block, block_kwargs, device, has_audio,
+            vx, cur_ax, block, block_kwargs, device, has_audio, i,
         )
 
         vx = new_vx

@@ -348,15 +348,22 @@ function drawLossChart(canvas, data) {
         timeStr = `  ${lastTime.toFixed(1)}s/step  avg=${avgTime.toFixed(1)}s`;
     }
 
+    let stepDisplay;
+    if (data.epoch && data.stepEpoch) {
+        const epochStep = ((maxStep - 1) % data.stepEpoch) + 1;
+        stepDisplay = `Step ${epochStep}/${data.stepEpoch}  epoch ${data.epoch}`;
+    } else {
+        stepDisplay = `Step ${maxStep}/${data.totalSteps || "?"}`;
+    }
     ctx.fillText(
-        `Step ${maxStep}/${data.totalSteps || "?"}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${timeStr}${status}`,
+        `${stepDisplay}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${timeStr}${status}`,
         pad.left, pad.top - 6
     );
 }
 
 // Listen for training updates from the backend
 api.addEventListener("rs-training-update", (event) => {
-    const { node_id, step, total_steps, loss, lr, ema_loss, monitoring, checkpoint_interval } = event.detail;
+    const { node_id, step, total_steps, loss, lr, ema_loss, monitoring, checkpoint_interval, epoch, step_epoch } = event.detail;
     if (!node_id) return;
 
     if (!lossData[node_id]) {
@@ -367,6 +374,8 @@ api.addEventListener("rs-training-update", (event) => {
     d.emaLoss = ema_loss;
     d.monitoring = monitoring;
     if (checkpoint_interval) d.checkpointInterval = checkpoint_interval;
+    if (epoch) d.epoch = epoch;
+    if (step_epoch) d.stepEpoch = step_epoch;
     d.steps.push(step);
     d.losses.push(loss);
     d.lrs.push(lr);
