@@ -22,6 +22,13 @@ from typing import Callable
 import torch
 from torch.utils.data import DataLoader
 
+# Build a tuple of OOM-like exception types.  PyTorch 2.10+ raises
+# torch.AcceleratorError for CUDA OOMs instead of torch.cuda.OutOfMemoryError,
+# so we catch whichever classes exist on the installed version.
+_OOM_EXCEPTIONS: tuple = (torch.cuda.OutOfMemoryError,)
+if hasattr(torch, "AcceleratorError"):
+    _OOM_EXCEPTIONS = _OOM_EXCEPTIONS + (torch.AcceleratorError,)
+
 logger = logging.getLogger(__name__)
 
 
@@ -426,7 +433,7 @@ class InProcessTrainer:
                 loss.backward()
                 loss_val = loss.item()
                 del loss  # Release computation graph immediately
-            except torch.cuda.OutOfMemoryError:
+            except _OOM_EXCEPTIONS:
                 # OOM on a hard sample — double FFN chunks and retry once
                 loss = None
                 gc.collect()
@@ -443,7 +450,7 @@ class InProcessTrainer:
                     loss.backward()
                     loss_val = loss.item()
                     del loss
-                except torch.cuda.OutOfMemoryError:
+                except _OOM_EXCEPTIONS:
                     # Still OOM even with more chunks — skip this step
                     print(f"Step {step}: OOM even with ffn_chunks={self._ffn_chunks} — skipping step")
                     loss = None

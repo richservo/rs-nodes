@@ -132,17 +132,26 @@ def _get_face_detector():
 
 def _detect_face_dnn(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     """Detect the largest face using OpenCV DNN. Returns (x, y, w, h) or None."""
+    faces = _detect_all_faces_dnn(frame)
+    if not faces:
+        return None
+    # Return largest
+    return max(faces, key=lambda r: r[2] * r[3])
+
+
+def _detect_all_faces_dnn(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Detect all faces using OpenCV DNN. Returns list of (x, y, w, h)."""
     net = _get_face_detector()
     if net is None:
-        return _detect_face_haar(frame)
+        haar = _detect_face_haar(frame)
+        return [haar] if haar is not None else []
 
     h, w = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
     net.setInput(blob)
     detections = net.forward()
 
-    best = None
-    best_area = 0
+    faces: list[tuple[int, int, int, int]] = []
     for i in range(detections.shape[2]):
         confidence = detections[0, 0, i, 2]
         if confidence < _FACE_CONFIDENCE_THRESHOLD:
@@ -151,12 +160,11 @@ def _detect_face_dnn(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         y1 = int(detections[0, 0, i, 4] * h)
         x2 = int(detections[0, 0, i, 5] * w)
         y2 = int(detections[0, 0, i, 6] * h)
-        area = (x2 - x1) * (y2 - y1)
-        if area > best_area:
-            best_area = area
-            best = (x1, y1, x2 - x1, y2 - y1)
-
-    return best
+        fw, fh = x2 - x1, y2 - y1
+        if fw <= 0 or fh <= 0:
+            continue
+        faces.append((x1, y1, fw, fh))
+    return faces
 
 
 def _detect_face_haar(frame: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -302,7 +310,7 @@ class RSLTXVPrepareDataset:
                 "resolution_buckets": ("STRING", {"default": "576x576x49", "tooltip": "WxHxF resolution buckets, semicolon-separated (e.g. '576x576x49;768x512x25')"}),
                 "lora_trigger": ("STRING", {"default": "", "tooltip": "Trigger word prepended to all captions"}),
                 "caption_mode": (["ollama", "skip", "auto_filename"], {"default": "ollama", "tooltip": "ollama=vision model captions, skip=use filenames, auto_filename=clean filenames"}),
-                "caption_style": (["subject", "subject + style", "style", "motion", "general"], {"default": "subject", "tooltip": "Captioning focus: subject=person identity, subject+style=person+cinematography, style=visual aesthetics only, motion=movement/action, general=balanced"}),
+                "caption_style": (["subject", "subject + style", "style", "motion", "general", "multi_character"], {"default": "subject", "tooltip": "Captioning focus: subject=person identity, subject+style=person+cinematography, style=visual aesthetics only, motion=movement/action, general=balanced, multi_character=name every recognized character equally (pairs with character_refs_folder)"}),
                 "ollama_url": ("STRING", {"default": "http://localhost:11434", "tooltip": "Ollama server URL (only used when caption_mode=ollama)"}),
                 "ollama_model": ("STRING", {"default": "gemma3:27b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
@@ -310,11 +318,15 @@ class RSLTXVPrepareDataset:
                 "crop_mode": (["face_crop", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=crop around detected face, full_frame=scale entire frame to target resolution (aspect-preserving, letterboxed). Both modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
+                "character_refs_folder": ("STRING", {"default": "", "tooltip": "Multi-character mode: path to a folder of reference face images. Filename (minus extension) is used as that character's trigger word. Clips are kept if ANY reference matches. All matched characters are named in captions."}),
+                "skip_start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 1.0, "tooltip": "Skip the first N seconds of every video (useful for cutting out repetitive intros)."}),
+                "skip_end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 1.0, "tooltip": "Skip the last N seconds of every video (useful for cutting out end credits)."}),
                 "face_similarity": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Face match threshold (0-1). Higher = stricter matching. 0.40 is a good default."}),
                 "face_padding": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Padding around detected face (0.6 = 60% extra for head+shoulders)"}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
                 "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
+                "clip_vision": ("CLIP_VISION", {"tooltip": "Optional CLIP Vision model (from CLIPVisionLoader). Enables matching of non-human characters (puppets, props, objects) in character_refs_folder. Human characters use face matching regardless."}),
             },
         }
 
@@ -345,11 +357,15 @@ class RSLTXVPrepareDataset:
         crop_mode: str = "face_crop",
         face_detection: bool = True,
         target_face=None,
+        character_refs_folder: str = "",
+        skip_start_seconds: float = 0.0,
+        skip_end_seconds: float = 0.0,
         face_similarity: float = 0.40,
         face_padding: float = 0.6,
         conditioning_folder: str = "",
         clip=None,
         vae=None,
+        clip_vision=None,
     ):
         validate_submodule()
         # Only validate/download text encoder if we'll need it for the subprocess
@@ -377,6 +393,24 @@ class RSLTXVPrepareDataset:
                 logger.info(f"Target face embedding computed, similarity threshold: {face_similarity}")
             else:
                 logger.warning("Could not extract face from target_face image, face matching disabled")
+
+        # Multi-character mode: load a folder of reference images.  Each file's
+        # stem becomes that character's trigger word.  Face-containing refs are
+        # matched via face embeddings; non-face refs (puppets, props, objects)
+        # fall back to CLIP vision embedding if clip_vision is connected.
+        # When populated, clip selection accepts chunks where any reference
+        # matches in at least one sample frame.
+        character_refs: dict[str, dict] = {}
+        if character_refs_folder and face_detection:
+            character_refs = self._load_character_refs(character_refs_folder, clip_vision=clip_vision)
+            if character_refs:
+                n_face = sum(1 for r in character_refs.values() if r["type"] == "face")
+                n_clip = sum(1 for r in character_refs.values() if r["type"] == "clip")
+                logger.info(
+                    f"Multi-character mode: loaded {len(character_refs)} references "
+                    f"({n_face} face, {n_clip} clip-vision) "
+                    f"— {', '.join(sorted(character_refs.keys()))}"
+                )
 
         output_dir = Path(folder_paths.get_output_directory()) / "ltxv_training" / output_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +487,8 @@ class RSLTXVPrepareDataset:
                         item["path"], clips_dir, target_w, target_h, face_detection,
                         target_embedding=target_embedding, face_similarity=face_similarity,
                         crop_mode=crop_mode,
+                        character_refs=character_refs,
+                        clip_vision=clip_vision,
                     )
                     if result:
                         produced_clips = True
@@ -469,7 +505,11 @@ class RSLTXVPrepareDataset:
                         item["path"], clips_dir, target_w, target_h, target_frames,
                         face_detection,
                         target_embedding=target_embedding, face_similarity=face_similarity,
-                        crop_mode=crop_mode,
+                        crop_mode=crop_mode, with_audio=with_audio,
+                        character_refs=character_refs,
+                        clip_vision=clip_vision,
+                        skip_start_seconds=skip_start_seconds,
+                        skip_end_seconds=skip_end_seconds,
                     )
                     if results:
                         produced_clips = True
@@ -544,10 +584,16 @@ class RSLTXVPrepareDataset:
             _, buf = cv2.imencode(".png", frame)
             target_face_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
+        # Build cast list for Gemma QC: when character_refs is populated, the
+        # caption step asks Gemma whether any known character is visible and
+        # drops the clip if not.  Names are derived from ref filenames.
+        cast_names: list[str] = sorted(character_refs.keys()) if character_refs else []
+
         self._caption_dataset_json(
             dataset_json_path, clip_paths, caption_mode, lora_trigger,
             ollama_url=ollama_url, ollama_model=ollama_model,
             target_face_b64=target_face_b64, caption_style=caption_style,
+            cast_names=cast_names,
         )
 
         # --- PHASE 3: Encode conditions and latents ---
@@ -567,7 +613,11 @@ class RSLTXVPrepareDataset:
             need_subprocess = True
 
         # Phase 3b: VAE encoding
-        if vae is not None:
+        # When with_audio is set, the subprocess needs to write combined video+audio
+        # latent files.  It auto-skips files that already exist on disk, so we must
+        # NOT pre-encode video-only latents in-process — doing so would cause audio
+        # encoding to be skipped entirely.
+        if vae is not None and not with_audio:
             self._encode_latents_inprocess(vae, dataset_json_path, latents_dir, existing_entries,
                                              target_w=target_w, target_h=target_h)
         else:
@@ -879,6 +929,138 @@ class RSLTXVPrepareDataset:
         embedding = _get_face_embedding(frame, face)
         return embedding
 
+    def _load_character_refs(
+        self, refs_folder: str, clip_vision=None,
+    ) -> dict[str, dict]:
+        """Load reference images from a folder.
+        Each file's stem becomes the character's trigger word.  For references
+        where a human face is detected, a face embedding is stored.  Otherwise,
+        if a CLIP vision model is provided, a CLIP image embedding is stored
+        for whole-frame visual matching (puppets, props, objects).
+
+        Returns {trigger: {"type": "face"|"clip", "embedding": np.ndarray}}.
+        """
+        refs: dict[str, dict] = {}
+        folder = Path(refs_folder)
+        if not folder.exists() or not folder.is_dir():
+            logger.warning(f"Character refs folder not found: {refs_folder}")
+            return refs
+
+        for f in sorted(folder.iterdir()):
+            if f.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            frame = cv2.imread(str(f))
+            if frame is None:
+                logger.warning(f"Could not read character reference: {f.name}")
+                continue
+            trigger = f.stem.lower().replace("_", "-")
+
+            # Try face detection first — most reliable for humans
+            face = _detect_face_dnn(frame)
+            if face is not None:
+                embedding = _get_face_embedding(frame, face)
+                if embedding is not None:
+                    refs[trigger] = {"type": "face", "embedding": embedding}
+                    logger.info(f"Loaded character reference (face): {trigger}")
+                    continue
+
+            # Fallback: CLIP vision embedding for non-human characters/objects
+            if clip_vision is None:
+                logger.warning(
+                    f"No face in '{f.name}' and no clip_vision provided — skipping. "
+                    f"Connect a CLIPVisionLoader to match non-human characters."
+                )
+                continue
+            emb = self._clip_vision_encode(clip_vision, frame)
+            if emb is None:
+                logger.warning(f"Could not compute CLIP embedding for: {f.name}")
+                continue
+            refs[trigger] = {"type": "clip", "embedding": emb}
+            logger.info(f"Loaded character reference (clip-vision): {trigger}")
+        return refs
+
+    def _clip_vision_encode(self, clip_vision, frame: np.ndarray) -> np.ndarray | None:
+        """Encode a BGR uint8 frame with a ComfyUI CLIPVision model.
+        Returns a unit-normalised 1-D numpy vector, or None on failure."""
+        try:
+            import torch
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            tensor = torch.from_numpy(rgb).float().unsqueeze(0) / 255.0  # [1,H,W,3]
+            output = clip_vision.encode_image(tensor)
+            # ComfyUI's CLIPVision returns an object with image_embeds / last_hidden_state
+            if hasattr(output, "image_embeds"):
+                vec = output.image_embeds
+            elif isinstance(output, dict) and "image_embeds" in output:
+                vec = output["image_embeds"]
+            elif hasattr(output, "last_hidden_state"):
+                # Mean-pool the token sequence as a fallback
+                vec = output.last_hidden_state.mean(dim=1)
+            else:
+                return None
+            vec = vec[0].detach().cpu().float().numpy()
+            n = np.linalg.norm(vec)
+            if n > 0:
+                vec = vec / n
+            return vec
+        except Exception as e:
+            logger.warning(f"CLIP vision encode failed: {e}")
+            return None
+
+    def _match_characters_in_frame(
+        self, frame: np.ndarray,
+        character_refs: dict[str, dict],
+        threshold: float,
+        clip_vision=None,
+        clip_threshold: float = 0.75,
+        first_match_only: bool = False,
+    ) -> set[str]:
+        """Return the set of character trigger words whose reference matches
+        something in the given frame.  Face refs are matched against detected
+        faces in the frame; clip-vision refs are matched against the
+        whole-frame CLIP embedding.
+
+        When first_match_only=True, returns as soon as ANY match is found —
+        skips CLIP vision if a face already matched.  This is the fast path
+        for clip-selection gating."""
+        matches: set[str] = set()
+        if not character_refs:
+            return matches
+
+        face_refs = {n: r["embedding"] for n, r in character_refs.items() if r["type"] == "face"}
+        clip_refs = {n: r["embedding"] for n, r in character_refs.items() if r["type"] == "clip"}
+
+        # --- Face matching ---
+        if face_refs:
+            faces = _detect_all_faces_dnn(frame)
+            for rect in faces:
+                emb = _get_face_embedding(frame, rect)
+                if emb is None:
+                    continue
+                best_name = None
+                best_sim = threshold
+                for name, ref in face_refs.items():
+                    sim = _match_face(emb, ref)
+                    if sim >= best_sim:
+                        best_sim = sim
+                        best_name = name
+                if best_name is not None:
+                    matches.add(best_name)
+                    if first_match_only:
+                        return matches
+
+        # --- CLIP vision matching (non-human refs) ---
+        if clip_refs and clip_vision is not None:
+            frame_emb = self._clip_vision_encode(clip_vision, frame)
+            if frame_emb is not None:
+                for name, ref in clip_refs.items():
+                    sim = float(np.dot(frame_emb, ref))
+                    if sim >= clip_threshold:
+                        matches.add(name)
+                        if first_match_only:
+                            return matches
+
+        return matches
+
     def _check_face_match(
         self, frame: np.ndarray, face_rect: tuple, target_embedding: np.ndarray, threshold: float,
     ) -> bool:
@@ -894,6 +1076,8 @@ class RSLTXVPrepareDataset:
         target_w: int, target_h: int, face_detection: bool,
         target_embedding: np.ndarray | None = None, face_similarity: float = 0.40,
         crop_mode: str = "face_crop",
+        character_refs: dict[str, dict] | None = None,
+        clip_vision=None,
     ) -> Path | None:
         """Process a single image: detect face, crop or scale, save as PNG.
         Returns output path or None if no face found (when face_detection is on).
@@ -910,14 +1094,25 @@ class RSLTXVPrepareDataset:
         # Face detection only for face_crop mode — stills in full_frame mode
         # are assumed to be the subject (user curated the folder)
         if crop_mode != "full_frame" and face_detection:
-            face = _detect_face_dnn(frame)
-            if face is None:
-                logger.info(f"No face detected, skipping: {img_path.name}")
-                return None
-            if target_embedding is not None:
-                if not self._check_face_match(frame, face, target_embedding, face_similarity):
-                    logger.info(f"Face doesn't match target, skipping: {img_path.name}")
+            if character_refs:
+                # Multi-character mode: accept if ANY known character is
+                # present (face or clip-vision match), no bare face required.
+                matches = self._match_characters_in_frame(
+                    frame, character_refs, face_similarity,
+                    clip_vision=clip_vision,
+                )
+                if not matches:
+                    logger.info(f"No known characters in {img_path.name}, skipping")
                     return None
+            else:
+                face = _detect_face_dnn(frame)
+                if face is None:
+                    logger.info(f"No face detected, skipping: {img_path.name}")
+                    return None
+                if target_embedding is not None:
+                    if not self._check_face_match(frame, face, target_embedding, face_similarity):
+                        logger.info(f"Face doesn't match target, skipping: {img_path.name}")
+                        return None
 
         if crop_mode == "full_frame":
             # Keep native resolution — VAE encode step handles resize
@@ -940,7 +1135,11 @@ class RSLTXVPrepareDataset:
         target_w: int, target_h: int, target_frames: int,
         face_detection: bool,
         target_embedding: np.ndarray | None = None, face_similarity: float = 0.40,
-        crop_mode: str = "face_crop",
+        crop_mode: str = "face_crop", with_audio: bool = False,
+        character_refs: dict[str, dict] | None = None,
+        clip_vision=None,
+        skip_start_seconds: float = 0.0,
+        skip_end_seconds: float = 0.0,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
         Returns list of output clip paths (skips chunks with no face when face_detection is on).
@@ -959,31 +1158,143 @@ class RSLTXVPrepareDataset:
         if total_frames <= 0:
             return []
 
+        # Apply intro / outro skip ranges (useful for cutting show intros and
+        # end credits that would otherwise be duplicated across every episode).
+        skip_start_frames = int(round(skip_start_seconds * fps))
+        skip_end_frames = int(round(skip_end_seconds * fps))
+        first_frame = max(0, skip_start_frames)
+        last_frame = max(first_frame, total_frames - skip_end_frames)
+        if first_frame > 0 or last_frame < total_frames:
+            logger.info(
+                f"{video_path.name}: scanning frames "
+                f"{first_frame}-{last_frame} of {total_frames} "
+                f"(skip_start={skip_start_seconds}s, skip_end={skip_end_seconds}s)"
+            )
+
         # Split into chunks of target_frames
         clips = []
-        chunk_idx = 0
-        start_frame = 0
 
-        while start_frame < total_frames:
-            end_frame = min(start_frame + target_frames, total_frames)
+        # Resume support: we keep a per-video `.progress` file in clips_dir
+        # that records the NEXT chunk index to process.  Unlike a glob of
+        # extracted clips, this tracks progress through skipped chunks too, so
+        # on resume we jump straight past all previously-scanned chunks even
+        # if most of them were rejected by the character filter.
+        progress_file = clips_dir / f"{video_path.stem}.progress"
+        # NOTE: do not use Path.glob here — video filenames frequently contain
+        # characters like `[iEgv1K7nPCM]` which glob interprets as character
+        # classes, causing zero matches.  Scan the directory and match literal
+        # prefixes instead.
+        chunk_prefix = f"{video_path.stem}_chunk"
+        existing_chunks = sorted(
+            (
+                p for p in clips_dir.iterdir()
+                if p.is_file()
+                and p.suffix == ".mp4"
+                and p.name.startswith(chunk_prefix)
+            ),
+            key=lambda p: p.name,
+        )
+        clips.extend(existing_chunks)
+
+        resume_chunk_idx = 0
+        if progress_file.exists():
+            try:
+                resume_chunk_idx = int(progress_file.read_text().strip())
+            except (ValueError, OSError):
+                resume_chunk_idx = 0
+        # Fallback: if no progress file but extracted clips exist, derive a
+        # lower bound from the highest extracted chunk index so we don't
+        # reprocess clearly-complete chunks on old runs.
+        if resume_chunk_idx == 0 and existing_chunks:
+            for p in existing_chunks:
+                try:
+                    idx = int(p.stem.rsplit("_chunk", 1)[1])
+                    if idx + 1 > resume_chunk_idx:
+                        resume_chunk_idx = idx + 1
+                except (ValueError, IndexError):
+                    continue
+
+        chunk_idx = resume_chunk_idx
+        start_frame = first_frame + chunk_idx * target_frames
+
+        if chunk_idx > 0:
+            logger.info(
+                f"{video_path.name}: resuming from chunk {chunk_idx} "
+                f"(frame {start_frame}) — {len(existing_chunks)} existing clips kept"
+            )
+
+        while start_frame < last_frame:
+            end_frame = min(start_frame + target_frames, last_frame)
             # Skip chunks that are too short (less than half the target)
             if end_frame - start_frame < target_frames // 2:
                 break
+
+            # Persist resume progress before doing any work on this chunk.
+            # On a crash / interrupt, the next run resumes at exactly this
+            # chunk index and fast-forwards everything before it.
+            try:
+                progress_file.write_text(str(chunk_idx))
+            except OSError:
+                pass
 
             # Sample a frame from the middle of the chunk for face detection
             sample_frame_idx = start_frame + (end_frame - start_frame) // 2
             crop = None
             matched_sample = None
 
-            # Face detection for clip selection (both modes use this)
-            if face_detection:
-                face_found = False
-                for try_idx in [sample_frame_idx,
-                                start_frame,
-                                start_frame + (end_frame - start_frame) // 4,
-                                start_frame + 3 * (end_frame - start_frame) // 4]:
-                    if not (start_frame <= try_idx < end_frame):
+            # Clip-selection gating.  Two modes:
+            #   - Multi-character: chunk must contain at least one known
+            #     character from character_refs (face OR clip-vision match).
+            #     Face crop uses the first detected face if available,
+            #     otherwise falls back to center crop.
+            #   - Single-character / default: requires a detected face; if a
+            #     target_embedding is set, that face must match the target.
+            sample_positions = [
+                sample_frame_idx,
+                start_frame,
+                start_frame + (end_frame - start_frame) // 4,
+                start_frame + 3 * (end_frame - start_frame) // 4,
+            ]
+            sample_positions = [p for p in sample_positions if start_frame <= p < end_frame]
+
+            if face_detection and character_refs:
+                matched_names: set[str] = set()
+                face_anchor = None  # (frame, rect) for crop if we find one
+                for try_idx in sample_positions:
+                    sample = self._read_frame(video_path, try_idx)
+                    if sample is None:
                         continue
+                    hits = self._match_characters_in_frame(
+                        sample, character_refs, face_similarity,
+                        clip_vision=clip_vision,
+                        first_match_only=True,
+                    )
+                    if hits:
+                        matched_names |= hits
+                        # Remember the first face we see in any matched sample
+                        # so face_crop mode still gets a proper anchor.
+                        if face_anchor is None:
+                            face = _detect_face_dnn(sample)
+                            if face is not None:
+                                face_anchor = (sample, face)
+                        break
+                if not matched_names:
+                    logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
+                    start_frame = end_frame
+                    chunk_idx += 1
+                    continue
+                logger.info(f"Chunk {chunk_idx}: matched {', '.join(sorted(matched_names))}")
+                if crop_mode == "face_crop":
+                    if face_anchor is not None:
+                        _, face = face_anchor
+                        crop = _compute_face_crop(*face, frame_w, frame_h, target_w, target_h)
+                    else:
+                        # Non-human-only match (e.g. Chairry solo shot) — no
+                        # face to anchor on, fall back to center crop.
+                        crop = self._center_crop(frame_w, frame_h, target_w, target_h)
+            elif face_detection:
+                face_found = False
+                for try_idx in sample_positions:
                     sample = self._read_frame(video_path, try_idx)
                     if sample is None:
                         continue
@@ -1000,7 +1311,6 @@ class RSLTXVPrepareDataset:
                     chunk_idx += 1
                     continue
 
-                # Check face identity match if target provided
                 if target_embedding is not None and matched_sample is not None:
                     face = _detect_face_dnn(matched_sample)
                     if face is None or not self._check_face_match(matched_sample, face, target_embedding, face_similarity):
@@ -1037,9 +1347,19 @@ class RSLTXVPrepareDataset:
                 cmd += [
                     "-c:v", "libx264",
                     "-pix_fmt", "yuv420p",
-                    "-an",
-                    str(out_path),
                 ]
+                if with_audio:
+                    # Use -frames:v above to bound video; cap audio to same duration
+                    # so the clip ends cleanly when the video does.
+                    clip_duration = num_frames / fps
+                    cmd += [
+                        "-t", f"{clip_duration:.4f}",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                    ]
+                else:
+                    cmd += ["-an"]
+                cmd += [str(out_path)]
 
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode != 0:
@@ -1112,6 +1432,7 @@ class RSLTXVPrepareDataset:
         ollama_model: str = "",
         target_face_b64: str | None = None,
         caption_style: str = "subject",
+        cast_names: list[str] | None = None,
     ):
         """Caption entries in the dataset JSON. Reads existing JSON, skips
         already-captioned entries, saves incrementally after each new caption.
@@ -1145,6 +1466,7 @@ class RSLTXVPrepareDataset:
                     vf, ollama_url, ollama_model, lora_trigger,
                     target_face_b64=target_face_b64,
                     caption_style=caption_style,
+                    cast_names=cast_names,
                 )
 
                 # LLM QC: if it returned MISMATCH, remove this entry and track it
@@ -1200,6 +1522,7 @@ class RSLTXVPrepareDataset:
     def _caption_with_ollama(
         self, clip_path: Path, ollama_url: str, ollama_model: str, lora_trigger: str,
         target_face_b64: str | None = None, caption_style: str = "subject",
+        cast_names: list[str] | None = None,
     ) -> str:
         """Caption a clip frame via Ollama. If target_face_b64 is provided,
         first verifies the person matches (separate call), then captions clean.
@@ -1208,15 +1531,26 @@ class RSLTXVPrepareDataset:
         import urllib.request
         import urllib.error
 
-        # Extract a frame from the clip
-        frame = self._extract_caption_frame(clip_path)
-        if frame is None:
-            logger.warning(f"Could not extract frame from {clip_path.name}, using filename")
-            return clip_path.stem
+        # Extract multiple evenly-spaced frames so the LLM can observe shot
+        # changes and secondary characters that may not be present in any single
+        # frame.  Falls back to the single-frame picker on failure.
+        frames = self._extract_caption_frames(clip_path, num_frames=5)
+        if not frames:
+            single = self._extract_caption_frame(clip_path)
+            if single is None:
+                logger.warning(f"Could not extract frame from {clip_path.name}, using filename")
+                return clip_path.stem
+            frames = [single]
 
-        # Encode frame as base64 PNG
-        _, buf = cv2.imencode(".png", frame)
-        b64_image = base64.b64encode(buf.tobytes()).decode("utf-8")
+        b64_images: list[str] = []
+        for fr in frames:
+            ok, buf = cv2.imencode(".png", fr)
+            if ok:
+                b64_images.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
+        if not b64_images:
+            return clip_path.stem
+        # Single-frame handle for face verification (use the middle-ish frame)
+        b64_image = b64_images[len(b64_images) // 2]
 
         base = ollama_url.rstrip("/")
 
@@ -1226,6 +1560,18 @@ class RSLTXVPrepareDataset:
                 base, ollama_model, target_face_b64, b64_image,
             )
             if verify_result == "MISMATCH":
+                return "MISMATCH"
+
+        # --- Step 1b: Cast QC ---
+        # When a character refs folder was used, ask Gemma (over all extracted
+        # frames) whether any of the known cast members are visible.  Reject
+        # the clip if it says no.  This catches false positives from the
+        # face/clip-vision filter at extraction time.
+        if cast_names:
+            qc_result = self._ollama_verify_cast(
+                base, ollama_model, cast_names, b64_images,
+            )
+            if qc_result == "MISMATCH":
                 return "MISMATCH"
 
         # --- Step 2: Caption (clean, no reference image) ---
@@ -1256,6 +1602,9 @@ class RSLTXVPrepareDataset:
                 "skin tone, eye color, body type) — the trigger word handles identity."
                 " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
                 "depth of field, or visual mood — the LoRA should learn the visual style."
+                " If you recognize any other named characters in the scene besides the main subject, "
+                "refer to them by name (e.g. 'standing next to <name>'). Only name characters you are "
+                "confident about; do not guess."
                 " Be factual and specific. "
                 "Do not use poetic language or speculation. Do not start with 'The image shows' or "
                 "'In this frame'."
@@ -1290,6 +1639,25 @@ class RSLTXVPrepareDataset:
                 "Do not use poetic language or speculation. Do not start with 'The image shows' or "
                 "'In this frame'."
             ),
+            "multi_character": (
+                "You are a video training caption generator for a multi-character scene."
+                " Describe what you see in a single detailed paragraph."
+                " Every named character should be referred to strictly by their given name — "
+                "never by physical description."
+                " Describe: background, environment, camera angle, poses, interactions between "
+                "characters, expressions, actions, and clothing context."
+                " Do NOT describe any character's defining physical features (face shape, hair, "
+                "skin tone, eye color, body type, costume colors) — the character names handle "
+                "identity."
+                " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
+                "depth of field, or visual mood — the LoRA should learn the visual style."
+                " If you recognize additional well-known named characters beyond the ones already "
+                "confirmed, name them too. Only name characters you are confident about; do not "
+                "guess."
+                " Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
         }
 
         system_prompt = _CAPTION_PROMPTS.get(caption_style, _CAPTION_PROMPTS["subject"]) + trigger_instruction
@@ -1300,8 +1668,14 @@ class RSLTXVPrepareDataset:
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": "Describe this frame for video model training.",
-                    "images": [b64_image],
+                    "content": (
+                        "These images are evenly-spaced frames sampled from a single "
+                        "short video clip, shown in chronological order. Write ONE "
+                        "caption that describes the whole clip as a single scene. "
+                        "If the clip cuts between shots or characters, include what "
+                        "appears across the different frames."
+                    ),
+                    "images": b64_images,
                 },
             ],
             "stream": False,
@@ -1330,6 +1704,66 @@ class RSLTXVPrepareDataset:
             logger.error(f"Ollama captioning failed for {clip_path.name}: {e}")
 
         return f"{lora_trigger} {clip_path.stem}" if lora_trigger else clip_path.stem
+
+    def _ollama_verify_cast(
+        self, base_url: str, model: str, cast_names: list[str], image_b64s: list[str],
+    ) -> str:
+        """Ask Gemma whether any character from the given cast list appears in
+        the provided frames.  Returns 'MATCH' or 'MISMATCH'.  On any failure,
+        returns 'MATCH' so we don't accidentally drop good clips."""
+        import urllib.request
+        import urllib.error
+
+        names_csv = ", ".join(cast_names)
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a cast verification system for a TV show dataset. "
+                        "You will receive a list of known character names and several "
+                        "frames sampled from a short video clip. Decide whether ANY "
+                        "of the named characters visibly appears in the clip. "
+                        "Respond with ONLY the word MATCH or MISMATCH. No other text. "
+                        "If you are unsure, say MATCH."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Known characters: {names_csv}.\n\n"
+                        "Does at least one of these characters appear in these frames? "
+                        "Answer MATCH or MISMATCH."
+                    ),
+                    "images": image_b64s,
+                },
+            ],
+            "stream": False,
+            "keep_alive": 0,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{base_url}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                answer = result.get("message", {}).get("content", "").strip().upper()
+                import re
+                answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
+                answer = re.sub(r"<think>.*", "", answer, flags=re.DOTALL)
+                answer = answer.strip().upper()
+                if "MISMATCH" in answer:
+                    return "MISMATCH"
+                return "MATCH"
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            logger.warning(f"Cast verification failed: {e}, assuming match")
+            return "MATCH"
 
     def _ollama_verify_face(
         self, base_url: str, model: str, ref_b64: str, clip_b64: str,
@@ -1411,3 +1845,32 @@ class RSLTXVPrepareDataset:
         ret, frame = cap.read()
         cap.release()
         return frame if ret else None
+
+    def _extract_caption_frames(self, clip_path: Path, num_frames: int = 5) -> list[np.ndarray]:
+        """Extract N evenly-spaced frames from a clip for multi-frame captioning.
+        This lets the LLM see shot changes and secondary characters that may only
+        appear in part of the clip.  Returns an empty list on failure."""
+        cap = cv2.VideoCapture(str(clip_path))
+        if not cap.isOpened():
+            return []
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            return []
+
+        num_frames = max(1, num_frames)
+        if total <= num_frames:
+            indices = list(range(total))
+        else:
+            # Evenly spaced across the clip, inclusive of ends trimmed slightly
+            step = total / (num_frames + 1)
+            indices = [int(step * (i + 1)) for i in range(num_frames)]
+
+        frames: list[np.ndarray] = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frames.append(frame)
+        cap.release()
+        return frames
