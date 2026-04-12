@@ -1937,7 +1937,9 @@ class RSLTXVPrepareDataset:
             "Frame 1 is the opening shot and the last frame is the end. "
             "Write ONE caption that describes the whole clip as a single "
             "scene. If the clip cuts between shots or characters, include "
-            "what appears across the different frames."
+            "what appears across the different frames. "
+            "Do NOT mention frame numbers in the caption — the labels are "
+            "only for your reference to understand temporal order."
         )
         # Image payload order: reference images (if any), then clip frames.
         images_payload: list[str] = list(b64_images)
