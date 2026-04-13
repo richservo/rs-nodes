@@ -314,6 +314,7 @@ class RSLTXVPrepareDataset:
                 "caption_style": (["subject", "subject + style", "style", "motion", "general", "multi_character"], {"default": "subject", "tooltip": "Captioning focus: subject=person identity, subject+style=person+cinematography, style=visual aesthetics only, motion=movement/action, general=balanced, multi_character=name every recognized character equally (pairs with character_refs_folder)"}),
                 "ollama_url": ("STRING", {"default": "http://localhost:11434", "tooltip": "Ollama server URL (only used when caption_mode=ollama)"}),
                 "ollama_model": ("STRING", {"default": "gemma4:26b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
+                "skip_id_pass": ("BOOLEAN", {"default": False, "tooltip": "Skip cast/location ID passes — send ALL reference images directly to the captioner and let it identify characters and locations itself in one shot."}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
                 "crop_mode": (["face_crop", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=crop around detected face, full_frame=scale entire frame to target resolution (aspect-preserving, letterboxed). Both modes use face detection for clip selection when enabled."}),
@@ -354,6 +355,7 @@ class RSLTXVPrepareDataset:
         caption_style: str = "subject",
         ollama_url: str = "http://localhost:11434",
         ollama_model: str = "gemma4:26b",
+        skip_id_pass: bool = False,
         with_audio: bool = False,
         load_text_encoder_in_8bit: bool = True,
         crop_mode: str = "face_crop",
@@ -658,6 +660,7 @@ class RSLTXVPrepareDataset:
             target_face_b64=target_face_b64, caption_style=caption_style,
             cast_names=cast_names, cast_refs=cast_refs,
             location_refs=location_refs_list,
+            skip_id_pass=skip_id_pass,
         )
 
         # --- PHASE 3: Encode conditions and latents ---
@@ -1549,6 +1552,7 @@ class RSLTXVPrepareDataset:
         cast_names: list[str] | None = None,
         cast_refs: list[tuple[str, str]] | None = None,
         location_refs: list[tuple[str, str]] | None = None,
+        skip_id_pass: bool = False,
     ):
         """Caption entries in the dataset JSON. Reads existing JSON, skips
         already-captioned entries, saves incrementally after each new caption.
@@ -1597,6 +1601,7 @@ class RSLTXVPrepareDataset:
                     cast_names=cast_names,
                     cast_refs=cast_refs,
                     location_refs=location_refs,
+                    skip_id_pass=skip_id_pass,
                 )
 
                 if prep is None:
@@ -1875,10 +1880,13 @@ class RSLTXVPrepareDataset:
         cast_names: list[str] | None = None,
         cast_refs: list[tuple[str, str]] | None = None,
         location_refs: list[tuple[str, str]] | None = None,
+        skip_id_pass: bool = False,
     ) -> dict | None:
         """Prepare a clip for captioning: extract frames, run cast ID and
         location ID.  Returns a dict with all info needed for the caption
-        call, or None if the clip should be rejected (MISMATCH)."""
+        call, or None if the clip should be rejected (MISMATCH).
+        If skip_id_pass=True, skips cast/location ID and sends ALL refs
+        directly to the captioner."""
         import base64
 
         frames = self._extract_caption_frames(clip_path, num_frames=5)
@@ -1907,126 +1915,210 @@ class RSLTXVPrepareDataset:
         b64_image = b64_images[len(b64_images) // 2]
         base = ollama_url.rstrip("/")
 
-        # --- Face verification ---
-        if target_face_b64:
-            if self._ollama_verify_face(base, ollama_model, target_face_b64, b64_image) == "MISMATCH":
-                return None
+        if skip_id_pass:
+            # --- Skip ID: send ALL refs + frames, let captioner do everything ---
+            trigger_instruction = ""
+            if lora_trigger:
+                trigger_instruction = (
+                    f" Always refer to the main subject as '{lora_trigger}'."
+                    f" Start the caption with '{lora_trigger}'."
+                )
 
-        # --- Cast identification ---
-        confirmed_cast: list[str] | None = None
-        if cast_names and cast_refs:
-            confirmed_cast = self._ollama_identify_cast(base, ollama_model, cast_refs, b64_images)
-            if not confirmed_cast:
-                confirmed_cast = None
+            system_prompt = self._CAPTION_PROMPTS["multi_character"] + trigger_instruction
 
-        # --- Location identification ---
-        identified_location: str | None = None
-        if location_refs:
-            import time as _t
-            _loc_t0 = _t.time()
-            logger.info(f"  Identifying location...")
-            identified_location = self._ollama_identify_location(base, ollama_model, location_refs, b64_images)
-            logger.info(f"  Location: {identified_location or 'NONE'} ({_t.time() - _loc_t0:.1f}s)")
+            # Label and collect all cast refs
+            all_cast_refs = []
+            if cast_refs:
+                all_cast_refs = [
+                    (name, self._label_ref_image(b64, name))
+                    for name, b64 in cast_refs
+                ]
+            # Label and collect all location refs
+            all_loc_refs = []
+            if location_refs:
+                all_loc_refs = [
+                    (name, self._label_ref_image(b64, name))
+                    for name, b64 in location_refs
+                ]
 
-        # --- Build user message + images for caption ---
-        trigger_instruction = ""
-        if lora_trigger:
-            trigger_instruction = (
-                f" Always refer to the main subject as '{lora_trigger}'."
-                f" Start the caption with '{lora_trigger}'."
-            )
-
-        effective_style = "multi_character" if confirmed_cast else caption_style
-        system_prompt = self._CAPTION_PROMPTS.get(effective_style, self._CAPTION_PROMPTS["subject"]) + trigger_instruction
-
-        num_clip_frames = len(b64_images)
-        frame_listing = ", ".join(f"Frame {i + 1}" for i in range(num_clip_frames))
-        user_content = (
-            f"You will see {num_clip_frames} frames sampled from a single "
-            f"short video clip, in chronological order: {frame_listing}. "
-            "Frame 1 is the opening shot and the last frame is the end. "
-            "Write ONE caption that describes the whole clip as a single "
-            "scene. If the clip cuts between shots or characters, include "
-            "what appears across the different frames. "
-            "Do NOT mention frame numbers in the caption — the labels are "
-            "only for your reference to understand temporal order."
-        )
-        images_payload: list[str] = list(b64_images)
-
-        if confirmed_cast:
-            ref_by_name = {n.lower(): b for n, b in (cast_refs or [])}
-            confirmed_refs: list[tuple[str, str]] = []
-            for name in confirmed_cast:
-                img = ref_by_name.get(name.lower())
-                if img is not None:
-                    confirmed_refs.append((name, img))
-
-            names_csv = ", ".join(confirmed_cast)
-            confirmed_refs = [
-                (name, self._label_ref_image(b64, name))
-                for name, b64 in confirmed_refs
-            ]
-            ref_intro_lines = []
-            for i, (name, _) in enumerate(confirmed_refs, start=1):
-                ref_intro_lines.append(f"Reference image {i}: this is {name}.")
-            ref_block = "\n".join(ref_intro_lines)
-            num_refs = len(confirmed_refs)
+            num_cast = len(all_cast_refs)
+            num_loc = len(all_loc_refs)
             num_frames = len(b64_images)
 
-            user_content = (
-                f"Confirmed characters visible in this clip: {names_csv}.\n\n"
-                + (
-                    (
-                        f"You will first see {num_refs} labeled reference "
-                        f"images, one per confirmed character:\n\n"
-                        f"{ref_block}\n\n"
-                        f"After the reference images, you will see "
-                        f"{num_frames} frames from the clip in chronological "
-                        f"order (Frame 1 through Frame {num_frames}). "
-                        f"Frame 1 is the opening shot.\n\n"
-                        f"IMPORTANT: Only the numbered frames (Frame 1 "
-                        f"through Frame {num_frames}) are the actual clip "
-                        f"to caption. The reference images are ONLY for "
-                        f"identifying who is who — do NOT describe or "
-                        f"include the reference images in your caption.\n\n"
-                    ) if confirmed_refs else ""
-                )
-                + user_content
-                + "\n\nNAMING RULES — READ CAREFULLY:\n"
-                "0. BEFORE writing your caption, double-check the confirmed "
-                "character list against what you actually see in the clip "
-                "frames. Compare each confirmed name's reference image to "
-                "the figures in the clip. If a confirmed name does NOT "
-                "actually match any living, active character in the clip "
-                "(e.g. it was matched to a statue, toy, decoration, or "
-                "the wrong person), DROP that name and describe the figure "
-                "generically instead. The confirmed list is a suggestion, "
-                "not an obligation — accuracy matters more.\n"
-                "1. For characters you have verified are truly present, "
-                "refer to them by their given names without quotes — never 'the subject', "
-                "'the man', 'the person', or any physical description. "
-                "Use the labeled reference images to correctly match each "
-                "name to its character.\n"
-                "2. Any OTHER character visible in the clip frames is NOT "
-                "on the confirmed list and MUST be described generically "
-                "(e.g. 'a child', 'a musician', 'a group of kids', 'a "
-                "person in a costume', 'a woman at the door'). NEVER "
-                "invent or guess a name for anyone not in the confirmed "
-                "list.\n"
-                "3. Do NOT add names from memory, context, or guessing. "
-                "Only the confirmed names are allowed as proper nouns.\n"
-                "4. Wrong names are worse than no names. When in doubt, "
-                "describe without naming."
-            )
-            images_payload = [b for _, b in confirmed_refs] + list(b64_images)
+            # Build ref intro
+            ref_lines = []
+            img_idx = 1
+            for name, _ in all_cast_refs:
+                ref_lines.append(f"Reference image {img_idx}: character '{name}'.")
+                img_idx += 1
+            for name, _ in all_loc_refs:
+                ref_lines.append(f"Reference image {img_idx}: location '{name}'.")
+                img_idx += 1
+            ref_block = "\n".join(ref_lines)
+            total_refs = num_cast + num_loc
 
-        if identified_location:
+            frame_listing = ", ".join(f"Frame {i + 1}" for i in range(num_frames))
             user_content = (
-                f"The setting of this clip has been identified as "
-                f"'{identified_location}'. When describing the environment "
-                f"or location, refer to it by that exact name.\n\n"
-                + user_content
+                f"You will first see {total_refs} labeled reference images "
+                f"for character and location identification:\n\n"
+                f"{ref_block}\n\n"
+                f"After the references, you will see {num_frames} frames "
+                f"from a video clip in chronological order: {frame_listing}. "
+                f"Frame 1 is the opening shot and the last frame is the end.\n\n"
+                f"YOUR TASK:\n"
+                f"1. Identify which characters from the reference images "
+                f"actually appear in the clip frames. Only name characters "
+                f"you can confidently match — if a reference doesn't match "
+                f"anyone in the clip, ignore it completely.\n"
+                f"2. Identify which location from the reference images best "
+                f"matches the clip's setting. If none match, describe the "
+                f"location generically.\n"
+                f"3. Write ONE detailed caption paragraph describing the clip.\n\n"
+                f"IMPORTANT: The reference images are ONLY for identification. "
+                f"NEVER describe anything from a reference image. Only describe "
+                f"what you see in the numbered clip frames.\n\n"
+                f"Write ONE caption that describes the whole clip as a single "
+                f"scene. If the clip cuts between shots or characters, include "
+                f"what appears across the different frames. "
+                f"Do NOT mention frame numbers in the caption.\n\n"
+                "NAMING RULES:\n"
+                "- Name only characters you have confidently matched to a "
+                "reference image. Use their given name without quotes.\n"
+                "- Describe any unmatched characters generically "
+                "(e.g. 'a child', 'a woman in a dress').\n"
+                "- Wrong names are worse than no names. When in doubt, "
+                "describe without naming.\n"
+                "- Character reference names may include descriptive hints "
+                "after the name; use ONLY the name portion in captions."
             )
+
+            images_payload = (
+                [b for _, b in all_cast_refs]
+                + [b for _, b in all_loc_refs]
+                + list(b64_images)
+            )
+        else:
+            # --- Standard path: separate ID passes then caption ---
+
+            # --- Face verification ---
+            if target_face_b64:
+                if self._ollama_verify_face(base, ollama_model, target_face_b64, b64_image) == "MISMATCH":
+                    return None
+
+            # --- Cast identification ---
+            confirmed_cast: list[str] | None = None
+            if cast_names and cast_refs:
+                confirmed_cast = self._ollama_identify_cast(base, ollama_model, cast_refs, b64_images)
+                if not confirmed_cast:
+                    confirmed_cast = None
+
+            # --- Location identification ---
+            identified_location: str | None = None
+            if location_refs:
+                _loc_t0 = _t.time()
+                logger.info(f"  Identifying location...")
+                identified_location = self._ollama_identify_location(base, ollama_model, location_refs, b64_images)
+                logger.info(f"  Location: {identified_location or 'NONE'} ({_t.time() - _loc_t0:.1f}s)")
+
+            # --- Build user message + images for caption ---
+            trigger_instruction = ""
+            if lora_trigger:
+                trigger_instruction = (
+                    f" Always refer to the main subject as '{lora_trigger}'."
+                    f" Start the caption with '{lora_trigger}'."
+                )
+
+            effective_style = "multi_character" if confirmed_cast else caption_style
+            system_prompt = self._CAPTION_PROMPTS.get(effective_style, self._CAPTION_PROMPTS["subject"]) + trigger_instruction
+
+            num_clip_frames = len(b64_images)
+            frame_listing = ", ".join(f"Frame {i + 1}" for i in range(num_clip_frames))
+            user_content = (
+                f"You will see {num_clip_frames} frames sampled from a single "
+                f"short video clip, in chronological order: {frame_listing}. "
+                "Frame 1 is the opening shot and the last frame is the end. "
+                "Write ONE caption that describes the whole clip as a single "
+                "scene. If the clip cuts between shots or characters, include "
+                "what appears across the different frames. "
+                "Do NOT mention frame numbers in the caption — the labels are "
+                "only for your reference to understand temporal order."
+            )
+            images_payload: list[str] = list(b64_images)
+
+            if confirmed_cast:
+                ref_by_name = {n.lower(): b for n, b in (cast_refs or [])}
+                confirmed_refs: list[tuple[str, str]] = []
+                for name in confirmed_cast:
+                    img = ref_by_name.get(name.lower())
+                    if img is not None:
+                        confirmed_refs.append((name, img))
+
+                names_csv = ", ".join(confirmed_cast)
+                confirmed_refs = [
+                    (name, self._label_ref_image(b64, name))
+                    for name, b64 in confirmed_refs
+                ]
+                ref_intro_lines = []
+                for i, (name, _) in enumerate(confirmed_refs, start=1):
+                    ref_intro_lines.append(f"Reference image {i}: this is {name}.")
+                ref_block = "\n".join(ref_intro_lines)
+                num_refs = len(confirmed_refs)
+                num_frames = len(b64_images)
+
+                user_content = (
+                    f"Confirmed characters visible in this clip: {names_csv}.\n\n"
+                    + (
+                        (
+                            f"You will first see {num_refs} labeled reference "
+                            f"images, one per confirmed character:\n\n"
+                            f"{ref_block}\n\n"
+                            f"After the reference images, you will see "
+                            f"{num_frames} frames from the clip in chronological "
+                            f"order (Frame 1 through Frame {num_frames}). "
+                            f"Frame 1 is the opening shot.\n\n"
+                            f"IMPORTANT: Only the numbered frames (Frame 1 "
+                            f"through Frame {num_frames}) are the actual clip "
+                            f"to caption. The reference images are ONLY for "
+                            f"identifying who is who — do NOT describe or "
+                            f"include the reference images in your caption.\n\n"
+                        ) if confirmed_refs else ""
+                    )
+                    + user_content
+                    + "\n\nNAMING RULES — READ CAREFULLY:\n"
+                    "0. BEFORE writing your caption, double-check the confirmed "
+                    "character list against what you actually see in the clip "
+                    "frames. Compare each confirmed name's reference image to "
+                    "the figures in the clip. If a confirmed name does NOT "
+                    "actually match any living, active character in the clip "
+                    "(e.g. it was matched to a statue, toy, decoration, or "
+                    "the wrong person), DROP that name and describe the figure "
+                    "generically instead. The confirmed list is a suggestion, "
+                    "not an obligation — accuracy matters more.\n"
+                    "1. For characters you have verified are truly present, "
+                    "refer to them by their given names without quotes — never 'the subject', "
+                    "'the man', 'the person', or any physical description. "
+                    "Use the labeled reference images to correctly match each "
+                    "name to its character.\n"
+                    "2. Any OTHER character visible in the clip frames is NOT "
+                    "on the confirmed list and MUST be described generically "
+                    "(e.g. 'a child', 'a musician', 'a group of kids', 'a "
+                    "person in a costume', 'a woman at the door'). NEVER "
+                    "invent or guess a name for anyone not in the confirmed "
+                    "list.\n"
+                    "3. Do NOT add names from memory, context, or guessing. "
+                    "Only the confirmed names are allowed as proper nouns.\n"
+                    "4. Wrong names are worse than no names. When in doubt, "
+                    "describe without naming."
+                )
+                images_payload = [b for _, b in confirmed_refs] + list(b64_images)
+
+            if identified_location:
+                user_content = (
+                    f"The setting of this clip has been identified as "
+                    f"'{identified_location}'. When describing the environment "
+                    f"or location, refer to it by that exact name.\n\n"
+                    + user_content
+                )
 
         return {
             "system_prompt": system_prompt,
