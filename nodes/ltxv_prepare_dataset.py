@@ -1651,7 +1651,7 @@ class RSLTXVPrepareDataset:
 
                 if len(caption_gen_times) >= 2 and caption_first_time > 0:
                     avg_gen = sum(caption_gen_times) / len(caption_gen_times)
-                    if avg_gen > caption_first_time * 1.4:
+                    if avg_gen > caption_first_time * 1.25:
                         reset_reason = f"slowdown: avg {avg_gen:.1f}s gen vs first {caption_first_time:.1f}s"
 
                 if token_count > CTX_THRESHOLD:
@@ -1838,15 +1838,23 @@ class RSLTXVPrepareDataset:
             "they actually appear in the numbered clip frames. If a REF "
             "character is not visible in the clip frames, ignore them "
             "completely.\n\n"
+            "The same applies to locations: the identified location is a "
+            "suggestion based on reference matching, not a guarantee. If "
+            "the clip frames clearly show a different environment than the "
+            "suggested location, describe what you actually see instead of "
+            "forcing the suggested location name. If the clip contains "
+            "cuts between a known location and an unknown one, use the "
+            "known location name where it applies and describe the unknown "
+            "location generically.\n\n"
             "Therefore:\n"
             "- ONLY describe what you see in the numbered clip frames.\n"
             "- DO describe: background, environment, camera angle, poses, "
             "interactions between characters, expressions, actions, "
             "clothing (the model knows these concepts).\n"
             "- DO refer to named characters strictly by their given name "
-            "— never by physical description. Character reference names may "
-            "include descriptive hints after the name; use ONLY the name "
-            "portion when writing captions.\n"
+            "— never by physical description. Never put character names in "
+            "quotes. Character reference names may include descriptive hints "
+            "after the name; use ONLY the name portion when writing captions.\n"
             "- Do NOT describe any character's defining physical features "
             "(face shape, hair, skin tone, eye color, body type) — the "
             "character names handle identity and the LoRA learns appearance.\n"
@@ -1995,7 +2003,7 @@ class RSLTXVPrepareDataset:
                 "generically instead. The confirmed list is a suggestion, "
                 "not an obligation — accuracy matters more.\n"
                 "1. For characters you have verified are truly present, "
-                "refer to them by their given names — never 'the subject', "
+                "refer to them by their given names without quotes — never 'the subject', "
                 "'the man', 'the person', or any physical description. "
                 "Use the labeled reference images to correctly match each "
                 "name to its character.\n"
@@ -2102,8 +2110,9 @@ class RSLTXVPrepareDataset:
             thinking_started = False
             content_started = False
             caption_parts: list[str] = []
-            _caption_gen_t0 = 0.0  # set when first content chunk arrives
             token_count = 0
+            _think_t0 = 0.0  # track thinking duration to subtract
+            _think_total = 0.0
             with urllib.request.urlopen(req, timeout=1800) as resp:
                 for raw_line in resp:
                     line = raw_line.decode("utf-8").strip()
@@ -2120,15 +2129,16 @@ class RSLTXVPrepareDataset:
                         if not thinking_started:
                             _sys.stderr.write("  [thinking] ")
                             thinking_started = True
+                            _think_t0 = _t.time()
                         _sys.stderr.write(think_chunk)
                         _sys.stderr.flush()
                     if content_chunk:
                         if thinking_started and not content_started:
+                            # Thinking just ended — record duration
+                            _think_total = _t.time() - _think_t0
                             _sys.stderr.write("\n  [caption] ")
                         elif not content_started:
                             _sys.stderr.write("  [caption] ")
-                        if not content_started:
-                            _caption_gen_t0 = _t.time()
                         content_started = True
                         _sys.stderr.write(content_chunk)
                         _sys.stderr.flush()
@@ -2137,6 +2147,9 @@ class RSLTXVPrepareDataset:
                         _sys.stderr.write("\n")
                         _sys.stderr.flush()
                         token_count = evt.get("prompt_eval_count", 0) + evt.get("eval_count", 0)
+                        # If it was still thinking when done fired
+                        if thinking_started and not content_started:
+                            _think_total = _t.time() - _think_t0
                         break
 
             caption = "".join(caption_parts).strip()
@@ -2147,10 +2160,11 @@ class RSLTXVPrepareDataset:
             if not caption:
                 caption = f"{prep.get('lora_trigger', '')} {prep['clip_name']}".strip()
 
-            caption_only_time = _t.time() - _caption_gen_t0 if _caption_gen_t0 else 0.0
-            logger.info(f"  Caption done ({_t.time() - _cap_t0:.1f}s total, {caption_only_time:.1f}s gen, {token_count} tokens)")
+            total_time = _t.time() - _cap_t0
+            work_time = total_time - _think_total  # total minus thinking
+            logger.info(f"  Caption done ({total_time:.1f}s total, {_think_total:.1f}s think, {work_time:.1f}s work, {token_count} tokens)")
             messages.append({"role": "assistant", "content": caption})
-            return caption, messages, caption_only_time, token_count
+            return caption, messages, work_time, token_count
 
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             logger.error(f"Ollama captioning failed for {prep['clip_name']}: {e}")
