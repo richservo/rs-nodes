@@ -431,16 +431,23 @@ app.registerExtension({
                 ));
             }
 
-            // On resize, set the canvas height to cover the spacer region
+            // On resize, set the canvas height using the node's actual size
             function updateChartSize() {
-                if (!spacers.length) return;
-                // The chart container and spacers are stacked — measure from
-                // the chart container top to the last spacer bottom
                 const chartRect = container.getBoundingClientRect();
-                const lastRect = spacers[spacers.length - 1].element?.getBoundingClientRect();
-                if (!chartRect || !lastRect || chartRect.height < 1) return;
-                const totalH = lastRect.bottom - chartRect.top - 20;
-                const h = Math.max(180, totalH);
+                if (!chartRect || chartRect.height < 1) return;
+                // Use node's rendered bottom edge minus chart top
+                const nodeEl = node.domElement || container.closest(".comfyui-node") || container.closest(".graphnode");
+                let h = 180;
+                if (nodeEl) {
+                    const nodeRect = nodeEl.getBoundingClientRect();
+                    h = Math.max(180, nodeRect.bottom - chartRect.top - 20);
+                } else {
+                    // Fallback: use spacer positions
+                    const lastRect = spacers.length && spacers[spacers.length - 1].element?.getBoundingClientRect();
+                    if (lastRect) {
+                        h = Math.max(180, lastRect.bottom - chartRect.top - 20);
+                    }
+                }
                 canvas.style.height = h + "px";
                 drawLossChart(canvas, lossData[node.id]);
             }

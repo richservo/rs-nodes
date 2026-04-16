@@ -19,6 +19,7 @@ from .nodes.frame_splitter import RSFrameSplitter
 from .nodes.frame_collector import RSFrameCollector
 from .nodes.ltxv_prepare_dataset import RSLTXVPrepareDataset
 from .nodes.ltxv_train_lora import RSLTXVTrainLoRA
+from .nodes.sigma_scheduler import RSSigmaScheduler
 
 WEB_DIRECTORY = "./web"
 
@@ -44,6 +45,7 @@ NODE_CLASS_MAPPINGS = {
     "RSFrameCollector": RSFrameCollector,
     "RSLTXVPrepareDataset": RSLTXVPrepareDataset,
     "RSLTXVTrainLoRA": RSLTXVTrainLoRA,
+    "RSSigmaScheduler": RSSigmaScheduler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -68,6 +70,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSFrameCollector": "RS Frame Collector",
     "RSLTXVPrepareDataset": "RS LTXV Prepare Dataset",
     "RSLTXVTrainLoRA": "RS LTXV Train LoRA",
+    "RSSigmaScheduler": "RS Sigma Scheduler",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed

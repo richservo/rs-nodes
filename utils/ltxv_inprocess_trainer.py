@@ -115,6 +115,7 @@ class InProcessTrainer:
         total_steps: int = 2000,
         optimizer_type: str = "adamw8bit",
         scheduler_type: str = "linear",
+        lr_cycle_steps: int = 0,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
         quantization: str | None = "fp8-quanto",
@@ -183,9 +184,10 @@ class InProcessTrainer:
         self._diverge_stop_steps = diverge_stop_steps
         self._ffn_chunks = ffn_chunks
         self._auto_stop = auto_stop
-        # LR schedule epoch length: always one full pass through the dataset.
-        # The schedule resets each epoch for proper per-epoch decay curves.
+        # Epoch = one full pass through the dataset (for logging, auto_stop, etc.)
         self._step_epoch = len(dataset)
+        # LR cycle length (independent of epoch). 0 = match epoch length.
+        self._lr_cycle = lr_cycle_steps if lr_cycle_steps > 0 else len(dataset)
         self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
         self._diverge_threshold = diverge_threshold  # Minimum slope to trigger detection
         self._ema_history: list[tuple[int, float]] = []  # (step, ema_loss) for slope computation
@@ -193,6 +195,7 @@ class InProcessTrainer:
         self._diverge_monitoring = False # Currently in monitoring mode
         self._pre_diverge_ckpt = None   # Path to checkpoint saved at detection
         self._diverge_final_ckpt = None # Set when divergence stops training — used by _save_final_lora
+        self._diverge_lr_boosted = False # Whether LR boost was already attempted during divergence
 
     # ------------------------------------------------------------------
     # Public API
@@ -347,24 +350,23 @@ class InProcessTrainer:
             epochs_done = self._global_step // self._step_epoch
             self._total_steps = (epochs_done + 1) * self._step_epoch
 
-        # On resume: reset base LR and rebuild scheduler for the CURRENT epoch,
-        # then fast-forward to position within epoch. Each epoch has its own
-        # decay curve, so we only FF by the offset within the current epoch.
+        # On resume: reset base LR and rebuild scheduler for the CURRENT LR cycle,
+        # then fast-forward to position within the cycle.
         if self._global_step > 0:
             for pg in self._optimizer.param_groups:
                 pg["lr"] = self._learning_rate
                 pg["initial_lr"] = self._learning_rate
             self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
-            # Fast-forward within current epoch only
-            steps_into_epoch = self._global_step % self._step_epoch
+            # Fast-forward within current LR cycle only
+            steps_into_cycle = self._global_step % self._lr_cycle
             if self._lr_scheduler is not None:
-                for _ in range(steps_into_epoch):
+                for _ in range(steps_into_cycle):
                     self._lr_scheduler.step()
             resumed_lr = self._optimizer.param_groups[0]["lr"]
             epoch_num = self._global_step // self._step_epoch + 1
             logger.info(
-                f"LR schedule reset for epoch {epoch_num} ({self._step_epoch} steps/epoch), "
-                f"fast-forwarded {steps_into_epoch} steps into epoch "
+                f"Resumed at epoch {epoch_num} ({self._step_epoch} steps/epoch), "
+                f"LR cycle={self._lr_cycle}, fast-forwarded {steps_into_cycle} steps "
                 f"(resumed LR = {resumed_lr:.2e})"
             )
 
@@ -579,6 +581,7 @@ class InProcessTrainer:
                             self._diverge_monitoring = False
                             self._diverge_detect_step = 0
                             self._pre_diverge_ckpt = None
+                            self._diverge_lr_boosted = False
                             self._cleanup_old_checkpoints()
                         else:
                             steps_in_monitoring = step - self._diverge_detect_step
@@ -586,13 +589,28 @@ class InProcessTrainer:
                                 self._save_checkpoint(step)
 
                             if steps_in_monitoring >= self._diverge_stop_steps:
-                                print(
-                                    f"[divergence] No recovery after {self._diverge_stop_steps} steps — stopping training. "
-                                    f"Slope still positive ({slope:.6f}). "
-                                    f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
-                                )
-                                self._diverge_final_ckpt = self._pre_diverge_ckpt
-                                break
+                                if not self._diverge_lr_boosted:
+                                    # First attempt: full LR reset to break out of plateau
+                                    for pg in self._optimizer.param_groups:
+                                        pg["lr"] = self._learning_rate
+                                        pg["initial_lr"] = self._learning_rate
+                                    self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+                                    self._diverge_lr_boosted = True
+                                    self._diverge_detect_step = step  # reset monitoring window
+                                    print(
+                                        f"[divergence] LR reset at step {step} — "
+                                        f"boosting to {self._learning_rate:.2e} to attempt recovery. "
+                                        f"Monitoring for another {self._diverge_stop_steps} steps."
+                                    )
+                                else:
+                                    # Already tried LR boost — give up
+                                    print(
+                                        f"[divergence] No recovery after LR boost + {self._diverge_stop_steps} steps — stopping training. "
+                                        f"Slope still positive ({slope:.6f}). "
+                                        f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
+                                    )
+                                    self._diverge_final_ckpt = self._pre_diverge_ckpt
+                                    break
 
             # Validation (save checkpoint first so progress is safe)
             if (
@@ -608,22 +626,24 @@ class InProcessTrainer:
             if self._checkpoint_interval > 0 and step % self._checkpoint_interval == 0:
                 self._save_checkpoint(step)
 
-            # Epoch boundary: rebuild LR scheduler for per-epoch decay.
-            # For auto_stop, also extend total_steps by one more epoch.
+            # Epoch boundary: log epoch completion, extend for auto_stop.
             if step > 0 and step % self._step_epoch == 0:
                 epoch_num = step // self._step_epoch
                 if self._auto_stop:
                     self._total_steps = step + self._step_epoch
-                # Reset base LR and rebuild scheduler for next epoch
+                print(
+                    f"[epoch {epoch_num} complete]"
+                    f"{f' extending to step {self._total_steps}' if self._auto_stop else ''}"
+                )
+
+            # LR cycle boundary: reset learning rate and rebuild scheduler.
+            if step > 0 and step % self._lr_cycle == 0:
                 for pg in self._optimizer.param_groups:
                     pg["lr"] = self._learning_rate
                     pg["initial_lr"] = self._learning_rate
                 self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
                 new_lr = self._optimizer.param_groups[0]["lr"]
-                print(
-                    f"[epoch {epoch_num} complete] LR schedule reset (lr={new_lr:.2e})"
-                    f"{f', extending to step {self._total_steps}' if self._auto_stop else ''}"
-                )
+                print(f"LR schedule reset (lr={new_lr:.2e}, cycle={self._lr_cycle})")
 
         # Restore sage attention logging
         _root_logger.removeFilter(_sage_filter)
@@ -1201,7 +1221,7 @@ class InProcessTrainer:
         )
 
         t = self._scheduler_type
-        steps = self._step_epoch  # schedule per epoch, not total training
+        steps = self._lr_cycle  # schedule per LR cycle, not total training
 
         if t is None or t == "constant":
             return None
