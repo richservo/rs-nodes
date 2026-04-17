@@ -66,14 +66,27 @@ class RSVideoSave:
             base = os.path.join(base, output_dir.strip())
         os.makedirs(base, exist_ok=True)
 
-        # Build filename
-        if index > 0:
-            filename = f"{filename_prefix}_{index:05d}.mov"
+        # Build filename — split prefix into subdirectory + basename
+        if os.sep in filename_prefix or "/" in filename_prefix:
+            sub_dir, name_base = os.path.split(filename_prefix)
+            base = os.path.join(base, sub_dir)
+            os.makedirs(base, exist_ok=True)
         else:
-            # Auto-increment: find next available
-            existing = [f for f in os.listdir(base) if f.startswith(filename_prefix) and f.endswith(".mov")]
-            counter = len(existing) + 1
-            filename = f"{filename_prefix}_{counter:05d}.mov"
+            name_base = filename_prefix
+
+        if index > 0:
+            filename = f"{name_base}_{index:05d}.mov"
+        else:
+            # Auto-increment: find highest existing counter
+            counter = 0
+            for f in os.listdir(base):
+                if f.startswith(name_base) and f.endswith(".mov"):
+                    try:
+                        num = int(f[len(name_base)+1:-4])
+                        counter = max(counter, num)
+                    except ValueError:
+                        pass
+            filename = f"{name_base}_{counter + 1:05d}.mov"
 
         out_path = os.path.join(base, filename)
 

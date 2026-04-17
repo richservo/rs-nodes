@@ -48,7 +48,8 @@ class RSLTXVGenerate:
                 "first_image":       ("IMAGE",),
                 "middle_image":      ("IMAGE",),
                 "last_image":        ("IMAGE",),
-                "guide_video":       ("IMAGE", {"tooltip": "Video-to-video: inject every 8th frame as a guide. Overrides first/middle/last when connected."}),
+                "guide_video":       ("IMAGE", {"tooltip": "Video-to-video: inject every 8th frame as a guide. When guide_mask is also connected, acts as init latent for inpainting instead."}),
+                "guide_mask":        ("IMAGE", {"tooltip": "Inpaint mask video (white=regenerate, black=preserve). Requires guide_video. Changes guide_video from frame injection to inpaint mode."}),
                 "first_strength":    ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
                 "middle_strength":   ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
                 "last_strength":     ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -142,6 +143,7 @@ class RSLTXVGenerate:
         middle_image=None,
         last_image=None,
         guide_video=None,
+        guide_mask=None,
         first_strength=1.0,
         middle_strength=1.0,
         last_strength=1.0,
@@ -211,7 +213,7 @@ class RSLTXVGenerate:
                 width=width, height=height, num_frames=num_frames,
                 steps=steps, cfg=cfg, seed=seed, frame_rate=frame_rate,
                 first_image=first_image, middle_image=middle_image, last_image=last_image,
-                guide_video=guide_video,
+                guide_video=guide_video, guide_mask=guide_mask,
                 first_strength=first_strength, middle_strength=middle_strength,
                 last_strength=last_strength, guide_strength=guide_strength,
                 guide_every_nth=guide_every_nth, guide_index_list=guide_index_list, crf=crf,
@@ -253,7 +255,7 @@ class RSLTXVGenerate:
         self,
         model, positive, negative, vae,
         width, height, num_frames, steps, cfg, seed, frame_rate,
-        first_image, middle_image, last_image, guide_video,
+        first_image, middle_image, last_image, guide_video, guide_mask,
         first_strength, middle_strength, last_strength, guide_strength, guide_every_nth, guide_index_list, crf,
         audio, audio_vae,
         audio_cfg, stg_scale, stg_perturbation, audio_stg_scale, cfg_end, stg_end,
@@ -306,8 +308,11 @@ class RSLTXVGenerate:
 
         # When upscaling, generate at half resolution — the 2x latent upscaler
         # brings it to the target width x height afterwards.
-        gen_width = width
-        gen_height = height
+        # Round to 64-align so latent dims are even (required for IC-LoRA dsf=2)
+        gen_width = (width + 63) // 64 * 64
+        gen_height = (height + 63) // 64 * 64
+        if gen_width != width or gen_height != height:
+            logger.info(f"Resolution 64-aligned: {width}x{height} → {gen_width}x{gen_height}")
         do_upscale = upscale and upscale_model is not None
         if upscale and upscale_model is None:
             logger.info("WARNING: upscale=True but no upscale_model connected — generating at full resolution")
@@ -438,7 +443,63 @@ class RSLTXVGenerate:
 
         guides = []
         guide_video_latent = None  # Single VAE encode for entire guide video
-        if guide_video is not None:
+        inpaint_mode = guide_video is not None and guide_mask is not None
+        if inpaint_mode:
+            # INPAINT MODE: guide_video becomes the init latent, guide_mask controls
+            # which regions get denoised (white=1=regenerate, black=0=preserve)
+            import torch.nn.functional as F
+
+            num_video_frames = guide_video.shape[0]
+            scale_factors = vae.downscale_index_formula
+            _, _, _, latent_height, latent_width = latent_dict["samples"].shape
+
+            # Encode guide video → use as starting latent
+            _, guide_video_latent = LTXVAddGuide.encode(
+                vae, latent_width, latent_height, guide_video, scale_factors
+            )
+            logger.info(f"Inpaint mode: encoded {num_video_frames} guide frames → latent {list(guide_video_latent.shape)}")
+
+            # Replace the empty latent with the encoded guide video
+            latent = guide_video_latent
+            latent_dict = {"samples": latent}
+
+            # Build noise_mask from guide_mask video
+            # guide_mask is [F, H, W, C] IMAGE — extract luminance → [F, H, W]
+            mask_frames = guide_mask[..., 0]  # [F, H, W] — take first channel
+
+            # Downsample spatially to latent dims
+            # [F, H, W] → [1, F, H, W] (F treated as channels) → interpolate → [1, F, lH, lW]
+            mask_4d = mask_frames.unsqueeze(0).float()
+            mask_latent = F.interpolate(mask_4d, size=(latent_height, latent_width), mode="nearest")
+            # → [1, F, lH, lW]
+
+            # Downsample temporally: average within each latent frame's receptive field
+            time_sf = scale_factors[0]
+            latent_T = latent.shape[2]
+            mask_t = torch.zeros(1, 1, latent_T, latent_height, latent_width,
+                                 device=latent.device, dtype=latent.dtype)
+            for t in range(latent_T):
+                if t == 0:
+                    # First latent frame maps to pixel frame 0
+                    pix_start, pix_end = 0, 1
+                else:
+                    pix_start = 1 + (t - 1) * time_sf
+                    pix_end = min(1 + t * time_sf, mask_frames.shape[0])
+                if pix_start < mask_latent.shape[1]:
+                    chunk = mask_latent[0, pix_start:pix_end]  # [chunk_len, lH, lW]
+                    mask_t[0, 0, t] = chunk.mean(dim=0)
+
+            # Threshold: anything > 0.5 gets denoised
+            noise_mask = (mask_t > 0.5).float()
+
+            # Blank out masked region so the model generates fresh content there
+            latent = latent * (1.0 - noise_mask)
+            latent_dict = {"samples": latent}
+
+            latent_dict["noise_mask"] = noise_mask
+            logger.info(f"Inpaint mask: latent shape {list(noise_mask.shape)}, "
+                        f"denoise ratio: {noise_mask.mean().item():.1%}")
+        elif guide_video is not None:
             num_video_frames = guide_video.shape[0]
             # Parse index list if provided, otherwise use every_nth
             if guide_index_list and guide_index_list.strip():
@@ -459,7 +520,6 @@ class RSLTXVGenerate:
 
             # Map pixel indices to latent frame indices and slice
             for i in indices:
-                # Latent frame index: frame 0 → latent 0, frames 1-8 → latent 1, etc.
                 if i == 0:
                     lat_idx = 0
                 else:
@@ -709,6 +769,174 @@ class RSLTXVGenerate:
             negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
 
         output_latent = {"samples": latent_image_out, "noise_mask": noise_mask_out}
+
+        # ----------------------------------------------------------------
+        # 6b. IC-LoRA REDIFFUSION (runs regardless of upscale)
+        # ----------------------------------------------------------------
+
+        _iclora_info = getattr(guider, 'control_info', None) if guider is not None else None
+        _iclora_has_control = _iclora_info is not None and _iclora_info.get("control_image") is not None
+        if not do_upscale and _iclora_has_control:
+            _rediff_passes = _iclora_info.get('_rediffusion_passes', 1)
+            if _rediff_passes > 0 and upscale_steps > 0 and upscale_denoise > 0:
+                from comfy_extras.nodes_lt import LTXVAddGuide as RdGuide, get_noise_mask as rd_get_noise_mask, get_keyframe_idxs as rd_get_keyframe_idxs
+
+                for _rediff_i in range(_rediff_passes):
+                    if hasattr(guider, 'control_info'):
+                        guider._current_rediff_pass = _rediff_i
+                        guider._total_rediff_passes = _rediff_passes
+                    logger.info(f"=== IC-LoRA re-diffusion pass {_rediff_i + 1}/{_rediff_passes} ===")
+
+                    rd_latent = output_latent["samples"]
+                    _, _, rd_lt, rd_lh, rd_lw = rd_latent.shape
+
+                    # Re-inject guide frames
+                    rd_scale_factors = vae.downscale_index_formula
+                    rd_guides = []
+                    rd_guide_video_latent = None
+                    if guide_video is not None and not inpaint_mode:
+                        num_video_frames = guide_video.shape[0]
+                        if guide_index_list and guide_index_list.strip():
+                            rd_indices = [int(x.strip()) for x in guide_index_list.split(",") if x.strip()]
+                            rd_indices = [i if i >= 0 else num_video_frames + i for i in rd_indices]
+                            rd_indices = [i for i in rd_indices if 0 <= i < num_video_frames]
+                        else:
+                            rd_indices = list(range(0, num_video_frames, guide_every_nth))
+
+                        _, rd_guide_video_latent = RdGuide.encode(
+                            vae, rd_lw, rd_lh, guide_video, rd_scale_factors
+                        )
+                        time_sf = rd_scale_factors[0]
+                        for i in rd_indices:
+                            lat_idx = 0 if i == 0 else (i - 1) // time_sf + 1
+                            lat_idx = min(lat_idx, rd_guide_video_latent.shape[2] - 1)
+                            guide_slice = rd_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
+                            rd_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+                    else:
+                        if first_image is not None:
+                            rd_guides.append((first_image, 0, first_strength, "first"))
+                        if middle_image is not None:
+                            mid_idx = (num_frames - 1) // 2
+                            mid_idx = max(0, (mid_idx // 8) * 8)
+                            if mid_idx == 0 and num_frames > 8:
+                                mid_idx = 8
+                            rd_guides.append((middle_image, mid_idx, middle_strength, "middle"))
+                        if last_image is not None:
+                            rd_guides.append((last_image, -1, last_strength, "last"))
+
+                    rd_noise_mask = None
+                    if rd_guides:
+                        rd_latent_dict = {"samples": rd_latent}
+                        rd_noise_mask = rd_get_noise_mask(rd_latent_dict)
+                        for guide_entry, frame_idx, strength_val, label in rd_guides:
+                            _, _, latent_length, latent_height, latent_width = rd_latent_dict["samples"].shape
+                            if rd_guide_video_latent is not None:
+                                rd_t = guide_entry
+                            else:
+                                _, rd_t = RdGuide.encode(vae, latent_width, latent_height, guide_entry, rd_scale_factors)
+                            guide_length = 1 if rd_guide_video_latent is not None else len(guide_entry)
+                            frame_idx_actual, _ = RdGuide.get_latent_index(
+                                positive, latent_length, guide_length, frame_idx, rd_scale_factors
+                            )
+                            logger.info(f"Rediffusion re-inject {label}: frame_idx={frame_idx_actual}, strength={strength_val}")
+                            positive, negative, rd_latent_samples, rd_noise_mask = RdGuide.append_keyframe(
+                                positive, negative, frame_idx_actual,
+                                rd_latent_dict["samples"], rd_noise_mask,
+                                rd_t, strength_val, rd_scale_factors,
+                            )
+                            rd_latent_dict = {"samples": rd_latent_samples, "noise_mask": rd_noise_mask}
+                        rd_latent = rd_latent_dict["samples"]
+
+                    # Apply rediffusion mask if present
+                    if rediffusion_mask is not None and rd_noise_mask is not None:
+                        rd_noise_mask = self._apply_rediffusion_mask(rd_noise_mask, rediffusion_mask, rediffusion_mask_strength, rd_lh, rd_lw)
+
+                    # Build model + sigmas
+                    rd_model = m.clone()
+                    if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                        lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                        lora = None
+                        if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
+                            lora = self.loaded_lora[1]
+                        if lora is None:
+                            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                            self.loaded_lora = (lora_path, lora)
+                        rd_model, _ = comfy.sd.load_lora_for_models(rd_model, None, lora, upscale_lora_strength, 0)
+                        logger.info(f"Applied rediffusion LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+
+                    rd_tokens = min(math.prod(rd_latent.shape[2:]), x2 * 2)
+                    rd_shift = rd_tokens * mm_shift + b
+                    logger.info(f"Rediffusion shift: tokens={rd_tokens}, shift={rd_shift:.3f}")
+
+                    rd_sampling = ModelSamplingAdvanced(rd_model.model.model_config)
+                    rd_sampling.set_parameters(shift=rd_shift)
+                    rd_model.add_object_patch("model_sampling", rd_sampling)
+
+                    exp_shift = math.exp(rd_shift)
+                    t_sched = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                    non_zero = t_sched != 0
+                    inv_t_m1 = torch.where(non_zero, 1.0 / t_sched - 1.0, torch.zeros_like(t_sched))
+                    omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t_sched))
+                    nz_omz = omz[non_zero]
+                    sf = nz_omz[-1] / (1.0 - 0.1)
+                    omz[non_zero] = nz_omz / sf
+                    rd_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+                    start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                    rd_sig = rd_sig[start_step:]
+                    logger.info(f"Rediffusion sigmas ({len(rd_sig)}): {rd_sig.tolist()}")
+
+                    # Build IC-LoRA guider for rediffusion
+                    rd_guider = self._rebuild_iclora_guider(
+                        rd_model, positive, negative, vae,
+                        _iclora_info, upscale_cfg,
+                        latent_h=rd_lh, latent_w=rd_lw, latent_t=rd_lt,
+                    )
+                    rd_guider._current_rediff_pass = _rediff_i
+                    rd_guider._total_rediff_passes = _rediff_passes
+
+                    # Recombine AV if needed
+                    rd_combined = rd_latent
+                    if has_audio and audio_latent_out is not None:
+                        rd_combined = comfy.nested_tensor.NestedTensor((rd_latent, audio_latent_out))
+                        audio_mask_val = 0.0 if audio_is_input else 1.0
+                        if rd_noise_mask is not None:
+                            audio_mask = torch.full_like(audio_latent_out[:, :1], audio_mask_val)
+                            rd_noise_mask = comfy.nested_tensor.NestedTensor((rd_noise_mask, audio_mask))
+
+                    rd_latent_image = comfy.sample.fix_empty_latent_channels(rd_guider.model_patcher, rd_combined)
+                    rd_noise = comfy.sample.prepare_noise(rd_latent_image, seed + 1 + _rediff_i)
+                    rd_sampler = getattr(guider, 'ic_lora_sampler', None) or comfy.samplers.sampler_object("euler_ancestral")
+                    rd_callback = latent_preview.prepare_callback(rd_guider.model_patcher, rd_sig.shape[-1] - 1)
+
+                    self._free_vram()
+                    rd_samples = rd_guider.sample(
+                        rd_noise, rd_latent_image, rd_sampler, rd_sig,
+                        denoise_mask=rd_noise_mask,
+                        callback=rd_callback,
+                        disable_pbar=disable_pbar,
+                        seed=seed + 1 + _rediff_i,
+                    )
+                    rd_samples = rd_samples.to(mm.intermediate_device())
+
+                    # Separate AV
+                    if rd_samples.is_nested:
+                        rd_parts = rd_samples.unbind()
+                        output_latent = {"samples": rd_parts[0]}
+                        audio_latent_out = rd_parts[1] if len(rd_parts) > 1 else audio_latent_out
+                    else:
+                        output_latent = {"samples": rd_samples}
+
+                    # Crop guide keyframes
+                    _, rd_num_keyframes = rd_get_keyframe_idxs(positive)
+                    if rd_num_keyframes > 0:
+                        output_latent["samples"] = output_latent["samples"][:, :, :-rd_num_keyframes]
+                        positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
+                        negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
+
+                    del rd_model, rd_guider
+                    self._free_vram()
+
+                logger.info("IC-LoRA rediffusion complete")
 
         # ----------------------------------------------------------------
         # 7. UPSCALE (optional)

@@ -275,6 +275,11 @@ class RSPromptFormatter:
                 self._pull_model(base, model)
                 logger.info(f"Model '{model}' ready.")
                 formatted = self._stream_chat(base, payload)
+            elif "think" in detail.lower():
+                # Model doesn't support thinking — retry without it
+                logger.info(f"Model '{model}' doesn't support thinking — retrying without")
+                payload.pop("think", None)
+                formatted = self._stream_chat(base, payload)
             else:
                 raise RuntimeError(f"Ollama error ({e.code}): {detail or e.reason}")
         except urllib.error.URLError as e:
