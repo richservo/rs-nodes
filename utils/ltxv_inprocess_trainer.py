@@ -405,12 +405,27 @@ class InProcessTrainer:
         logger.info(f"Starting training: {start_step} → {self._total_steps} steps"
                     f"{f' (auto_stop, epoch={self._step_epoch} samples)' if self._auto_stop else ''}")
 
+        # Import ComfyUI's interrupt exception for clean shutdown
+        try:
+            from comfy.model_management import InterruptProcessingException
+        except ImportError:
+            InterruptProcessingException = KeyboardInterrupt
+
         step = start_step
+        interrupted = False
         while step < self._total_steps:
             step += 1
-            # Cancellation check
+            # Cancellation check — save checkpoint before exiting
             if cancel_check is not None:
-                cancel_check()
+                try:
+                    cancel_check()
+                except Exception:
+                    logger.info(f"Interrupted at step {step} — saving checkpoint before exit...")
+                    print(f"[interrupted] Saving checkpoint at step {step}...")
+                    self._global_step = step
+                    self._save_checkpoint(step)
+                    interrupted = True
+                    break
 
             # Fetch next batch, cycling the dataset
             try:
@@ -439,6 +454,15 @@ class InProcessTrainer:
                 loss.backward()
                 loss_val = loss.item()
                 del loss  # Release computation graph immediately
+            except InterruptProcessingException:
+                # Interrupt fired inside forward/backward — save and exit
+                logger.info(f"Interrupted during step {step} — saving checkpoint before exit...")
+                print(f"[interrupted] Saving checkpoint at step {step}...")
+                self._global_step = step
+                self._optimizer.zero_grad(set_to_none=True)
+                self._save_checkpoint(step)
+                interrupted = True
+                break
             except _OOM_EXCEPTIONS:
                 # OOM on a hard sample — double FFN chunks and retry once
                 loss = None
@@ -580,7 +604,22 @@ class InProcessTrainer:
                     if self._diverge_monitoring:
                         if slope <= 0:
                             # Slope turned negative — recovered
-                            print(f"[divergence] Recovered at step {step} — slope turned negative ({slope:.6f}), training continues")
+                            # Restore the progressive LR decay schedule if stage 2 boosted it
+                            if self._diverge_lr_boosted:
+                                cycle_count = getattr(self, '_lr_cycle_count', 0)
+                                cycle_lr = self._learning_rate * (0.8 ** cycle_count)
+                                for pg in self._optimizer.param_groups:
+                                    pg["lr"] = cycle_lr
+                                    pg["initial_lr"] = cycle_lr
+                                self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+                                # Fast-forward scheduler to position within current cycle
+                                steps_into_cycle = step % self._lr_cycle
+                                for _ in range(steps_into_cycle):
+                                    self._lr_scheduler.step()
+                                restored_lr = self._optimizer.param_groups[0]["lr"]
+                                print(f"[divergence] Recovered at step {step} — restoring LR to cycle #{cycle_count} schedule (lr={restored_lr:.2e})")
+                            else:
+                                print(f"[divergence] Recovered at step {step} — slope turned negative ({slope:.6f}), training continues")
                             self._diverge_monitoring = False
                             self._diverge_detect_step = 0
                             self._pre_diverge_ckpt = None
@@ -658,8 +697,12 @@ class InProcessTrainer:
 
         # Final save
         final_path = self._save_final_lora()
-        logger.info(f"Training complete. LoRA saved to {final_path}")
-        print(f"Training complete. LoRA saved to {final_path}")
+        if interrupted:
+            logger.info(f"Training interrupted at step {step}. Checkpoint saved to {final_path}")
+            print(f"Training interrupted at step {step}. Checkpoint saved to {final_path}")
+        else:
+            logger.info(f"Training complete. LoRA saved to {final_path}")
+            print(f"Training complete. LoRA saved to {final_path}")
         return str(final_path)
 
     def cleanup(self) -> None:
