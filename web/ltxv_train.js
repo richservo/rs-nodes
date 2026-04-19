@@ -164,8 +164,8 @@ function createLossChart() {
 
     const canvas = document.createElement("canvas");
     canvas.width = 400;
-    canvas.height = 180;
-    canvas.style.cssText = "width:100%;min-height:180px;background:#1a1a1a;border-radius:4px;position:absolute;left:0;top:0;z-index:1;";
+    canvas.height = 234;
+    canvas.style.cssText = "width:100%;min-height:234px;background:#1a1a1a;border-radius:4px;position:absolute;left:0;top:0;z-index:1;";
     container.appendChild(canvas);
 
     return { container, canvas };

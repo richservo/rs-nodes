@@ -108,7 +108,7 @@ class RSPromptFormatter:
         """Send a streaming chat request and print tokens as they arrive."""
         url = f"{base_url}/api/chat"
         payload["stream"] = True
-        payload["think"] = True
+        # Don't override think — caller controls whether it's in the payload
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -251,6 +251,21 @@ class RSPromptFormatter:
         if encoded_images:
             user_message["images"] = encoded_images
 
+        # Check if model supports thinking via /api/show capabilities
+        supports_think = False
+        try:
+            show_url = f"{base}/api/show"
+            show_data = json.dumps({"name": model}).encode("utf-8")
+            show_req = urllib.request.Request(show_url, data=show_data,
+                                             headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(show_req, timeout=10) as show_resp:
+                show_info = json.loads(show_resp.read().decode("utf-8"))
+                caps = show_info.get("capabilities", [])
+                supports_think = "thinking" in caps
+                logger.info(f"Model '{model}' capabilities: {caps}")
+        except Exception:
+            pass  # If we can't check, default to no thinking
+
         payload = {
             "model": model,
             "messages": [
@@ -259,6 +274,8 @@ class RSPromptFormatter:
             ],
             "keep_alive": 0,
         }
+        if supports_think:
+            payload["think"] = True
 
         try:
             formatted = self._stream_chat(base, payload)

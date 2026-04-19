@@ -116,6 +116,7 @@ class InProcessTrainer:
         optimizer_type: str = "adamw8bit",
         scheduler_type: str = "linear",
         lr_cycle_steps: int = 0,
+        lr_cycle_decay: float = 1.0,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
         quantization: str | None = "fp8-quanto",
@@ -156,6 +157,7 @@ class InProcessTrainer:
         self._total_steps = len(dataset) if auto_stop else total_steps
         self._optimizer_type = optimizer_type
         self._scheduler_type = scheduler_type
+        self._lr_cycle_decay = lr_cycle_decay
         self._max_grad_norm = max_grad_norm
         self._gradient_checkpointing = gradient_checkpointing
         self._quantization = quantization if quantization and quantization != "none" else None
@@ -189,9 +191,11 @@ class InProcessTrainer:
         # LR cycle length (independent of epoch). 0 = match epoch length.
         self._lr_cycle = lr_cycle_steps if lr_cycle_steps > 0 else len(dataset)
         self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
-        self._diverge_threshold = diverge_threshold  # Minimum slope to trigger detection
+        self._diverge_threshold = diverge_threshold  # % above min EMA to trigger detection
         self._ema_history: list[tuple[int, float]] = []  # (step, ema_loss) for slope computation
-        self._diverge_detect_step = 0   # Step when upward slope first detected
+        self._ema_min = None            # Lowest EMA loss seen (after warmup)
+        self._ema_min_step = 0          # Step where minimum was recorded
+        self._diverge_detect_step = 0   # Step when divergence first detected
         self._diverge_monitoring = False # Currently in monitoring mode
         self._pre_diverge_ckpt = None   # Path to checkpoint saved at detection
         self._diverge_final_ckpt = None # Set when divergence stops training — used by _save_final_lora
@@ -355,7 +359,7 @@ class InProcessTrainer:
         # fast-forward to position within the current cycle.
         if self._global_step > 0:
             self._lr_cycle_count = self._global_step // self._lr_cycle
-            cycle_lr = self._learning_rate * (0.8 ** self._lr_cycle_count)
+            cycle_lr = self._learning_rate * (self._lr_cycle_decay ** self._lr_cycle_count)
             for pg in self._optimizer.param_groups:
                 pg["lr"] = cycle_lr
                 pg["initial_lr"] = cycle_lr
@@ -389,6 +393,50 @@ class InProcessTrainer:
 
         data_iter = iter(dataloader)
         start_step = self._global_step
+
+        # Restore loss history from previous run (for chart + divergence continuity)
+        loss_history_path = self._output_dir / "loss_history.json"
+        if start_step > 0 and loss_history_path.exists():
+            try:
+                import json
+                with open(loss_history_path) as f:
+                    history = json.load(f)
+                self._ema_history = [(s, v) for s, v in history.get("ema_history", [])]
+                self._ema_loss = history.get("ema_loss")
+                self._ema_min = history.get("ema_min")
+                self._ema_min_step = history.get("ema_min_step", 0)
+                # Replay loss data to the chart via websocket
+                if self._node_id:
+                    try:
+                        from server import PromptServer
+                        for entry in history.get("steps", []):
+                            PromptServer.instance.send_sync("rs-training-update", {
+                                "node_id": self._node_id,
+                                "step": entry["step"],
+                                "total_steps": self._total_steps,
+                                "loss": entry["loss"],
+                                "lr": entry.get("lr", 0),
+                                "ema_loss": entry.get("ema_loss"),
+                                "monitoring": False,
+                                "checkpoint_interval": self._checkpoint_interval,
+                                "epoch": entry.get("epoch", 1),
+                                "step_epoch": self._step_epoch,
+                            })
+                    except Exception:
+                        pass
+                logger.info(f"Restored loss history ({len(self._ema_history)} EMA points, min={self._ema_min:.4f} at step {self._ema_min_step})")
+            except Exception as e:
+                logger.warning(f"Could not restore loss history: {e}")
+
+        # Track per-step loss data for saving
+        self._loss_steps: list[dict] = []
+        if start_step > 0 and loss_history_path.exists():
+            try:
+                import json
+                with open(loss_history_path) as f:
+                    self._loss_steps = json.load(f).get("steps", [])
+            except Exception:
+                pass
 
         # Suppress sage attention warnings during training (fp8 quantized weights
         # produce dtypes sage doesn't support — falls back to pytorch attention).
@@ -546,13 +594,23 @@ class InProcessTrainer:
                 except Exception:
                     pass
 
+            # Record step for loss history persistence
+            epoch = (step - 1) // self._step_epoch + 1
+            self._loss_steps.append({
+                "step": step, "loss": loss_val, "lr": lr,
+                "ema_loss": self._ema_loss, "epoch": epoch,
+            })
+            # Save loss history every 50 steps (cheap JSON write)
+            if step % 50 == 0:
+                self._save_loss_history()
+
             # --- Divergence detection ---
-            # Track EMA loss and detect divergence via trendline slope.
+            # Track EMA loss and detect divergence via distance from minimum.
             # Skip the first 25% of steps (warmup).
-            # Uses a sliding window linear regression (same as the JS graph trendline).
-            # If slope is positive (upward) for detect_steps: enter monitoring.
-            # If slope turns negative (downward) during monitoring: recovered, cancel.
-            # If slope stays positive for stop_steps: stop and keep pre-divergence checkpoint.
+            # If EMA loss rises more than threshold% above the lowest EMA seen,
+            # and stays there for detect_steps: enter monitoring.
+            # If EMA drops back below threshold: recovered.
+            # If it stays diverged for stop_steps: stop and rewind.
             warmup_end = start_step + max(50, int((self._total_steps - start_step) * 0.25))
             if self._ema_loss is None:
                 self._ema_loss = loss_val
@@ -562,52 +620,40 @@ class InProcessTrainer:
             if step >= warmup_end:
                 self._ema_history.append((step, self._ema_loss))
 
-                # Compute slope over a trailing window (matching JS graph: 75% of history, min 50 pts)
-                min_pts = 50
-                if len(self._ema_history) >= min_pts:
-                    window_size = max(min_pts, int(len(self._ema_history) * 0.75))
-                    window = self._ema_history[-window_size:]
-                    n = len(window)
-                    sum_x = sum(s for s, _ in window)
-                    sum_y = sum(v for _, v in window)
-                    sum_xy = sum(s * v for s, v in window)
-                    sum_xx = sum(s * s for s, _ in window)
-                    denom = n * sum_xx - sum_x * sum_x
-                    slope = (n * sum_xy - sum_x * sum_y) / denom if denom != 0 else 0.0
+                # Track minimum EMA loss
+                if self._ema_min is None or self._ema_loss < self._ema_min:
+                    self._ema_min = self._ema_loss
+                    self._ema_min_step = step
 
-                    # Compute predicted % increase over the detection window
-                    # slope is loss/step, so slope * window_size = predicted loss change
-                    # Convert to percentage relative to current EMA loss
-                    predicted_change = slope * self._diverge_detect_steps
-                    pct_change = (predicted_change / self._ema_loss * 100) if self._ema_loss > 0 else 0.0
+                # Compute % above minimum
+                pct_above_min = ((self._ema_loss - self._ema_min) / self._ema_min * 100) if self._ema_min > 0 else 0.0
 
-                    # Only trigger if predicted increase exceeds threshold %
-                    if not self._diverge_monitoring and pct_change > self._diverge_threshold:
-                        # Count consecutive above-threshold steps
-                        if self._diverge_detect_step == 0:
-                            self._diverge_detect_step = step
-                        steps_positive = step - self._diverge_detect_step
+                if not self._diverge_monitoring and pct_above_min > self._diverge_threshold:
+                    # EMA is above threshold — count consecutive steps
+                    if self._diverge_detect_step == 0:
+                        self._diverge_detect_step = step
+                    steps_above = step - self._diverge_detect_step
 
-                        if steps_positive >= self._diverge_detect_steps:
-                            self._diverge_monitoring = True
-                            self._pre_diverge_ckpt = self._save_checkpoint(step)
-                            print(
-                                f"[divergence] Upward trend detected at step {step} — "
-                                f"predicted +{pct_change:.1f}% (threshold={self._diverge_threshold:.0f}%), EMA={self._ema_loss:.4f}. "
-                                f"Monitoring for {self._diverge_stop_steps} steps."
-                            )
-                    elif not self._diverge_monitoring and pct_change <= self._diverge_threshold:
-                        # Reset counter — trend is below threshold
-                        self._diverge_detect_step = 0
+                    if steps_above >= self._diverge_detect_steps:
+                        self._diverge_monitoring = True
+                        self._pre_diverge_ckpt = self._save_checkpoint(step)
+                        print(
+                            f"[divergence] Loss {pct_above_min:.1f}% above minimum ({self._ema_min:.4f} at step {self._ema_min_step}) — "
+                            f"EMA={self._ema_loss:.4f}, threshold={self._diverge_threshold:.0f}%. "
+                            f"Monitoring for {self._diverge_stop_steps} steps."
+                        )
+                elif not self._diverge_monitoring:
+                    # Below threshold — reset counter
+                    self._diverge_detect_step = 0
 
-                    # In monitoring mode
-                    if self._diverge_monitoring:
-                        if slope <= 0:
+                # In monitoring mode
+                if self._diverge_monitoring:
+                    if pct_above_min <= self._diverge_threshold:
                             # Slope turned negative — recovered
                             # Restore the progressive LR decay schedule if stage 2 boosted it
                             if self._diverge_lr_boosted:
                                 cycle_count = getattr(self, '_lr_cycle_count', 0)
-                                cycle_lr = self._learning_rate * (0.8 ** cycle_count)
+                                cycle_lr = self._learning_rate * (self._lr_cycle_decay ** cycle_count)
                                 for pg in self._optimizer.param_groups:
                                     pg["lr"] = cycle_lr
                                     pg["initial_lr"] = cycle_lr
@@ -619,7 +665,7 @@ class InProcessTrainer:
                                 restored_lr = self._optimizer.param_groups[0]["lr"]
                                 print(f"[divergence] Recovered at step {step} — restoring LR to cycle #{cycle_count} schedule (lr={restored_lr:.2e})")
                             else:
-                                print(f"[divergence] Recovered at step {step} — slope turned negative ({slope:.6f}), training continues")
+                                print(f"[divergence] Recovered at step {step} — EMA={self._ema_loss:.4f} back within {self._diverge_threshold:.0f}% of min ({self._ema_min:.4f})")
                             self._diverge_monitoring = False
                             self._diverge_detect_step = 0
                             self._pre_diverge_ckpt = None
@@ -648,7 +694,7 @@ class InProcessTrainer:
                                     # Already tried LR boost — give up
                                     print(
                                         f"[divergence] No recovery after LR boost + {self._diverge_stop_steps} steps — stopping training. "
-                                        f"Slope still positive ({slope:.6f}). "
+                                        f"EMA={self._ema_loss:.4f}, still {pct_above_min:.1f}% above min ({self._ema_min:.4f}). "
                                         f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
                                     )
                                     self._diverge_final_ckpt = self._pre_diverge_ckpt
@@ -682,7 +728,7 @@ class InProcessTrainer:
             # and rebuild scheduler. Divergence stage 2 still does a full reset.
             if step > 0 and step % self._lr_cycle == 0:
                 self._lr_cycle_count = getattr(self, '_lr_cycle_count', 0) + 1
-                cycle_lr = self._learning_rate * (0.8 ** self._lr_cycle_count)
+                cycle_lr = self._learning_rate * (self._lr_cycle_decay ** self._lr_cycle_count)
                 for pg in self._optimizer.param_groups:
                     pg["lr"] = cycle_lr
                     pg["initial_lr"] = cycle_lr
@@ -1297,6 +1343,23 @@ class InProcessTrainer:
             logger.warning(f"Unknown scheduler_type {t!r}, using constant LR")
             return None
 
+    def _save_loss_history(self):
+        """Save loss history to JSON for resume continuity."""
+        import json
+        loss_history_path = self._output_dir / "loss_history.json"
+        try:
+            data = {
+                "ema_history": self._ema_history,
+                "ema_loss": self._ema_loss,
+                "ema_min": self._ema_min,
+                "ema_min_step": self._ema_min_step,
+                "steps": self._loss_steps,
+            }
+            with open(loss_history_path, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Failed to save loss history: {e}")
+
     def _save_checkpoint(self, step: int) -> Path:
         """Save intermediate LoRA checkpoint and prune old ones.
 
@@ -1334,6 +1397,9 @@ class InProcessTrainer:
         # Don't delete old checkpoints during monitoring — keep them all for rewind
         if not self._diverge_monitoring:
             self._cleanup_old_checkpoints()
+
+        # Also save loss history alongside checkpoint
+        self._save_loss_history()
 
         return save_path
 

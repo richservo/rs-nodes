@@ -134,6 +134,8 @@ class RSLTXVTrainLoRA:
                 "scheduler":              (["linear", "constant", "cosine", "cosine_with_restarts", "polynomial"],),
                 "lr_cycle_steps":         ("INT",   {"default": 0, "min": 0, "max": 100000, "step": 100,
                                                      "tooltip": "LR schedule cycle length in steps. 0 = one cycle per epoch (dataset size). Set to e.g. 1000 for faster LR resets on large datasets."}),
+                "lr_cycle_decay":         ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.01,
+                                                     "tooltip": "Multiply LR by this factor each cycle reset. 1.0 = no decay, 0.8 = 20% reduction per cycle."}),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                 "ffn_chunks":             ("INT",     {"default": 0, "min": 0, "max": 16, "step": 1, "tooltip": "Split FFN layers into N chunks along sequence dim to reduce peak VRAM. 0 = disabled, 4 = good default. Trades speed for memory."}),
                 # Quantization
@@ -155,11 +157,11 @@ class RSLTXVTrainLoRA:
                                                   "tooltip": "-1 = keep all"}),
                 # Divergence detection
                 "diverge_detect_steps": ("INT", {"default": 150, "min": 10, "max": 5000, "step": 10,
-                                                 "tooltip": "Steps with positive slope before entering monitoring mode"}),
+                                                 "tooltip": "Steps above threshold before entering monitoring mode"}),
                 "diverge_stop_steps":   ("INT", {"default": 300, "min": 10, "max": 5000, "step": 10,
-                                                 "tooltip": "Steps in monitoring without slope recovery before stopping training"}),
-                "diverge_threshold":    ("FLOAT", {"default": 20.0, "min": 0.0, "max": 200.0, "step": 1.0,
-                                                   "tooltip": "Predicted % loss increase over detect window to trigger monitoring. 20 = start if trending toward 20% increase."}),
+                                                 "tooltip": "Steps in monitoring without recovery before stopping training"}),
+                "diverge_threshold":    ("FLOAT", {"default": 15.0, "min": 0.0, "max": 200.0, "step": 1.0,
+                                                   "tooltip": "% above lowest EMA loss to trigger divergence detection. 15 = trigger if loss rises 15% above best."}),
                 # Resume
                 "resume": ("BOOLEAN", {"default": False, "tooltip": "Resume from latest checkpoint in output directory"}),
                 # Debug
@@ -226,6 +228,7 @@ class RSLTXVTrainLoRA:
         optimizer: str = "adamw8bit",
         scheduler: str = "linear",
         lr_cycle_steps: int = 0,
+        lr_cycle_decay: float = 1.0,
         gradient_checkpointing: bool = True,
         ffn_chunks: int = 0,
         quantization: str = "fp8-quanto",
@@ -486,6 +489,7 @@ class RSLTXVTrainLoRA:
             optimizer_type=optimizer,
             scheduler_type=scheduler,
             lr_cycle_steps=lr_cycle_steps,
+            lr_cycle_decay=lr_cycle_decay,
             max_grad_norm=1.0,
             gradient_checkpointing=gradient_checkpointing,
             quantization=quantization if quantization != "none" else None,
