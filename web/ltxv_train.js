@@ -160,12 +160,12 @@ const lossData = {};  // node_id -> { steps: [], losses: [], lrs: [], timestamps
 
 function createLossChart() {
     const container = document.createElement("div");
-    container.style.cssText = "width:100%;padding:4px;box-sizing:border-box;position:relative;overflow:visible;";
+    container.style.cssText = "width:100%;height:234px;padding:4px;box-sizing:border-box;overflow:hidden;";
 
     const canvas = document.createElement("canvas");
     canvas.width = 400;
     canvas.height = 234;
-    canvas.style.cssText = "width:100%;min-height:234px;background:#1a1a1a;border-radius:4px;position:absolute;left:0;top:0;z-index:1;";
+    canvas.style.cssText = "width:100%;height:100%;background:#1a1a1a;border-radius:4px;display:block;";
     container.appendChild(canvas);
 
     return { container, canvas };
@@ -443,37 +443,8 @@ app.registerExtension({
             node._lossCanvas = canvas;
             node._lossChartWidget = chartWidget;
 
-            // Add spacer widgets to claim vertical space for the chart.
-            // ComfyUI sizes nodes by widget count, so we need these.
-            const SPACER_COUNT = 8;
-            const spacers = [];
-            for (let i = 0; i < SPACER_COUNT; i++) {
-                const spacer = document.createElement("div");
-                spacer.style.cssText = "width:100%;height:1px;";
-                spacers.push(node.addDOMWidget(
-                    "chart_spacer_" + i, "custom", spacer,
-                    { serialize: false }
-                ));
-            }
-
-            // On resize, set the canvas height using the node's actual size
+            // On resize, redraw the chart to fit
             function updateChartSize() {
-                const chartRect = container.getBoundingClientRect();
-                if (!chartRect || chartRect.height < 1) return;
-                // Use node's rendered bottom edge minus chart top
-                const nodeEl = node.domElement || container.closest(".comfyui-node") || container.closest(".graphnode");
-                let h = 180;
-                if (nodeEl) {
-                    const nodeRect = nodeEl.getBoundingClientRect();
-                    h = Math.max(180, nodeRect.bottom - chartRect.top - 20);
-                } else {
-                    // Fallback: use spacer positions
-                    const lastRect = spacers.length && spacers[spacers.length - 1].element?.getBoundingClientRect();
-                    if (lastRect) {
-                        h = Math.max(180, lastRect.bottom - chartRect.top - 20);
-                    }
-                }
-                canvas.style.height = h + "px";
                 drawLossChart(canvas, lossData[node.id]);
             }
 

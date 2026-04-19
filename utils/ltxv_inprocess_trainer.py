@@ -651,56 +651,56 @@ class InProcessTrainer:
                 # In monitoring mode
                 if self._diverge_monitoring:
                     if pct_above_min <= self._diverge_threshold:
-                            # Slope turned negative — recovered
-                            # Restore the progressive LR decay schedule if stage 2 boosted it
-                            if self._diverge_lr_boosted:
-                                cycle_count = getattr(self, '_lr_cycle_count', 0)
-                                cycle_lr = self._learning_rate * (self._lr_cycle_decay ** cycle_count)
-                                for pg in self._optimizer.param_groups:
-                                    pg["lr"] = cycle_lr
-                                    pg["initial_lr"] = cycle_lr
-                                self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
-                                # Fast-forward scheduler to position within current cycle
-                                steps_into_cycle = step % self._lr_cycle
-                                for _ in range(steps_into_cycle):
-                                    self._lr_scheduler.step()
-                                restored_lr = self._optimizer.param_groups[0]["lr"]
-                                print(f"[divergence] Recovered at step {step} — restoring LR to cycle #{cycle_count} schedule (lr={restored_lr:.2e})")
-                            else:
-                                print(f"[divergence] Recovered at step {step} — EMA={self._ema_loss:.4f} back within {self._diverge_threshold:.0f}% of min ({self._ema_min:.4f})")
-                            self._diverge_monitoring = False
-                            self._diverge_detect_step = 0
-                            self._pre_diverge_ckpt = None
-                            self._diverge_lr_boosted = False
-                            self._cleanup_old_checkpoints()
+                        # Recovered — EMA back within threshold of minimum
+                        # Restore the progressive LR decay schedule if stage 2 boosted it
+                        if self._diverge_lr_boosted:
+                            cycle_count = getattr(self, '_lr_cycle_count', 0)
+                            cycle_lr = self._learning_rate * (self._lr_cycle_decay ** cycle_count)
+                            for pg in self._optimizer.param_groups:
+                                pg["lr"] = cycle_lr
+                                pg["initial_lr"] = cycle_lr
+                            self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+                            # Fast-forward scheduler to position within current cycle
+                            steps_into_cycle = step % self._lr_cycle
+                            for _ in range(steps_into_cycle):
+                                self._lr_scheduler.step()
+                            restored_lr = self._optimizer.param_groups[0]["lr"]
+                            print(f"[divergence] Recovered at step {step} — restoring LR to cycle #{cycle_count} schedule (lr={restored_lr:.2e})")
                         else:
-                            steps_in_monitoring = step - self._diverge_detect_step
-                            if steps_in_monitoring > 0 and steps_in_monitoring % 100 == 0:
-                                self._save_checkpoint(step)
+                            print(f"[divergence] Recovered at step {step} — EMA={self._ema_loss:.4f} back within {self._diverge_threshold:.0f}% of min ({self._ema_min:.4f})")
+                        self._diverge_monitoring = False
+                        self._diverge_detect_step = 0
+                        self._pre_diverge_ckpt = None
+                        self._diverge_lr_boosted = False
+                        self._cleanup_old_checkpoints()
+                    else:
+                        steps_in_monitoring = step - self._diverge_detect_step
+                        if steps_in_monitoring > 0 and steps_in_monitoring % 100 == 0:
+                            self._save_checkpoint(step)
 
-                            if steps_in_monitoring >= self._diverge_stop_steps:
-                                if not self._diverge_lr_boosted:
-                                    # First attempt: full LR reset to break out of plateau
-                                    for pg in self._optimizer.param_groups:
-                                        pg["lr"] = self._learning_rate
-                                        pg["initial_lr"] = self._learning_rate
-                                    self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
-                                    self._diverge_lr_boosted = True
-                                    self._diverge_detect_step = step  # reset monitoring window
-                                    print(
-                                        f"[divergence] LR reset at step {step} — "
-                                        f"boosting to {self._learning_rate:.2e} to attempt recovery. "
-                                        f"Monitoring for another {self._diverge_stop_steps} steps."
-                                    )
-                                else:
-                                    # Already tried LR boost — give up
-                                    print(
-                                        f"[divergence] No recovery after LR boost + {self._diverge_stop_steps} steps — stopping training. "
-                                        f"EMA={self._ema_loss:.4f}, still {pct_above_min:.1f}% above min ({self._ema_min:.4f}). "
-                                        f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
-                                    )
-                                    self._diverge_final_ckpt = self._pre_diverge_ckpt
-                                    break
+                        if steps_in_monitoring >= self._diverge_stop_steps:
+                            if not self._diverge_lr_boosted:
+                                # First attempt: full LR reset to break out of plateau
+                                for pg in self._optimizer.param_groups:
+                                    pg["lr"] = self._learning_rate
+                                    pg["initial_lr"] = self._learning_rate
+                                self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
+                                self._diverge_lr_boosted = True
+                                self._diverge_detect_step = step  # reset monitoring window
+                                print(
+                                    f"[divergence] LR reset at step {step} — "
+                                    f"boosting to {self._learning_rate:.2e} to attempt recovery. "
+                                    f"Monitoring for another {self._diverge_stop_steps} steps."
+                                )
+                            else:
+                                # Already tried LR boost — give up
+                                print(
+                                    f"[divergence] No recovery after LR boost + {self._diverge_stop_steps} steps — stopping training. "
+                                    f"EMA={self._ema_loss:.4f}, still {pct_above_min:.1f}% above min ({self._ema_min:.4f}). "
+                                    f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
+                                )
+                                self._diverge_final_ckpt = self._pre_diverge_ckpt
+                                break
 
             # Validation (save checkpoint first so progress is safe)
             if (
