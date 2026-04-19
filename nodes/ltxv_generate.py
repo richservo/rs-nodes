@@ -1999,6 +1999,15 @@ class RSLTXVGenerate:
         )
         up_guider.control_info = ci
         up_guider.ic_lora_sampler = ci.get("_ic_lora_sampler", None)
+
+        # Propagate distilled LoRA for distilled sigma passes
+        dl_name = ci.get("_distilled_lora", "none")
+        dl_strength = ci.get("_distilled_lora_strength", 1.0)
+        if dl_name and dl_name != "none" and dl_strength != 0:
+            dl_path = folder_paths.get_full_path_or_raise("loras", dl_name)
+            dl_data = comfy.utils.load_torch_file(dl_path, safe_load=True)
+            up_guider._distilled_lora = (dl_data, dl_strength, dl_name)
+
         logger.info("IC-LoRA guider rebuilt for upscale (deferred encoding)")
         return up_guider
 

@@ -76,7 +76,7 @@ class InProcessTrainer:
         target_modules: List of module name patterns to apply LoRA to.
         learning_rate: AdamW learning rate.
         total_steps: Total training steps.
-        optimizer_type: "adamw8bit" | "adamw".
+        optimizer_type: "adamw8bit" | "adamw" | "rose".
         scheduler_type: LR scheduler type ("linear" | "constant" | "cosine" | ...).
         max_grad_norm: Gradient clipping norm.
         gradient_checkpointing: Enable activation checkpointing on the transformer.
@@ -350,12 +350,15 @@ class InProcessTrainer:
             epochs_done = self._global_step // self._step_epoch
             self._total_steps = (epochs_done + 1) * self._step_epoch
 
-        # On resume: reset base LR and rebuild scheduler for the CURRENT LR cycle,
-        # then fast-forward to position within the cycle.
+        # On resume: compute how many LR cycles have completed, apply the
+        # progressive decay (20% per cycle), then rebuild scheduler and
+        # fast-forward to position within the current cycle.
         if self._global_step > 0:
+            self._lr_cycle_count = self._global_step // self._lr_cycle
+            cycle_lr = self._learning_rate * (0.8 ** self._lr_cycle_count)
             for pg in self._optimizer.param_groups:
-                pg["lr"] = self._learning_rate
-                pg["initial_lr"] = self._learning_rate
+                pg["lr"] = cycle_lr
+                pg["initial_lr"] = cycle_lr
             self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
             # Fast-forward within current LR cycle only
             steps_into_cycle = self._global_step % self._lr_cycle
@@ -636,14 +639,17 @@ class InProcessTrainer:
                     f"{f' extending to step {self._total_steps}' if self._auto_stop else ''}"
                 )
 
-            # LR cycle boundary: reset learning rate and rebuild scheduler.
+            # LR cycle boundary: reset learning rate (decaying 20% each cycle)
+            # and rebuild scheduler. Divergence stage 2 still does a full reset.
             if step > 0 and step % self._lr_cycle == 0:
+                self._lr_cycle_count = getattr(self, '_lr_cycle_count', 0) + 1
+                cycle_lr = self._learning_rate * (0.8 ** self._lr_cycle_count)
                 for pg in self._optimizer.param_groups:
-                    pg["lr"] = self._learning_rate
-                    pg["initial_lr"] = self._learning_rate
+                    pg["lr"] = cycle_lr
+                    pg["initial_lr"] = cycle_lr
                 self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
                 new_lr = self._optimizer.param_groups[0]["lr"]
-                print(f"LR schedule reset (lr={new_lr:.2e}, cycle={self._lr_cycle})")
+                print(f"LR cycle reset #{self._lr_cycle_count} (lr={new_lr:.2e}, base={self._learning_rate:.2e}, cycle={self._lr_cycle})")
 
         # Restore sage attention logging
         _root_logger.removeFilter(_sage_filter)
@@ -1203,12 +1209,23 @@ class InProcessTrainer:
         if opt_type == "adamw8bit":
             try:
                 from bitsandbytes.optim import AdamW8bit
+                logger.info("Using optimizer: AdamW8bit")
                 return AdamW8bit(params, lr=self._learning_rate)
             except ImportError:
                 logger.warning("bitsandbytes not available, falling back to AdamW")
                 return torch.optim.AdamW(params, lr=self._learning_rate)
         elif opt_type == "adamw":
+            logger.info("Using optimizer: AdamW")
             return torch.optim.AdamW(params, lr=self._learning_rate)
+        elif opt_type == "rose":
+            try:
+                from rose import Rose
+                logger.info("Using optimizer: ROSE (stateless)")
+                return Rose(params, lr=self._learning_rate)
+            except ImportError:
+                raise ImportError(
+                    "Rose optimizer not installed. Run: pip install git+https://github.com/MatthewK78/Rose"
+                )
         else:
             raise ValueError(f"Unknown optimizer_type: {self._optimizer_type!r}")
 

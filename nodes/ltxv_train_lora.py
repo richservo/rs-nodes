@@ -130,7 +130,7 @@ class RSLTXVTrainLoRA:
                 "learning_rate":          ("FLOAT", {"default": 1e-4,  "min": 1e-7, "max": 1e-1, "step": 1e-5}),
                 "epochs":                 ("INT",   {"default": 3,     "min": 1,    "max": 1000, "tooltip": "Number of passes through the full dataset. Each epoch = len(dataset) steps."}),
                 "auto_stop":              ("BOOLEAN", {"default": False, "tooltip": "Ignore epoch count — train until divergence detection stops it"}),
-                "optimizer":              (["adamw8bit", "adamw"], {"default": "adamw8bit"}),
+                "optimizer":              (["adamw8bit", "adamw", "rose"], {"default": "adamw8bit"}),
                 "scheduler":              (["linear", "constant", "cosine", "cosine_with_restarts", "polynomial"],),
                 "lr_cycle_steps":         ("INT",   {"default": 0, "min": 0, "max": 100000, "step": 100,
                                                      "tooltip": "LR schedule cycle length in steps. 0 = one cycle per epoch (dataset size). Set to e.g. 1000 for faster LR resets on large datasets."}),
@@ -388,45 +388,44 @@ class RSLTXVTrainLoRA:
         logger.info(f"VRAM freed. GPU memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
         logger.info(f"RAM usage: {__import__('psutil').Process().memory_info().rss / 1024**3:.1f} GB")
 
-        # ---- Step 5: load VAE decoder for validation ----
-        if vae is not None:
-            # Use ComfyUI's VAE but strip inference-mode flags from its weights.
-            # ComfyUI creates all tensors under inference_mode(True); cloning the
-            # state_dict and reloading produces clean non-inference tensors that
-            # work inside the training loop's inference_mode(False) context.
-            logger.info("Preparing ComfyUI VAE decoder for validation...")
-            vae_model = vae.first_stage_model
-            with torch.inference_mode(False):
-                clean_sd = {k: v.clone() for k, v in vae_model.state_dict().items()}
-            vae_model.load_state_dict(clean_sd, assign=True)
-            del clean_sd
-            vae_decoder = _ComfyVAEDecoderAdapter(vae_model)
-            vae_decoder.requires_grad_(False)
-        else:
-            logger.info("Loading VideoDecoder from checkpoint for validation...")
-            _setup_ltx_paths()
-            from ltx_trainer.model_loader import load_video_vae_decoder
-            vae_decoder = load_video_vae_decoder(
-                checkpoint_path=model_full_path,
-                device="cpu",
-                dtype=torch.bfloat16,
-            )
-            vae_decoder.requires_grad_(False)
-
-        # If audio is requested for validation, also load audio components
+        # ---- Step 5: load VAE decoder for validation (skip if disabled) ----
+        vae_decoder = None
         audio_vae_decoder = None
         vocoder = None
-        if with_audio and validation_config is not None:
-            logger.info("Loading audio VAE + vocoder for validation...")
-            from ltx_trainer.model_loader import load_audio_vae_decoder, load_vocoder
-            audio_vae_decoder = load_audio_vae_decoder(
-                checkpoint_path=model_full_path, device="cpu", dtype=torch.bfloat16
-            )
-            audio_vae_decoder.requires_grad_(False)
-            vocoder = load_vocoder(
-                checkpoint_path=model_full_path, device="cpu", dtype=torch.bfloat16
-            )
-            vocoder.requires_grad_(False)
+        if validation_config is not None:
+            if vae is not None:
+                logger.info("Preparing ComfyUI VAE decoder for validation...")
+                vae_model = vae.first_stage_model
+                with torch.inference_mode(False):
+                    clean_sd = {k: v.clone() for k, v in vae_model.state_dict().items()}
+                vae_model.load_state_dict(clean_sd, assign=True)
+                del clean_sd
+                vae_decoder = _ComfyVAEDecoderAdapter(vae_model)
+                vae_decoder.requires_grad_(False)
+            else:
+                logger.info("Loading VideoDecoder from checkpoint for validation...")
+                _setup_ltx_paths()
+                from ltx_trainer.model_loader import load_video_vae_decoder
+                vae_decoder = load_video_vae_decoder(
+                    checkpoint_path=model_full_path,
+                    device="cpu",
+                    dtype=torch.bfloat16,
+                )
+                vae_decoder.requires_grad_(False)
+
+            if with_audio:
+                logger.info("Loading audio VAE + vocoder for validation...")
+                from ltx_trainer.model_loader import load_audio_vae_decoder, load_vocoder
+                audio_vae_decoder = load_audio_vae_decoder(
+                    checkpoint_path=model_full_path, device="cpu", dtype=torch.bfloat16
+                )
+                audio_vae_decoder.requires_grad_(False)
+                vocoder = load_vocoder(
+                    checkpoint_path=model_full_path, device="cpu", dtype=torch.bfloat16
+                )
+                vocoder.requires_grad_(False)
+        else:
+            logger.info("Validation disabled — skipping VAE decoder load")
 
         # ---- Step 6: build training strategy + dataset + timestep sampler ----
         from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy

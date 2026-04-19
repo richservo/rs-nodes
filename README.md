@@ -52,10 +52,9 @@ install.bat
 
 The install script handles everything: initializes the LTX-2 submodule (for LoRA training) and installs all Python dependencies.
 
-**Manual install** (if not on Windows):
+**Linux:**
 ```bash
-git submodule update --init
-pip install -r requirements.txt
+./install.sh
 ```
 
 ### External Dependencies

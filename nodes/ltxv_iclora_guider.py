@@ -82,6 +82,9 @@ class RSLTXVICLoRAGuider:
                 "sampler":           ("SAMPLER", {"tooltip": "Sampler for IC-LoRA guidance passes. Default: euler."}),
                 "rediffusion_passes": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
                                                "tooltip": "Number of half-res re-diffusion passes (stage 2)."}),
+                "distilled_lora":    (["none"] + folder_paths.get_filename_list("loras"),
+                                      {"tooltip": "Distilled LoRA to apply when running distilled sigmas (cfg=1.0)."}),
+                "distilled_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
             },
         }
 
@@ -102,6 +105,7 @@ class RSLTXVICLoRAGuider:
         audio_stg_scale=-1.0, video_modality_scale=0.0,
         audio_modality_scale=3.0, video_attn_scale=1.03,
         sampler=None, rediffusion_passes=1,
+        distilled_lora="none", distilled_lora_strength=1.0,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -180,6 +184,8 @@ class RSLTXVICLoRAGuider:
             "video_attn_scale": video_attn_scale,
             "_ic_lora_sampler": sampler,
             "_rediffusion_passes": rediffusion_passes,
+            "_distilled_lora": distilled_lora,
+            "_distilled_lora_strength": distilled_lora_strength,
         }
 
         # --- Create ICLoRAGuider (deferred encoding at sample() time) ---
@@ -212,6 +218,13 @@ class RSLTXVICLoRAGuider:
         # Attach control_info for upscale rebuild
         guider.control_info = control_info
         guider.ic_lora_sampler = sampler
+
+        # Load distilled LoRA data for use when running distilled sigmas
+        if distilled_lora and distilled_lora != "none" and distilled_lora_strength != 0:
+            dl_path = folder_paths.get_full_path_or_raise("loras", distilled_lora)
+            dl_data = comfy.utils.load_torch_file(dl_path, safe_load=True)
+            guider._distilled_lora = (dl_data, distilled_lora_strength, distilled_lora)
+            logger.info(f"Distilled LoRA loaded: {distilled_lora} (strength={distilled_lora_strength})")
 
         logger.info(f"Guider created (cfg={cfg}, stg={stg_scale}, rescale={rescale})")
         return (guider, out_width, out_height)

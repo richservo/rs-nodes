@@ -1032,9 +1032,10 @@ class ICLoRAGuider(MultimodalGuider):
         # 1. Apply model sampling shift (deferred until latent dims known)
         self._apply_model_sampling(latent_image)
 
-        # Distilled mode: when cfg=1.0, use official sigma schedule
+        # Distilled mode: when cfg=1.0, use official sigma schedule + distilled LoRA
         # (unless custom sigmas were provided via RSSigmaScheduler)
-        if self.video_cfg == 1.0:
+        is_distilled = self.video_cfg == 1.0
+        if is_distilled:
             base_sigmas = torch.tensor(self.DISTILLED_SIGMAS, dtype=torch.float32)
             # Check if external sigmas were provided (different from generate node's default)
             custom_sigmas = not torch.equal(sigmas, base_sigmas) and sigmas[0] == 1.0 and sigmas[-1] == 0.0
@@ -1064,6 +1065,16 @@ class ICLoRAGuider(MultimodalGuider):
             else:
                 sampler = comfy.samplers.sampler_object("euler")
                 logger.info(f"Distilled mode: sampler=euler, {'custom' if custom_sigmas else 'official'} sigma schedule ({len(sigmas)-1} steps)")
+
+            # Apply distilled LoRA when running distilled sigmas
+            distilled_lora = getattr(self, '_distilled_lora', None)
+            if distilled_lora is not None:
+                import comfy.sd
+                lora_data, lora_strength, lora_name = distilled_lora
+                self.model_patcher, _ = comfy.sd.load_lora_for_models(
+                    self.model_patcher, None, lora_data, lora_strength, 0
+                )
+                logger.info(f"Applied distilled LoRA: {lora_name} (strength={lora_strength})")
 
         # 2. Encode guide + inject into latent and conditioning
         denoise_mask = kwargs.get("denoise_mask", None)

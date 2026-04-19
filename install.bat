@@ -12,8 +12,13 @@ git submodule update --init
 echo.
 
 :: Install Python dependencies (won't touch torch/ComfyUI packages)
-echo [2/2] Installing Python dependencies...
+echo [2/3] Installing Python dependencies...
 pip install -r requirements.txt
+echo.
+
+:: Install ROSE optimizer (stateless optimizer for LoRA training)
+echo [3/3] Installing ROSE optimizer...
+pip install git+https://github.com/MatthewK78/Rose
 echo.
 
 echo ============================================

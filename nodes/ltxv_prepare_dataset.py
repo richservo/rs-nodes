@@ -292,6 +292,52 @@ def _compute_face_crop(
     return crop_x, crop_y, crop_w, crop_h
 
 
+def _compute_pan_and_scan(
+    face_x: int, face_y: int, face_w: int, face_h: int,
+    frame_w: int, frame_h: int,
+    target_w: int, target_h: int,
+) -> tuple[int, int, int, int]:
+    """Compute the largest crop at target aspect ratio that includes the face.
+    The face stays at its natural position — the crop just slides to contain it.
+    Returns (crop_x, crop_y, crop_w, crop_h).
+    """
+    target_aspect = target_w / target_h
+
+    # Max crop size at target aspect ratio that fits in the frame
+    if frame_w / frame_h > target_aspect:
+        crop_h = frame_h
+        crop_w = int(frame_h * target_aspect)
+    else:
+        crop_w = frame_w
+        crop_h = int(frame_w / target_aspect)
+
+    # Face center
+    cx = face_x + face_w // 2
+    cy = face_y + face_h // 2
+
+    # Default: center the crop in the frame
+    crop_x = (frame_w - crop_w) // 2
+    crop_y = (frame_h - crop_h) // 2
+
+    # Slide horizontally if face is outside crop
+    if cx < crop_x + face_w // 2:
+        crop_x = max(0, cx - face_w // 2)
+    elif cx > crop_x + crop_w - face_w // 2:
+        crop_x = min(frame_w - crop_w, cx + face_w // 2 - crop_w)
+
+    # Slide vertically if face is outside crop
+    if cy < crop_y + face_h // 2:
+        crop_y = max(0, cy - face_h // 2)
+    elif cy > crop_y + crop_h - face_h // 2:
+        crop_y = min(frame_h - crop_h, cy + face_h // 2 - crop_h)
+
+    # Clamp
+    crop_x = max(0, min(crop_x, frame_w - crop_w))
+    crop_y = max(0, min(crop_y, frame_h - crop_h))
+
+    return crop_x, crop_y, crop_w, crop_h
+
+
 class RSLTXVPrepareDataset:
     """Scan a folder of videos/images, detect faces, crop around them,
     generate dataset JSON, and run process_dataset.py to precompute latents."""
@@ -317,7 +363,7 @@ class RSLTXVPrepareDataset:
                 "skip_id_pass": ("BOOLEAN", {"default": False, "tooltip": "Skip cast/location ID passes — send ALL reference images directly to the captioner and let it identify characters and locations itself in one shot."}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
-                "crop_mode": (["face_crop", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=crop around detected face, full_frame=scale entire frame to target resolution (aspect-preserving, letterboxed). Both modes use face detection for clip selection when enabled."}),
+                "crop_mode": (["face_crop", "pan_and_scan", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=tight crop around face, pan_and_scan=max crop at target aspect ratio slid to include face (preserves natural framing), full_frame=scale entire frame. All modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
                 "character_refs_folder": ("STRING", {"default": "", "tooltip": "Multi-character mode: path to a folder of reference face images. Filename (minus extension) is used as that character's trigger word. Clips are kept if ANY reference matches. All matched characters are named in captions."}),
@@ -571,17 +617,8 @@ class RSLTXVPrepareDataset:
 
                 pbar.update_absolute(i + 1, len(new_media))
 
-            # Invalidate preprocessing only if new clips were actually added
-            new_clips_added = len(existing_entries) > entries_before
-            if new_clips_added:
-                if latents_dir.exists():
-                    import shutil
-                    shutil.rmtree(latents_dir)
-                    logger.info("Cleared latents — new clips added, preprocessing needed")
-                if conditions_dir.exists():
-                    import shutil
-                    shutil.rmtree(conditions_dir)
-                    logger.info("Cleared conditions — new clips added, preprocessing needed")
+            # New clips will get their own conditions/latents encoded —
+            # the encode functions skip files that already exist on disk.
         else:
             logger.info(f"All {len(existing_entries)} clips up to date, no new media to process")
             # Make sure JSON is written even if no new media
@@ -947,27 +984,30 @@ class RSLTXVPrepareDataset:
 
     @staticmethod
     def _resolve_resolution_buckets(resolution_buckets: str, entries: list[dict]) -> str:
-        """Add 1-frame image buckets for each unique image resolution in the dataset."""
+        """Add 1-frame image buckets derived from existing video buckets.
+
+        Uses the spatial dimensions of each video bucket with frames=1,
+        so images are resized/cropped to match the video resolution.
+        This prevents the bucketing algorithm from creating a native-
+        resolution image bucket that hijacks video clips due to a closer
+        aspect ratio match.
+        """
+        has_images = any(
+            entry.get("media_path", "").lower().endswith((".png", ".jpg", ".jpeg"))
+            for entry in entries
+        )
+        if not has_images:
+            return resolution_buckets
+
         existing_buckets = set(resolution_buckets.split(";"))
-        for entry in entries:
-            media_path = entry.get("media_path", "")
-            if not media_path.lower().endswith((".png", ".jpg", ".jpeg")):
-                continue
-            # Read actual image dimensions
-            img = cv2.imread(media_path)
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-            # Round down to nearest multiple of 32 (crop, don't resize)
-            w = (w // 32) * 32
-            h = (h // 32) * 32
-            if w == 0 or h == 0:
-                continue
-            image_bucket = f"{w}x{h}x1"
-            if image_bucket not in existing_buckets:
-                resolution_buckets = f"{resolution_buckets};{image_bucket}"
-                existing_buckets.add(image_bucket)
-                logger.info(f"Added image resolution bucket: {image_bucket}")
+        for bucket_str in list(existing_buckets):
+            parts = bucket_str.strip().split("x")
+            if len(parts) >= 3 and int(parts[2]) > 1:
+                image_bucket = f"{parts[0]}x{parts[1]}x1"
+                if image_bucket not in existing_buckets:
+                    resolution_buckets = f"{resolution_buckets};{image_bucket}"
+                    existing_buckets.add(image_bucket)
+                    logger.info(f"Added image resolution bucket: {image_bucket}")
         return resolution_buckets
 
     def _scan_media(self, folder: Path) -> list[dict]:
@@ -1239,8 +1279,17 @@ class RSLTXVPrepareDataset:
         if crop_mode == "full_frame":
             # Keep native resolution — VAE encode step handles resize
             output = frame
+        elif crop_mode == "pan_and_scan":
+            face = _detect_face_dnn(frame) if face_detection else None
+            h, w = frame.shape[:2]
+            if face is not None:
+                crop = _compute_pan_and_scan(*face, w, h, target_w, target_h)
+            else:
+                crop = self._center_crop(w, h, target_w, target_h)
+            cx, cy, cw, ch = crop
+            output = frame[cy:cy+ch, cx:cx+cw]
         else:
-            # Crop to target aspect ratio but keep source resolution — no downscale
+            # face_crop: tight crop around face
             crop = self._get_face_crop(frame, target_w, target_h, face_detection)
             if crop is None:
                 logger.info(f"No face detected, skipping: {img_path.name}")
@@ -1406,10 +1455,13 @@ class RSLTXVPrepareDataset:
                     chunk_idx += 1
                     continue
                 logger.info(f"Chunk {chunk_idx}: matched {', '.join(sorted(matched_names))}")
-                if crop_mode == "face_crop":
+                if crop_mode in ("face_crop", "pan_and_scan"):
                     if face_anchor is not None:
                         _, face = face_anchor
-                        crop = _compute_face_crop(*face, frame_w, frame_h, target_w, target_h)
+                        if crop_mode == "pan_and_scan":
+                            crop = _compute_pan_and_scan(*face, frame_w, frame_h, target_w, target_h)
+                        else:
+                            crop = _compute_face_crop(*face, frame_w, frame_h, target_w, target_h)
                     else:
                         # Non-human-only match (e.g. Chairry solo shot) — no
                         # face to anchor on, fall back to center crop.
@@ -1425,6 +1477,8 @@ class RSLTXVPrepareDataset:
                         matched_sample = sample
                         if crop_mode == "face_crop":
                             crop = _compute_face_crop(*face, frame_w, frame_h, target_w, target_h)
+                        elif crop_mode == "pan_and_scan":
+                            crop = _compute_pan_and_scan(*face, frame_w, frame_h, target_w, target_h)
                         face_found = True
                         break
                 if not face_found:
@@ -1440,8 +1494,8 @@ class RSLTXVPrepareDataset:
                         start_frame = end_frame
                         chunk_idx += 1
                         continue
-            elif crop_mode == "face_crop":
-                # No face detection + face_crop: center crop
+            elif crop_mode in ("face_crop", "pan_and_scan"):
+                # No face detection + face_crop/pan_and_scan: center crop
                 crop = self._center_crop(frame_w, frame_h, target_w, target_h)
 
             out_path = clips_dir / f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
