@@ -114,6 +114,7 @@ class InProcessTrainer:
         learning_rate: float = 1e-4,
         total_steps: int = 2000,
         optimizer_type: str = "adamw8bit",
+        rose_stabilize: bool = True,
         scheduler_type: str = "linear",
         lr_cycle_steps: int = 0,
         lr_cycle_decay: float = 1.0,
@@ -156,6 +157,7 @@ class InProcessTrainer:
         self._learning_rate = learning_rate
         self._total_steps = len(dataset) if auto_stop else total_steps
         self._optimizer_type = optimizer_type
+        self._rose_stabilize = rose_stabilize
         self._scheduler_type = scheduler_type
         self._lr_cycle_decay = lr_cycle_decay
         self._max_grad_norm = max_grad_norm
@@ -1309,8 +1311,8 @@ class InProcessTrainer:
         elif opt_type == "rose":
             try:
                 from rose import Rose
-                logger.info("Using optimizer: ROSE (stateless)")
-                return Rose(params, lr=self._learning_rate)
+                logger.info(f"Using optimizer: ROSE (stateless, stabilize={self._rose_stabilize})")
+                return Rose(params, lr=self._learning_rate, stabilize=self._rose_stabilize)
             except ImportError:
                 raise ImportError(
                     "Rose optimizer not installed. Run: pip install git+https://github.com/MatthewK78/Rose"

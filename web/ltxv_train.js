@@ -409,6 +409,31 @@ app.registerExtension({
                 applyPreset(node, presetWidget.value);
             }
 
+            // Hide/show ROSE-specific settings based on optimizer selection
+            const optimizerWidget = node.widgets.find((w) => w.name === "optimizer");
+            const roseWidgets = ["rose_stabilize"];
+            function updateRoseVisibility() {
+                const isRose = optimizerWidget && optimizerWidget.value === "rose";
+                for (const name of roseWidgets) {
+                    const w = node.widgets.find((w) => w.name === name);
+                    if (w) w.type = isRose ? w._origType || "toggle" : "hidden";
+                }
+                node.setSize(node.computeSize());
+            }
+            if (optimizerWidget) {
+                // Store original widget types
+                for (const name of roseWidgets) {
+                    const w = node.widgets.find((w) => w.name === name);
+                    if (w) w._origType = w.type;
+                }
+                const origOptCallback = optimizerWidget.callback;
+                optimizerWidget.callback = function (value) {
+                    if (origOptCallback) origOptCallback.call(this, value);
+                    updateRoseVisibility();
+                };
+                updateRoseVisibility();
+            }
+
             // Add live loss chart widget at the bottom
             const { container, canvas } = createLossChart();
             const chartWidget = node.addDOMWidget(
