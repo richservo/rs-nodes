@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RS Training Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a1a; color: #ccc; font-family: monospace; overflow: hidden; }
+#status { position: fixed; top: 8px; left: 12px; font-size: 11px; color: #666; z-index: 10; }
+#status.connected { color: #4a9eff; }
+#status.error { color: #ff6644; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<div id="status">Connecting...</div>
+<canvas id="chart"></canvas>
+<script>
+const statusEl = document.getElementById("status");
+const canvas = document.getElementById("chart");
+const lossData = {};
+let activeNodeId = null;
+
+function connect() {
+    const host = location.hostname || "127.0.0.1";
+    const port = location.port || "8188";
+    const ws = new WebSocket(`ws://${host}:${port}/ws`);
+
+    ws.onopen = () => {
+        statusEl.textContent = "Connected — waiting for training data...";
+        statusEl.className = "connected";
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.type !== "rs-training-update") return;
+            const d = msg.data;
+            if (!d || !d.node_id) return;
+
+            const id = d.node_id;
+            // If we have restored history under a different key, migrate it
+            if (activeNodeId && activeNodeId !== id && lossData[activeNodeId] && !lossData[id]) {
+                lossData[id] = lossData[activeNodeId];
+                delete lossData[activeNodeId];
+            }
+            activeNodeId = id;
+
+            if (!lossData[id]) {
+                lossData[id] = { steps: [], losses: [], lrs: [], timestamps: [], totalSteps: 0 };
+            }
+            const ld = lossData[id];
+            ld.totalSteps = d.total_steps;
+            ld.emaLoss = d.ema_loss;
+            ld.monitoring = d.monitoring;
+            if (d.checkpoint_interval) ld.checkpointInterval = d.checkpoint_interval;
+            if (d.epoch) ld.epoch = d.epoch;
+            if (d.step_epoch) ld.stepEpoch = d.step_epoch;
+            ld.steps.push(d.step);
+            ld.losses.push(d.loss);
+            ld.lrs.push(d.lr);
+            ld.timestamps.push(performance.now());
+
+            statusEl.textContent = `Training node ${id} — ${ld.steps.length} steps`;
+            statusEl.className = "connected";
+
+            drawChart();
+        } catch (e) {}
+    };
+
+    ws.onclose = () => {
+        statusEl.textContent = "Disconnected — reconnecting...";
+        statusEl.className = "error";
+        setTimeout(connect, 2000);
+    };
+
+    ws.onerror = () => {
+        ws.close();
+    };
+}
+
+function drawChart() {
+    if (!activeNodeId || !lossData[activeNodeId]) return;
+    const data = lossData[activeNodeId];
+
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const W = cssW;
+    const H = cssH;
+    const pad = { top: 50, right: 20, bottom: 40, left: 65 };
+    const plotW = W - pad.left - pad.right;
+    const plotH = H - pad.top - pad.bottom;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(0, 0, W, H);
+
+    if (!data || data.steps.length < 2) {
+        ctx.fillStyle = "#666";
+        ctx.font = "14px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(
+            data && data.steps.length === 1
+                ? "Waiting for more data..."
+                : "Training loss will appear here",
+            W / 2, H / 2
+        );
+        return;
+    }
+
+    // EMA smoothing
+    const allSteps = data.steps;
+    const allLosses = data.losses;
+    const allSmoothed = [];
+    const alpha = Math.min(0.95, 1 - 2 / (Math.max(allLosses.length / 5, 2) + 1));
+    allSmoothed[0] = allLosses[0];
+    for (let i = 1; i < allLosses.length; i++) {
+        allSmoothed[i] = alpha * allSmoothed[i - 1] + (1 - alpha) * allLosses[i];
+    }
+
+    // Trailing window
+    const interval = data.monitoring ? 100 : (data.checkpointInterval || 500);
+    const maxVisible = interval * 2;
+    const visStart = Math.max(0, allSteps.length - maxVisible);
+    const steps = allSteps.slice(visStart);
+    const losses = allLosses.slice(visStart);
+    const smoothed = allSmoothed.slice(visStart);
+
+    const minStep = steps[0];
+    const maxStep = steps[steps.length - 1];
+    const stepRange = maxStep - minStep || 1;
+
+    // Y range
+    let minLoss = Infinity, maxLoss = -Infinity;
+    for (const v of smoothed) {
+        if (v < minLoss) minLoss = v;
+        if (v > maxLoss) maxLoss = v;
+    }
+    const lossRange = maxLoss - minLoss || 0.01;
+    minLoss -= lossRange * 0.05;
+    maxLoss += lossRange * 0.05;
+    const yRange = maxLoss - minLoss;
+
+    // Grid
+    ctx.strokeStyle = "#333";
+    ctx.lineWidth = 0.5;
+    const numGridY = 5;
+    ctx.font = "11px monospace";
+    ctx.fillStyle = "#888";
+    ctx.textAlign = "right";
+    for (let i = 0; i <= numGridY; i++) {
+        const y = pad.top + (plotH * i) / numGridY;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + plotW, y);
+        ctx.stroke();
+        const val = maxLoss - (yRange * i) / numGridY;
+        ctx.fillText(val.toFixed(4), pad.left - 6, y + 4);
+    }
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#888";
+    const numGridX = 6;
+    for (let i = 0; i <= numGridX; i++) {
+        const x = pad.left + (plotW * i) / numGridX;
+        const stepVal = minStep + (stepRange * i) / numGridX;
+        ctx.fillText(Math.round(stepVal).toString(), x, H - pad.bottom + 18);
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top);
+        ctx.lineTo(x, pad.top + plotH);
+        ctx.stroke();
+    }
+
+    // Raw losses
+    ctx.fillStyle = "rgba(100, 160, 255, 0.15)";
+    for (let i = 0; i < steps.length; i++) {
+        const x = pad.left + ((steps[i] - minStep) / stepRange) * plotW;
+        const y = pad.top + ((maxLoss - losses[i]) / yRange) * plotH;
+        ctx.beginPath();
+        ctx.arc(x, y, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Smoothed line
+    ctx.strokeStyle = "#4a9eff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < steps.length; i++) {
+        const x = pad.left + ((steps[i] - minStep) / stepRange) * plotW;
+        const y = pad.top + ((maxLoss - smoothed[i]) / yRange) * plotH;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Trend line
+    const trendMinPts = 50;
+    if (steps.length >= trendMinPts) {
+        const windowSize = Math.max(trendMinPts, Math.floor(steps.length * 0.75));
+        const startIdx = steps.length - windowSize;
+        let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        for (let i = startIdx; i < steps.length; i++) {
+            sumX += steps[i];
+            sumY += smoothed[i];
+            sumXY += steps[i] * smoothed[i];
+            sumXX += steps[i] * steps[i];
+        }
+        const n = windowSize;
+        const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+        const intercept = (sumY - slope * sumX) / n;
+
+        const x0 = pad.left;
+        const x1 = pad.left + plotW;
+        const y0 = pad.top + ((maxLoss - (slope * minStep + intercept)) / yRange) * plotH;
+        const y1 = pad.top + ((maxLoss - (slope * maxStep + intercept)) / yRange) * plotH;
+
+        ctx.strokeStyle = slope < 0 ? "rgba(80, 220, 120, 0.6)" : "rgba(255, 100, 80, 0.6)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 5]);
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    // Title bar
+    const lastLoss = losses[losses.length - 1];
+    const lastSmooth = smoothed[smoothed.length - 1];
+    const status = data.monitoring ? "  DIVERGENCE MONITORING" : "";
+
+    let timeStr = "";
+    const ts = data.timestamps;
+    if (ts && ts.length >= 2) {
+        const lastTime = (ts[ts.length - 1] - ts[ts.length - 2]) / 1000;
+        const avgTime = (ts[ts.length - 1] - ts[0]) / ((ts.length - 1) * 1000);
+        timeStr = `  ${lastTime.toFixed(1)}s/step  avg=${avgTime.toFixed(1)}s`;
+    }
+
+    let stepDisplay;
+    if (data.epoch && data.stepEpoch) {
+        const epochStep = ((maxStep - 1) % data.stepEpoch) + 1;
+        stepDisplay = `Step ${epochStep}/${data.stepEpoch}  epoch ${data.epoch}`;
+    } else {
+        stepDisplay = `Step ${maxStep}/${data.totalSteps || "?"}`;
+    }
+
+    ctx.fillStyle = data.monitoring ? "#ff6644" : "#ccc";
+    ctx.font = "13px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText(
+        `${stepDisplay}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${timeStr}${status}`,
+        pad.left, pad.top - 10
+    );
+}
+
+// Resize
+window.addEventListener("resize", drawChart);
+
+// Load existing loss history on startup
+async function loadHistory() {
+    try {
+        const resp = await fetch("/rs-nodes/loss-history");
+        const history = await resp.json();
+        if (history.steps && history.steps.length > 0) {
+            // Find the node_id from the first entry or use a default
+            const nodeId = history.steps[0].node_id || "restored";
+            activeNodeId = nodeId;
+            if (!lossData[nodeId]) {
+                lossData[nodeId] = { steps: [], losses: [], lrs: [], timestamps: [], totalSteps: 0 };
+            }
+            const ld = lossData[nodeId];
+            for (const entry of history.steps) {
+                ld.steps.push(entry.step);
+                ld.losses.push(entry.loss);
+                ld.lrs.push(entry.lr || 0);
+                ld.timestamps.push(performance.now());
+            }
+            if (history.ema_loss != null) ld.emaLoss = history.ema_loss;
+            statusEl.textContent = `Loaded ${ld.steps.length} steps from history`;
+            statusEl.className = "connected";
+            drawChart();
+        }
+    } catch (e) {
+        // No history available — that's fine
+    }
+}
+
+// Connect and load
+loadHistory();
+connect();
+</script>
+</body>
+</html>

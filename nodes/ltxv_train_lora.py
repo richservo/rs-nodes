@@ -15,6 +15,25 @@ from ..utils.ltxv_train_env import (
 
 logger = logging.getLogger(__name__)
 
+# Track active training output dir for the loss history API endpoint
+_active_training_dir: Path | None = None
+
+try:
+    from server import PromptServer
+    from aiohttp import web
+
+    @PromptServer.instance.routes.get("/rs-nodes/loss-history")
+    async def _serve_loss_history(request):
+        """Serve loss_history.json for the training monitor page."""
+        if _active_training_dir is None:
+            return web.json_response({"steps": []})
+        history_path = _active_training_dir / "loss_history.json"
+        if not history_path.exists():
+            return web.json_response({"steps": []})
+        return web.FileResponse(history_path)
+except Exception:
+    pass
+
 # Module group -> target_modules mapping for the LTX-2 transformer.
 # PEFT target_modules with a list uses suffix matching (key.endswith(f".{x}")),
 # NOT regex. To prevent matching audio_embeddings_connector submodules that
@@ -275,6 +294,8 @@ class RSLTXVTrainLoRA:
         # Output directories — inside the model's own folder, not the shared parent
         output_dir = data_root / "training_output"
         output_dir.mkdir(parents=True, exist_ok=True)
+        global _active_training_dir
+        _active_training_dir = output_dir
 
         # Use the loras folder that already has files (extra_model_paths), fall back to first
         lora_paths = folder_paths.get_folder_paths("loras")

@@ -34,8 +34,12 @@ A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous
   - [Post-Processing & Utilities](#post-processing--utilities)
     - [RS Film Grain](#rs-film-grain)
     - [RS Video Trim](#rs-video-trim)
+    - [RS Video Save (ProRes)](#rs-video-save-prores)
+    - [RS Frame Splitter](#rs-frame-splitter)
+    - [RS Frame Collector](#rs-frame-collector)
     - [RS Free VRAM](#rs-free-vram)
     - [RS Counter](#rs-counter)
+    - [RS Sigma Scheduler](#rs-sigma-scheduler)
 - [Workflow Examples](#workflow-examples)
 - [Tips & Troubleshooting](#tips--troubleshooting)
 
@@ -330,6 +334,10 @@ Scans a folder of videos/images, optionally detects and crops faces, generates c
 | `ollama_model` | STRING | "gemma3:27b" | Vision model for captioning |
 | `face_detection` | BOOLEAN | True | Enable face detection and cropping |
 | `target_face` | IMAGE | — | Reference face for identity matching |
+| `character_refs_folder` | STRING | "" | Multi-character mode: folder of reference face images |
+| `location_refs_folder` | STRING | "" | Location reference images folder |
+| `skip_start_seconds` | FLOAT | 0.0 | Skip first N seconds of every video |
+| `skip_end_seconds` | FLOAT | 0.0 | Skip last N seconds of every video |
 | `face_similarity` | FLOAT | 0.40 | Face match threshold |
 | `conditioning_folder` | STRING | "" | IC-LoRA conditioning inputs folder |
 | `clip` | CLIP | — | Text encoder for in-process encoding |
@@ -345,14 +353,18 @@ Scans a folder of videos/images, optionally detects and crops faces, generates c
 **Key Behaviors:**
 - Two-phase processing: clip generation then latent preprocessing
 - Face detection via OpenCV DNN with optional identity matching
-- Incremental: skips already-processed clips, tracks rejections
+- **Multi-character mode**: reference folder with named face/CLIP-vision images — auto-identifies cast per clip
+- **Location mode**: reference folder for distinct locations — auto-matches settings per clip
+- **Pan & scan**: face-aware cropping for optimal framing
+- Incremental: skips already-processed clips, tracks rejections, removes missing clips on re-run
 - Caption styles control what gets described (environment vs subject vs both)
+- Captioner carries forward character recognition from previous clips in the session
 
 ---
 
 #### RS LTXV Train LoRA
 
-In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer. Includes a **live loss chart** rendered directly on the node during training.
+In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer. Includes a **standalone training monitor** that opens in a separate browser tab for full-size, resizable loss charts.
 
 **Required Inputs:**
 
@@ -373,14 +385,22 @@ In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer
 | `lora_alpha` | INT | 16 | LoRA alpha |
 | 8 module toggles | BOOLEAN | varies | Select which layers to train (self-attn, cross-attn, FFN, audio) |
 | `learning_rate` | FLOAT | 1e-4 | Learning rate |
-| `steps` | INT | 2000 | Total training steps |
-| `optimizer` | ENUM | adamw8bit | `adamw8bit` or `adamw` |
+| `epochs` | INT | 3 | Number of passes through the full dataset |
+| `auto_stop` | BOOLEAN | False | Ignore epoch count — train until divergence detection stops |
+| `optimizer` | ENUM | adamw8bit | `adamw8bit`, `adamw`, or `rose` |
+| `rose_stabilize` | BOOLEAN | True | ROSE only: CV Trust Gating (try False for some conditions) |
 | `scheduler` | ENUM | linear | LR schedule: `linear`, `constant`, `cosine`, `cosine_with_restarts`, `polynomial` |
+| `lr_cycle_steps` | INT | 0 | LR schedule cycle length (0 = one cycle per epoch) |
+| `lr_cycle_decay` | FLOAT | 1.0 | Multiply LR by this factor each cycle reset (1.0 = no decay) |
 | `quantization` | ENUM | fp8-quanto | `fp8-quanto`, `int8-quanto`, `int4-quanto`, `none` |
+| `strategy` | ENUM | text_to_video | `text_to_video` or `video_to_video` (IC-LoRA) |
 | `clip` | CLIP | — | Text encoder for validation prompt |
 | `validation_prompt` | STRING | "" | Prompt for validation video generation |
 | `validation_interval` | INT | 250 | Steps between validations |
 | `checkpoint_interval` | INT | 500 | Steps between checkpoints |
+| `diverge_detect_steps` | INT | 150 | Steps above threshold before entering monitoring |
+| `diverge_stop_steps` | INT | 300 | Steps in monitoring without recovery before stopping |
+| `diverge_threshold` | FLOAT | 15.0 | % above lowest EMA loss to trigger divergence |
 | `resume` | BOOLEAN | False | Resume from latest checkpoint |
 
 **Outputs:**
@@ -392,10 +412,14 @@ In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer
 
 **Key Behaviors:**
 - **In-process**: reuses the loaded 22B transformer — no reload, no double memory
-- **Live loss chart**: streams loss/LR data via websocket to a live-updating Canvas chart on the node, with EMA smoothing and color-coded trend line
+- **Training monitor**: click "Open Training Monitor" on the node to open a full-page loss chart in a new browser tab. Shows raw loss dots, EMA-smoothed line, color-coded trend line, step timing, and divergence status. Loads history from `loss_history.json` on refresh.
+- **ROSE optimizer**: stateless optimizer — no momentum buffers, lower memory. ROSE-specific settings auto-hide when another optimizer is selected.
+- **Divergence detection**: monitors EMA loss vs minimum. If loss rises above threshold% for too long, saves a checkpoint and attempts LR reset. If unrecoverable, stops training and rewinds to the pre-divergence checkpoint.
+- **LR cycle decay**: progressive learning rate reduction across scheduler cycles (e.g., 0.9 = 10% reduction per cycle)
+- **Loss history persistence**: saves `loss_history.json` every 50 steps for chart continuity across resume/restart
 - **Layer offloading**: streams transformer blocks CPU↔GPU one at a time (~0.5 GB VRAM instead of ~11 GB)
 - **FP8 quantization**: reduces model memory while preserving LoRA weights in float
-- **Resume support**: restores optimizer state, RNG, and rebuilds LR schedule for the new total steps
+- **Resume support**: restores optimizer state, RNG, loss history, and rebuilds LR schedule
 - **Presets**: auto-configure module toggles and rank for common use cases (subject, style, motion)
 - Quantization modifies the transformer in-place — reload checkpoint after training
 
@@ -709,7 +733,7 @@ Persistent incrementing counter. State stored in `counter_state.json` across wor
 [Load LTXV Model] ──┐
 [Load VAE] ──────────┼──→ [RS LTXV Prepare Dataset] ──→ [RS LTXV Train LoRA]
 [Load CLIP] ─────────┘                                         │
-                                                          (live loss chart)
+                                                    (click "Open Training Monitor")
 ```
 
 ### Audio-Driven Video with TTS
@@ -758,8 +782,10 @@ Persistent incrementing counter. State stored in `counter_state.json` across wor
 - Use **`fp8-quanto`** quantization (no C++ build tools needed).
 - **Subject LoRAs**: enable self-attention + cross-attention. Captions should describe everything *except* the subject.
 - **Style LoRAs**: enable self-attention + feed-forward. Captions should describe the visual style in detail.
-- **Resume**: set the target total steps before resuming — the LR schedule is rebuilt for the new total.
-- The live loss chart shows raw dots, EMA-smoothed line, and a green (decreasing) or red (increasing) trend line.
+- **ROSE optimizer**: stateless, lower memory than AdamW. LR may need to be ~2x higher than AdamW (model-dependent — experiment).
+- **Divergence detection**: uses EMA loss distance from minimum. Threshold of 15% is a good default. Auto-saves checkpoint at detection, attempts LR reset, stops and rewinds if unrecoverable.
+- **Resume**: restores optimizer state, loss history, and LR schedule. The training monitor loads history from `loss_history.json` automatically.
+- **Training Monitor**: open via the link on the training node. Full-page chart with raw loss dots, EMA-smoothed line, trend line (green=decreasing, red=increasing), step timing, and divergence status. Resizes with the browser window.
 
 ### Prompt Workflow
 
