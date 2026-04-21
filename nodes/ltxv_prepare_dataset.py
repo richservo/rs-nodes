@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -363,6 +364,8 @@ class RSLTXVPrepareDataset:
                 "skip_id_pass": ("BOOLEAN", {"default": False, "tooltip": "Skip cast/location ID passes — send ALL reference images directly to the captioner and let it identify characters and locations itself in one shot."}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
+                "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0, "step": 0.001, "tooltip": "Target framerate for output clips (0=keep source fps). Drops frames to match target without affecting audio speed."}),
+                "max_samples": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Maximum clips in dataset (0=unlimited). When set, enables rolling dataset — random videos are selected and clipped until max_samples is reached. Deleted clips are blacklisted and backfilled."}),
                 "crop_mode": (["face_crop", "pan_and_scan", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=tight crop around face, pan_and_scan=max crop at target aspect ratio slid to include face (preserves natural framing), full_frame=scale entire frame. All modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
@@ -417,6 +420,8 @@ class RSLTXVPrepareDataset:
         clip=None,
         vae=None,
         clip_vision=None,
+        target_fps: float = 0.0,
+        max_samples: int = 0,
     ):
         validate_submodule()
         # Only validate/download text encoder if we'll need it for the subprocess
@@ -526,9 +531,12 @@ class RSLTXVPrepareDataset:
             and str(item["path"]) not in rejected_clips
         ]
 
-        # Verify existing clips still exist on disk, remove entries for missing clips
+        # Verify existing clips still exist on disk, remove entries for missing clips.
+        # For rolling dataset mode, record deleted clips in rejected.json with
+        # chunk-level info so we can audit what was purged.
         valid_entries = []
         removed_missing = 0
+        deleted_rejected: list[dict] = []
         for entry in existing_entries:
             clip_path = Path(entry["media_path"])
             if clip_path.exists():
@@ -536,95 +544,305 @@ class RSLTXVPrepareDataset:
             else:
                 logger.info(f"Clip missing from disk, removing: {clip_path.name}")
                 removed_missing += 1
+                # Build a chunk-level rejection record so the raw-pool loop
+                # knows this slot freed up.  We derive frame range from the
+                # clip filename when possible; fall back to target_frames math
+                # if the filename doesn't carry chunk info.
+                rej_entry: dict = {
+                    "source_file": entry.get("source_file", ""),
+                    "media_path": str(clip_path),
+                    "reason": "deleted",
+                }
+                # Try to extract chunk index from stem (e.g. "video_chunk0042")
+                stem = clip_path.stem
+                if "_chunk" in stem:
+                    try:
+                        chunk_num = int(stem.rsplit("_chunk", 1)[1])
+                        rej_entry["start_frame"] = chunk_num * target_frames
+                        rej_entry["end_frame"] = rej_entry["start_frame"] + target_frames
+                    except (ValueError, IndexError):
+                        pass
+                deleted_rejected.append(rej_entry)
+
         existing_entries = valid_entries
         if removed_missing > 0:
             with open(dataset_json_path, "w") as f:
                 json.dump(existing_entries, f, indent=2)
             logger.info(f"Removed {removed_missing} missing-clip entries from dataset.json")
+            # Append chunk-level deletion records to rejected.json
+            if deleted_rejected:
+                existing_rejected: list[dict] = []
+                if rejected_path.exists():
+                    try:
+                        with open(rejected_path) as rf:
+                            existing_rejected = json.load(rf)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                existing_rejected.extend(deleted_rejected)
+                with open(rejected_path, "w") as rf:
+                    json.dump(existing_rejected, rf, indent=2)
 
-        if new_media:
-            logger.info(f"Processing {len(new_media)} new media files ({len(existing_entries)} already done)")
-            entries_before = len(existing_entries)
-
-            pbar = comfy.utils.ProgressBar(len(new_media))
+        # --- Rolling dataset budget check ---
+        # When max_samples is set, skip clip extraction entirely if we're full.
+        if max_samples > 0 and len(existing_entries) >= max_samples:
+            logger.info(
+                f"Dataset at capacity ({len(existing_entries)}/{max_samples}), "
+                "skipping clip extraction"
+            )
+            # Jump straight to captioning / encoding below.
+        else:
+            # Determine whether we're in rolling-dataset mode (max_samples set)
+            # or classic sequential mode (process all new media from media_folder).
+            use_rolling = max_samples > 0
             ref_folder = Path(conditioning_folder) if conditioning_folder else None
 
-            for i, item in enumerate(new_media):
-                source_path = str(item["path"])
-                produced_clips = False
-                if item["type"] == "image":
-                    result = self._process_image(
-                        item["path"], clips_dir, target_w, target_h, face_detection,
-                        target_embedding=target_embedding, face_similarity=face_similarity,
-                        crop_mode=crop_mode,
-                        character_refs=character_refs,
-                        clip_vision=clip_vision,
-                    )
-                    if result:
-                        produced_clips = True
-                        entry = {"caption": "", "media_path": str(result), "source_file": source_path}
-                        if ref_folder and ref_folder.exists():
-                            for ext in VIDEO_EXTENSIONS:
-                                ref_file = ref_folder / (result.stem + ext)
-                                if ref_file.exists():
-                                    entry["reference_path"] = str(ref_file)
-                                    break
-                        existing_entries.append(entry)
+            if use_rolling:
+                # ---- Rolling dataset mode ----
+                clips_budget = max_samples - len(existing_entries)
+                logger.info(
+                    f"Rolling dataset mode: need {clips_budget} more clips "
+                    f"({len(existing_entries)}/{max_samples} slots used)"
+                )
+
+                # Use media_folder as the source pool — video-only for rolling
+                # mode because images have nothing to resume from.
+                pool_media = [
+                    item for item in media_files
+                    if item["type"] == "video"
+                ]
+                if not pool_media:
+                    logger.warning(f"No videos found in media_folder: {media_folder}")
                 else:
-                    results = self._process_video(
-                        item["path"], clips_dir, target_w, target_h, target_frames,
-                        face_detection,
-                        target_embedding=target_embedding, face_similarity=face_similarity,
-                        crop_mode=crop_mode, with_audio=with_audio,
-                        character_refs=character_refs,
-                        clip_vision=clip_vision,
-                        skip_start_seconds=skip_start_seconds,
-                        skip_end_seconds=skip_end_seconds,
-                    )
-                    if results:
-                        produced_clips = True
-                    for result in results:
-                        entry = {"caption": "", "media_path": str(result), "source_file": source_path}
-                        if ref_folder and ref_folder.exists():
-                            for ext in VIDEO_EXTENSIONS:
-                                ref_file = ref_folder / (result.stem + ext)
-                                if ref_file.exists():
-                                    entry["reference_path"] = str(ref_file)
-                                    break
-                        existing_entries.append(entry)
-
-                # Record fully-rejected source files so they aren't reprocessed
-                if not produced_clips:
-                    rejected_path = output_dir / "rejected.json"
-                    rejected = []
-                    if rejected_path.exists():
+                    # Load video_progress.json — tracks per-source progress so we
+                    # can resume from where we left off and avoid reprocessing.
+                    vp_path = output_dir / "video_progress.json"
+                    video_progress: dict[str, dict] = {}
+                    if vp_path.exists():
                         try:
-                            with open(rejected_path) as rf:
-                                rejected = json.load(rf)
+                            with open(vp_path) as vpf:
+                                video_progress = json.load(vpf)
                         except (json.JSONDecodeError, KeyError):
-                            pass
-                    rejected.append({
-                        "source_file": source_path,
-                        "reason": "no clips produced (all chunks rejected)",
-                    })
-                    with open(rejected_path, "w") as rf:
-                        json.dump(rejected, rf, indent=2)
-                    logger.info(f"No clips from {item['path'].name} — added to rejected.json")
+                            video_progress = {}
 
-                # Save JSON after each source file so progress isn't lost
-                with open(dataset_json_path, "w") as f:
-                    json.dump(existing_entries, f, indent=2)
+                    # Filter out fully-completed videos, non-existent files,
+                    # and source videos already fully rejected.
+                    incomplete = [
+                        item for item in pool_media
+                        if video_progress.get(item["path"].name, {}).get("status") != "complete"
+                        and item["path"].exists()
+                        and str(item["path"]) not in rejected_clips
+                    ]
 
-                pbar.update_absolute(i + 1, len(new_media))
+                    if not incomplete:
+                        logger.info("All source videos marked complete — nothing left to draw from")
+                    else:
+                        # Shuffle so each run distributes clips across different
+                        # source videos rather than draining the same one repeatedly.
+                        random.shuffle(incomplete)
 
-            # New clips will get their own conditions/latents encoded —
-            # the encode functions skip files that already exist on disk.
-        else:
-            logger.info(f"All {len(existing_entries)} clips up to date, no new media to process")
-            # Make sure JSON is written even if no new media
-            if not dataset_json_path.exists():
-                with open(dataset_json_path, "w") as f:
-                    json.dump(existing_entries, f, indent=2)
+                        pbar = comfy.utils.ProgressBar(clips_budget)
+                        clips_produced_this_run = 0
+
+                        for item in incomplete:
+                            if clips_budget <= 0:
+                                break
+
+                            source_path = str(item["path"])
+
+                            results = self._process_video(
+                                item["path"], clips_dir, target_w, target_h, target_frames,
+                                face_detection,
+                                target_embedding=target_embedding,
+                                face_similarity=face_similarity,
+                                crop_mode=crop_mode, with_audio=with_audio,
+                                character_refs=character_refs,
+                                clip_vision=clip_vision,
+                                skip_start_seconds=skip_start_seconds,
+                                skip_end_seconds=skip_end_seconds,
+                                target_fps=target_fps,
+                            )
+
+                            # _process_video returns ALL clips (existing + new).
+                            # Only add ones not already tracked in existing_entries.
+                            known_paths = {e["media_path"] for e in existing_entries}
+                            new_from_video = [r for r in results if str(r) not in known_paths]
+                            produced_clips = bool(new_from_video) or bool(results)
+                            for result in results:
+                                if clips_budget <= 0:
+                                    break
+                                if str(result) in known_paths:
+                                    continue
+                                entry = {
+                                    "caption": "",
+                                    "media_path": str(result),
+                                    "source_file": source_path,
+                                }
+                                if ref_folder and ref_folder.exists():
+                                    for ext in VIDEO_EXTENSIONS:
+                                        ref_file = ref_folder / (result.stem + ext)
+                                        if ref_file.exists():
+                                            entry["reference_path"] = str(ref_file)
+                                            break
+                                existing_entries.append(entry)
+                                known_paths.add(str(result))
+                                clips_budget -= 1
+                                clips_produced_this_run += 1
+                                pbar.update_absolute(clips_produced_this_run, max_samples - len(existing_entries) + clips_produced_this_run)
+
+                            if not produced_clips:
+                                # Source video yielded nothing — log to rejected.json
+                                existing_rejected = []
+                                if rejected_path.exists():
+                                    try:
+                                        with open(rejected_path) as rf:
+                                            existing_rejected = json.load(rf)
+                                    except (json.JSONDecodeError, KeyError):
+                                        pass
+                                existing_rejected.append({
+                                    "source_file": source_path,
+                                    "reason": "no clips produced (all chunks rejected)",
+                                })
+                                with open(rejected_path, "w") as rf:
+                                    json.dump(existing_rejected, rf, indent=2)
+                                logger.info(f"No clips from {item['path'].name} — added to rejected.json")
+
+                            # Update video_progress.json for this source.
+                            # Derive last_chunk_idx from the .progress file written
+                            # by _process_video (it stores the NEXT chunk to process).
+                            progress_file = clips_dir / f"{item['path'].stem}.progress"
+                            last_chunk_idx = 0
+                            vid_status = "partial"
+                            if progress_file.exists():
+                                try:
+                                    last_chunk_idx = int(progress_file.read_text().strip())
+                                except (ValueError, OSError):
+                                    pass
+
+                            # Read video metadata to know total frames for status check
+                            cap = cv2.VideoCapture(str(item["path"]))
+                            if cap.isOpened():
+                                fps_raw = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                                total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                                cap.release()
+                                total_chunks = (total_frames_raw + target_frames - 1) // target_frames
+                                if last_chunk_idx >= total_chunks:
+                                    vid_status = "complete"
+                                video_progress[item["path"].name] = {
+                                    "total_frames": total_frames_raw,
+                                    "fps": round(fps_raw, 3),
+                                    "last_chunk_idx": last_chunk_idx,
+                                    "status": vid_status,
+                                }
+                            else:
+                                video_progress[item["path"].name] = {
+                                    "last_chunk_idx": last_chunk_idx,
+                                    "status": vid_status,
+                                }
+
+                            with open(vp_path, "w") as vpf:
+                                json.dump(video_progress, vpf, indent=2)
+
+                            # Save dataset.json after each source so progress persists
+                            with open(dataset_json_path, "w") as f:
+                                json.dump(existing_entries, f, indent=2)
+
+                        logger.info(
+                            f"Rolling dataset: added {clips_produced_this_run} clips "
+                            f"({len(existing_entries)}/{max_samples} total)"
+                        )
+
+            else:
+                # ---- Classic sequential mode ----
+                if new_media:
+                    logger.info(f"Processing {len(new_media)} new media files ({len(existing_entries)} already done)")
+
+                    pbar = comfy.utils.ProgressBar(len(new_media))
+
+                    for i, item in enumerate(new_media):
+                        # Budget check: honour max_samples even in classic mode
+                        if max_samples > 0 and len(existing_entries) >= max_samples:
+                            logger.info(
+                                f"Reached max_samples={max_samples}, stopping early"
+                            )
+                            break
+
+                        source_path = str(item["path"])
+                        produced_clips = False
+                        if item["type"] == "image":
+                            result = self._process_image(
+                                item["path"], clips_dir, target_w, target_h, face_detection,
+                                target_embedding=target_embedding, face_similarity=face_similarity,
+                                crop_mode=crop_mode,
+                                character_refs=character_refs,
+                                clip_vision=clip_vision,
+                            )
+                            if result:
+                                produced_clips = True
+                                entry = {"caption": "", "media_path": str(result), "source_file": source_path}
+                                if ref_folder and ref_folder.exists():
+                                    for ext in VIDEO_EXTENSIONS:
+                                        ref_file = ref_folder / (result.stem + ext)
+                                        if ref_file.exists():
+                                            entry["reference_path"] = str(ref_file)
+                                            break
+                                existing_entries.append(entry)
+                        else:
+                            results = self._process_video(
+                                item["path"], clips_dir, target_w, target_h, target_frames,
+                                face_detection,
+                                target_embedding=target_embedding, face_similarity=face_similarity,
+                                crop_mode=crop_mode, with_audio=with_audio,
+                                character_refs=character_refs,
+                                clip_vision=clip_vision,
+                                skip_start_seconds=skip_start_seconds,
+                                skip_end_seconds=skip_end_seconds,
+                                target_fps=target_fps,
+                            )
+                            if results:
+                                produced_clips = True
+                            for result in results:
+                                if max_samples > 0 and len(existing_entries) >= max_samples:
+                                    break
+                                entry = {"caption": "", "media_path": str(result), "source_file": source_path}
+                                if ref_folder and ref_folder.exists():
+                                    for ext in VIDEO_EXTENSIONS:
+                                        ref_file = ref_folder / (result.stem + ext)
+                                        if ref_file.exists():
+                                            entry["reference_path"] = str(ref_file)
+                                            break
+                                existing_entries.append(entry)
+
+                        # Record fully-rejected source files so they aren't reprocessed
+                        if not produced_clips:
+                            existing_rejected = []
+                            if rejected_path.exists():
+                                try:
+                                    with open(rejected_path) as rf:
+                                        existing_rejected = json.load(rf)
+                                except (json.JSONDecodeError, KeyError):
+                                    pass
+                            existing_rejected.append({
+                                "source_file": source_path,
+                                "reason": "no clips produced (all chunks rejected)",
+                            })
+                            with open(rejected_path, "w") as rf:
+                                json.dump(existing_rejected, rf, indent=2)
+                            logger.info(f"No clips from {item['path'].name} — added to rejected.json")
+
+                        # Save JSON after each source file so progress isn't lost
+                        with open(dataset_json_path, "w") as f:
+                            json.dump(existing_entries, f, indent=2)
+
+                        pbar.update_absolute(i + 1, len(new_media))
+
+                    # New clips will get their own conditions/latents encoded —
+                    # the encode functions skip files that already exist on disk.
+                else:
+                    logger.info(f"All {len(existing_entries)} clips up to date, no new media to process")
+                    # Make sure JSON is written even if no new media
+                    if not dataset_json_path.exists():
+                        with open(dataset_json_path, "w") as f:
+                            json.dump(existing_entries, f, indent=2)
 
         if not existing_entries:
             raise RuntimeError(
@@ -1311,6 +1529,7 @@ class RSLTXVPrepareDataset:
         clip_vision=None,
         skip_start_seconds: float = 0.0,
         skip_end_seconds: float = 0.0,
+        target_fps: float = 0.0,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
         Returns list of output clip paths (skips chunks with no face when face_detection is on).
@@ -1342,7 +1561,22 @@ class RSLTXVPrepareDataset:
                 f"(skip_start={skip_start_seconds}s, skip_end={skip_end_seconds}s)"
             )
 
-        # Split into chunks of target_frames
+        # When target_fps is set and differs from source, each chunk must span
+        # more source frames to produce target_frames output frames at the lower
+        # rate.  E.g. 49 output frames at 24fps = 2.04s → need 61 source frames
+        # at 30fps to cover the same duration.
+        use_fps_conversion = target_fps > 0 and abs(fps - target_fps) > 0.5
+        if use_fps_conversion:
+            # Source frames needed per chunk to yield target_frames at target_fps
+            source_chunk_frames = int(round(target_frames * (fps / target_fps)))
+            logger.info(
+                f"{video_path.name}: fps conversion {fps:.3f} -> {target_fps:.3f} "
+                f"({source_chunk_frames} source frames per {target_frames}-frame output chunk)"
+            )
+        else:
+            source_chunk_frames = target_frames
+
+        # Split into chunks of source_chunk_frames (yields target_frames output frames)
         clips = []
 
         # Resume support: we keep a per-video `.progress` file in clips_dir
@@ -1386,7 +1620,7 @@ class RSLTXVPrepareDataset:
                     continue
 
         chunk_idx = resume_chunk_idx
-        start_frame = first_frame + chunk_idx * target_frames
+        start_frame = first_frame + chunk_idx * source_chunk_frames
 
         if chunk_idx > 0:
             logger.info(
@@ -1395,9 +1629,9 @@ class RSLTXVPrepareDataset:
             )
 
         while start_frame < last_frame:
-            end_frame = min(start_frame + target_frames, last_frame)
+            end_frame = min(start_frame + source_chunk_frames, last_frame)
             # Skip chunks that are too short (less than half the target)
-            if end_frame - start_frame < target_frames // 2:
+            if end_frame - start_frame < source_chunk_frames // 2:
                 break
 
             # Persist resume progress before doing any work on this chunk.
@@ -1502,32 +1736,35 @@ class RSLTXVPrepareDataset:
 
             if not out_path.exists():
                 start_time = start_frame / fps
-                num_frames = end_frame - start_frame
+                num_source_frames = end_frame - start_frame
+                clip_duration = num_source_frames / fps
 
-                if crop_mode == "full_frame":
-                    # No resize — keep source resolution, VAE encode step handles resize
-                    vf = None
-                else:
-                    # Crop to target aspect ratio at source resolution (no downscale)
+                # Build video filter chain
+                vf_parts = []
+                if crop_mode != "full_frame":
                     cx, cy, cw, ch = crop
-                    vf = f"crop={cw}:{ch}:{cx}:{cy}"
+                    vf_parts.append(f"crop={cw}:{ch}:{cx}:{cy}")
+                if use_fps_conversion:
+                    vf_parts.append(f"fps={target_fps}")
 
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", f"{start_time:.4f}",
                     "-i", str(video_path),
-                    "-frames:v", str(num_frames),
                 ]
-                if vf:
-                    cmd += ["-vf", vf]
+                # When decimating fps, use -t (duration) instead of -frames:v
+                # so ffmpeg reads all source frames before the fps filter drops them.
+                if use_fps_conversion:
+                    cmd += ["-t", f"{clip_duration:.4f}"]
+                else:
+                    cmd += ["-frames:v", str(num_source_frames)]
+                if vf_parts:
+                    cmd += ["-vf", ",".join(vf_parts)]
                 cmd += [
                     "-c:v", "libx264",
                     "-pix_fmt", "yuv420p",
                 ]
                 if with_audio:
-                    # Use -frames:v above to bound video; cap audio to same duration
-                    # so the clip ends cleanly when the video does.
-                    clip_duration = num_frames / fps
                     cmd += [
                         "-t", f"{clip_duration:.4f}",
                         "-c:a", "aac",

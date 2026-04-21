@@ -20,6 +20,35 @@ const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const lossData = {};
 let activeNodeId = null;
+let zoomVisible = 0; // 0 = auto (default trailing window), >0 = user-set number of steps to show
+
+canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (!activeNodeId || !lossData[activeNodeId]) return;
+    const data = lossData[activeNodeId];
+    const totalPts = data.steps.length;
+    if (totalPts < 2) return;
+
+    // Initialize zoom from current auto window if not yet set
+    if (zoomVisible <= 0) {
+        const interval = data.monitoring ? 100 : (data.checkpointInterval || 500);
+        zoomVisible = Math.min(totalPts, interval * 2);
+    }
+
+    // Zoom: scroll up = zoom in (fewer steps), scroll down = zoom out (more steps)
+    const factor = e.deltaY > 0 ? 1.25 : 0.8;
+    zoomVisible = Math.round(zoomVisible * factor);
+    zoomVisible = Math.max(20, Math.min(totalPts, zoomVisible));
+
+    drawChart();
+}, { passive: false });
+
+document.addEventListener("keydown", (e) => {
+    if (e.key === "f" || e.key === "F") {
+        zoomVisible = 0;
+        drawChart();
+    }
+});
 
 function connect() {
     const host = location.hostname || "127.0.0.1";
@@ -132,9 +161,10 @@ function drawChart() {
         allSmoothed[i] = alpha * allSmoothed[i - 1] + (1 - alpha) * allLosses[i];
     }
 
-    // Trailing window
-    const interval = data.monitoring ? 100 : (data.checkpointInterval || 500);
-    const maxVisible = interval * 2;
+    // Trailing window — use zoom level if user has scrolled, otherwise auto
+    const maxVisible = zoomVisible > 0
+        ? zoomVisible
+        : (data.monitoring ? 100 : (data.checkpointInterval || 500)) * 2;
     const visStart = Math.max(0, allSteps.length - maxVisible);
     const steps = allSteps.slice(visStart);
     const losses = allLosses.slice(visStart);
