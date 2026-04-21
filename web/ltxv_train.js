@@ -183,7 +183,7 @@ app.registerExtension({
 
             // Hide/show ROSE-specific settings based on optimizer selection
             const optimizerWidget = node.widgets.find((w) => w.name === "optimizer");
-            const roseWidgets = ["rose_stabilize"];
+            const roseWidgets = ["rose_stabilize", "rose_weight_decay", "rose_wd_schedule"];
             function updateRoseVisibility() {
                 const isRose = optimizerWidget && optimizerWidget.value === "rose";
                 for (const name of roseWidgets) {

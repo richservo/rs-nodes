@@ -112,9 +112,12 @@ class InProcessTrainer:
         dropout: float = 0.0,
         target_modules: list[str] | None = None,
         learning_rate: float = 1e-4,
+        lr_end: float = 0.0,
         total_steps: int = 2000,
         optimizer_type: str = "adamw8bit",
         rose_stabilize: bool = True,
+        rose_weight_decay: float = 1e-4,
+        rose_wd_schedule: bool = False,
         scheduler_type: str = "linear",
         lr_cycle_steps: int = 0,
         lr_cycle_decay: float = 1.0,
@@ -155,9 +158,12 @@ class InProcessTrainer:
         self._dropout = dropout
         self._target_modules = target_modules or ["attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0"]
         self._learning_rate = learning_rate
+        self._lr_end = lr_end
         self._total_steps = len(dataset) if auto_stop else total_steps
         self._optimizer_type = optimizer_type
         self._rose_stabilize = rose_stabilize
+        self._rose_weight_decay = rose_weight_decay
+        self._rose_wd_schedule = rose_wd_schedule
         self._scheduler_type = scheduler_type
         self._lr_cycle_decay = lr_cycle_decay
         self._max_grad_norm = max_grad_norm
@@ -1311,8 +1317,8 @@ class InProcessTrainer:
         elif opt_type == "rose":
             try:
                 from rose import Rose
-                logger.info(f"Using optimizer: ROSE (stateless, stabilize={self._rose_stabilize})")
-                return Rose(params, lr=self._learning_rate, stabilize=self._rose_stabilize)
+                logger.info(f"Using optimizer: ROSE (stabilize={self._rose_stabilize}, wd={self._rose_weight_decay}, wd_schedule={self._rose_wd_schedule})")
+                return Rose(params, lr=self._learning_rate, stabilize=self._rose_stabilize, weight_decay=self._rose_weight_decay, wd_schedule=self._rose_wd_schedule)
             except ImportError:
                 raise ImportError(
                     "Rose optimizer not installed. Run: pip install git+https://github.com/MatthewK78/Rose"
@@ -1331,14 +1337,17 @@ class InProcessTrainer:
         t = self._scheduler_type
         steps = self._lr_cycle  # schedule per LR cycle, not total training
 
+        lr_end = self._lr_end
+        end_factor = (lr_end / self._learning_rate) if lr_end > 0 and self._learning_rate > 0 else 0.1
+
         if t is None or t == "constant":
             return None
         elif t == "linear":
-            return LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=steps)
+            return LinearLR(optimizer, start_factor=1.0, end_factor=end_factor, total_iters=steps)
         elif t == "cosine":
-            return CosineAnnealingLR(optimizer, T_max=steps, eta_min=0)
+            return CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr_end)
         elif t == "cosine_with_restarts":
-            return CosineAnnealingWarmRestarts(optimizer, T_0=steps)
+            return CosineAnnealingWarmRestarts(optimizer, T_0=steps, eta_min=lr_end)
         elif t == "polynomial":
             return PolynomialLR(optimizer, total_iters=steps, power=1.0)
         else:
