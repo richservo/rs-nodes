@@ -2790,12 +2790,21 @@ class RSLTXVPrepareDataset:
                                 )
                                 break
                             if alt["hits_per_pos"] < _ext_prev_hits:
+                                # Strict decline = past the peak. The
+                                # character's window is receding; no gain
+                                # from pushing further.
                                 logger.info(
                                     f"Chunk {chunk_idx}: extended shift {_shift:+d} "
                                     f"({int(_frac * 100)}%) past the peak "
                                     f"({alt['hits_per_pos']}<{_ext_prev_hits}) — stopping extension"
                                 )
                                 break
+                            # Plateau (same hit count as previous step) is
+                            # NOT a stop — the character window may have a
+                            # brief dip and then improve again further out.
+                            # Register it as a candidate and keep pushing
+                            # until we find a strict improvement, a strict
+                            # decline, or 100% coverage.
                             logger.info(
                                 f"Chunk {chunk_idx}: extended shift {_shift:+d} "
                                 f"({int(_frac * 100)}%) candidate — hits "
