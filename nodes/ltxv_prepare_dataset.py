@@ -2739,6 +2739,83 @@ class RSLTXVPrepareDataset:
                                     f"({int(_frac * 100)}%) ineligible — {', '.join(_reasons)}"
                                 )
 
+                # If the best candidate so far is pinned at the outer
+                # boundary (±200%) AND still below 100% hits, the
+                # character's on-screen window probably extends further.
+                # Keep pushing in that direction in 25% steps until we
+                # hit 100%, hits drop (past the peak), bounds cross, or
+                # the extended cap (400% = 4 chunks) is reached.
+                if candidates and target_chunk_idx >= 0:
+                    candidates.sort(
+                        key=lambda c: (
+                            -c["hits_per_pos"],
+                            c["unknown_face_positions"],
+                            abs(c["shift"]),
+                        )
+                    )
+                    _best_now = candidates[0]
+                    _max_initial_shift = _snap8(int(_chunk_len * 2.0))
+                    if (
+                        _best_now["shift"] != 0
+                        and abs(_best_now["shift"]) >= _max_initial_shift
+                        and _best_now["hits_per_pos"] < n_pos
+                    ):
+                        _ext_sign = 1 if _best_now["shift"] > 0 else -1
+                        _ext_prev_hits = _best_now["hits_per_pos"]
+                        logger.info(
+                            f"Chunk {chunk_idx}: best so far pinned at "
+                            f"{_best_now['shift']:+d} ({_best_now['hits_per_pos']}/{n_pos} hits) — "
+                            f"extending search in that direction"
+                        )
+                        for _frac in (2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0):
+                            _shift = _ext_sign * _snap8(int(_chunk_len * _frac))
+                            _ns, _ne = start_frame + _shift, end_frame + _shift
+                            if _ns < first_frame or _ne > last_frame:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: extended shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) stopped — range "
+                                    f"[{_ns}, {_ne}) crosses video bounds"
+                                )
+                                break
+                            alt = _validate_at(_ns, _ne)
+                            _alt_hits = [i for i, h in enumerate(alt["pos_has_hit"]) if h]
+                            _alt_passes = (
+                                alt["hits_per_pos"] >= min_hits
+                                and alt["unknown_face_positions"] <= unknown_tol
+                            )
+                            if not _alt_passes:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: extended shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) ineligible — stopping extension"
+                                )
+                                break
+                            if alt["hits_per_pos"] < _ext_prev_hits:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: extended shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) past the peak "
+                                    f"({alt['hits_per_pos']}<{_ext_prev_hits}) — stopping extension"
+                                )
+                                break
+                            logger.info(
+                                f"Chunk {chunk_idx}: extended shift {_shift:+d} "
+                                f"({int(_frac * 100)}%) candidate — hits "
+                                f"{alt['hits_per_pos']}/{n_pos} at {_alt_hits}, "
+                                f"unknowns {alt['unknown_face_positions']}/{n_pos}"
+                            )
+                            candidates.append({
+                                "shift": _shift,
+                                "start": _ns,
+                                "end": _ne,
+                                **alt,
+                            })
+                            _ext_prev_hits = alt["hits_per_pos"]
+                            if alt["hits_per_pos"] == n_pos:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: extended shift {_shift:+d} "
+                                    f"reached 100% coverage — stopping extension"
+                                )
+                                break
+
                 if candidates:
                     # Best = max hits, tiebreak min unknowns, tiebreak shift
                     # magnitude ascending (stay closer to the original pool
@@ -2766,13 +2843,15 @@ class RSLTXVPrepareDataset:
                         unknown_face_positions = best["unknown_face_positions"]
                         pos_has_hit = best["pos_has_hit"]
                         # The shifted range crosses into neighbor pool
-                        # entries' territory. Shifts in (0, 100%] touch one
-                        # adjacent chunk; shifts in (100%, 200%] touch two.
-                        # Mark them all consumed so we don't re-extract
-                        # near-duplicate content from the same frames.
+                        # entries' territory. Mark every chunk that the
+                        # new range overlaps as consumed so we don't
+                        # re-extract near-duplicate content. A shift of
+                        # N chunk lengths touches up to ceil(N) neighbors
+                        # in the shift direction.
                         _shift = best["shift"]
                         _direction = 1 if _shift > 0 else -1
-                        _num_adj = 1 if abs(_shift) <= _chunk_len else 2
+                        # ceil(|shift| / chunk_len) = number of neighbors touched
+                        _num_adj = (abs(_shift) + _chunk_len - 1) // _chunk_len
                         for _offset in range(1, _num_adj + 1):
                             _adj_ci = chunk_idx + _direction * _offset
                             if _adj_ci >= 0:
