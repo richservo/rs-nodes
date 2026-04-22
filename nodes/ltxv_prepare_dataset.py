@@ -2358,9 +2358,9 @@ class RSLTXVPrepareDataset:
                                 face = _detect_face_dnn(sample)
                                 if face is not None:
                                     anchor = (sample, face)
-                    # Rescan — enumerate any additional characters and count
-                    # unknown faces.
-                    unknown = 0
+                    # Rescan — enumerate any additional characters and track
+                    # which sample positions contain unknown faces.
+                    unknown_at: list[int] = []
                     need_more = len(matched) < len(character_refs)
                     for idx, sp in enumerate(positions):
                         sample = self._read_frame(video_path, sp)
@@ -2377,14 +2377,15 @@ class RSLTXVPrepareDataset:
                                 if len(matched) == len(character_refs):
                                     need_more = False
                         if _has_unknown_face(sample, character_refs, face_similarity):
-                            unknown += 1
+                            unknown_at.append(idx)
                     return {
                         "sample_positions": positions,
                         "matched_names": matched,
                         "hits_per_pos": hits,
                         "pos_has_hit": has_hit,
                         "face_anchor": anchor,
-                        "unknown_face_positions": unknown,
+                        "unknown_face_positions": len(unknown_at),
+                        "unknown_at": unknown_at,
                     }
 
                 info = _validate_at(start_frame, end_frame)
@@ -2394,6 +2395,7 @@ class RSLTXVPrepareDataset:
                 face_anchor = info["face_anchor"]
                 unknown_face_positions = info["unknown_face_positions"]
                 pos_has_hit = info["pos_has_hit"]
+                unknown_at = info["unknown_at"]
 
                 min_hits = max(1, int(round(_pct * len(sample_positions))))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
@@ -2438,21 +2440,44 @@ class RSLTXVPrepareDataset:
                 half = n_pos / 2
                 all_front = hit_indices and all(i < half for i in hit_indices)
                 all_back = hit_indices and all(i >= half for i in hit_indices)
+                # Where are the unknown faces concentrated? Used both for
+                # stand-alone clean-up shifts and to bias the rescue direction
+                # order.
+                unknowns_all_front = unknown_at and all(i < half for i in unknown_at)
+                unknowns_all_back = unknown_at and all(i >= half for i in unknown_at)
                 shift_directions: list[int] = []
                 if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
                     if not original_passes:
-                        # Rescue: try both directions
-                        shift_directions = [-1, 1]
+                        # Rescue: try both directions. Prefer the one that
+                        # moves AWAY from concentrated extras so the first
+                        # attempt has the best chance of landing clean.
+                        if unknowns_all_front:
+                            shift_directions = [1, -1]
+                        elif unknowns_all_back:
+                            shift_directions = [-1, 1]
+                        else:
+                            shift_directions = [-1, 1]
                     elif all_front:
                         shift_directions = [-1]
                     elif all_back:
                         shift_directions = [1]
+                    elif unknown_at and (unknowns_all_front or unknowns_all_back):
+                        # Clean-up: character is balanced and original passes,
+                        # but there are unknown faces clustered at one end.
+                        # Shift AWAY from them to drop the extras entirely.
+                        shift_directions = [1] if unknowns_all_front else [-1]
 
                 if shift_directions:
-                    _reason = "rescue" if not original_passes else "balance"
+                    if not original_passes:
+                        _reason = "rescue"
+                    elif all_front or all_back:
+                        _reason = "balance"
+                    else:
+                        _reason = "cleanup"
                     logger.info(
                         f"Chunk {chunk_idx}: {_reason} — hits at positions "
-                        f"{hit_indices}/{n_pos} — trying expand-to-fit shifts"
+                        f"{hit_indices}/{n_pos}, unknowns at {unknown_at}/{n_pos} "
+                        f"— trying expand-to-fit shifts"
                     )
                     _chunk_len = end_frame - start_frame
                     _snap8 = lambda x: (x // 8) * 8
@@ -2484,13 +2509,19 @@ class RSLTXVPrepareDataset:
                                 alt["hits_per_pos"] >= min_hits
                                 and alt["unknown_face_positions"] <= allow_unknown_faces_in
                             )
-                            # In balance mode we insist on a better-balanced
-                            # outcome; in rescue mode we accept any position
-                            # that meets both gates.
-                            if original_passes:
-                                accept = _alt_passes and _alt_balanced
-                            else:
+                            # Accept criteria by mode:
+                            #   rescue: any position that meets both gates
+                            #   balance: passes AND is now better-balanced
+                            #   cleanup: passes AND has strictly fewer unknowns
+                            if _reason == "rescue":
                                 accept = _alt_passes
+                            elif _reason == "cleanup":
+                                accept = (
+                                    _alt_passes
+                                    and alt["unknown_face_positions"] < unknown_face_positions
+                                )
+                            else:  # balance
+                                accept = _alt_passes and _alt_balanced
                             if accept:
                                 logger.info(
                                     f"Chunk {chunk_idx}: shift accepted {_shift:+d} "
@@ -2526,9 +2557,17 @@ class RSLTXVPrepareDataset:
                                 _reasons.append(
                                     f"unknown {alt['unknown_face_positions']}>{allow_unknown_faces_in}"
                                 )
-                            if original_passes and not _alt_balanced:
+                            if _reason == "balance" and not _alt_balanced:
                                 _reasons.append(
                                     f"still imbalanced (positions {_alt_hits})"
+                                )
+                            if (
+                                _reason == "cleanup"
+                                and alt["unknown_face_positions"] >= unknown_face_positions
+                            ):
+                                _reasons.append(
+                                    f"unknowns not reduced "
+                                    f"({alt['unknown_face_positions']} vs {unknown_face_positions})"
                                 )
                             logger.info(
                                 f"Chunk {chunk_idx}: shift {_shift:+d} "
