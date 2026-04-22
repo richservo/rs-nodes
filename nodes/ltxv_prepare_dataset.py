@@ -44,7 +44,7 @@ def _emit_prepper_status(node_id, char_counts: dict[str, int], total_clips: int,
         return
     lines = []
     for name in sorted(char_counts):
-        lines.append(f"  {name}: {char_counts[name]}")
+        lines.append(f"{name}: {char_counts[name]}")
     if max_samples > 0:
         lines.append(f"total: {total_clips}/{max_samples}")
     else:
