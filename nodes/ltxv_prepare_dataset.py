@@ -69,6 +69,162 @@ def _list_text_encoder_dirs() -> list[str]:
     return dirs
 
 
+# Whisper speech transcription (lazy-loaded)
+_whisper_model = None
+_WHISPER_MODEL_SIZE = "base"  # small footprint, good enough for word boundaries
+_WORD_CUT_THRESHOLD = 0.3  # seconds — if last word ends within this of clip end, it's likely cut
+
+# Demucs vocal isolation (lazy-loaded)
+_demucs_model = None
+_demucs_device = None
+
+
+def _get_whisper_model():
+    """Load Whisper model on first use. Cached after first call."""
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        import whisper
+        logger.info(f"Loading Whisper model ({_WHISPER_MODEL_SIZE})...")
+        _whisper_model = whisper.load_model(_WHISPER_MODEL_SIZE)
+        logger.info("Whisper model loaded")
+        return _whisper_model
+    except ImportError:
+        logger.error("openai-whisper not installed. Run: pip install openai-whisper")
+        return None
+
+
+def _isolate_vocals(clip_path: Path) -> Path | None:
+    """Use Demucs to isolate vocals from a clip's audio.
+    Returns path to a temporary WAV file with vocals only,
+    or None if demucs isn't available or isolation fails."""
+    global _demucs_model, _demucs_device
+    try:
+        import torchaudio
+        from demucs.pretrained import get_model
+        from demucs.apply import apply_model
+    except ImportError:
+        return None
+
+    try:
+        # Load demucs model (cached after first call)
+        if _demucs_model is None:
+            logger.info("Loading Demucs model for vocal isolation...")
+            _demucs_model = get_model("htdemucs")
+            _demucs_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info("Demucs model loaded")
+
+        # Extract audio from clip to WAV
+        audio_tmp = clip_path.with_suffix(".tmp_audio.wav")
+        ffmpeg_result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(clip_path),
+             "-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le",
+             str(audio_tmp)],
+            capture_output=True, text=True,
+        )
+        if ffmpeg_result.returncode != 0 or not audio_tmp.exists():
+            return None
+
+        # Load and separate
+        waveform, sr = torchaudio.load(str(audio_tmp))
+        # Demucs expects [batch, channels, samples]
+        waveform = waveform.unsqueeze(0)
+
+        with torch.no_grad():
+            sources = apply_model(_demucs_model, waveform, device=_demucs_device)
+
+        # sources shape: [batch, n_sources, channels, samples]
+        # htdemucs sources: drums, bass, other, vocals (index 3)
+        vocals = sources[0, 3]  # [channels, samples]
+
+        # Save vocals to temp file
+        vocals_path = clip_path.with_suffix(".tmp_vocals.wav")
+        torchaudio.save(str(vocals_path), vocals.cpu(), sr)
+
+        # Clean up intermediate audio
+        try:
+            audio_tmp.unlink()
+        except OSError:
+            pass
+
+        return vocals_path
+
+    except Exception as e:
+        logger.warning(f"Demucs vocal isolation failed for {clip_path.name}: {e}")
+        # Clean up on failure
+        for tmp in [clip_path.with_suffix(".tmp_audio.wav"),
+                    clip_path.with_suffix(".tmp_vocals.wav")]:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return None
+
+
+def _transcribe_clip(clip_path: Path) -> dict | None:
+    """Run Demucs vocal isolation then Whisper on a clip.
+    Returns dict with 'text', 'words' list of {word, start, end}, 'duration'.
+    Returns None if transcription fails or no speech detected."""
+    model = _get_whisper_model()
+    if model is None:
+        return None
+
+    import whisper
+
+    # Isolate vocals to remove music/sfx before transcribing
+    vocals_path = _isolate_vocals(clip_path)
+    audio_source = str(vocals_path) if vocals_path else str(clip_path)
+
+    try:
+        result = whisper.transcribe(model, audio_source, word_timestamps=True)
+    except Exception as e:
+        logger.warning(f"Whisper transcription failed for {clip_path.name}: {e}")
+        return None
+    finally:
+        # Clean up vocals temp file
+        if vocals_path:
+            try:
+                vocals_path.unlink()
+            except OSError:
+                pass
+
+    text = result.get("text", "").strip()
+    if not text:
+        return None
+
+    # Detect Whisper hallucinations — non-Latin gibberish when there's no speech
+    latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_alpha = sum(1 for c in text if c.isalpha())
+    if total_alpha > 0 and latin_chars / total_alpha < 0.5:
+        logger.info(f"  Whisper hallucination detected, no usable speech: {text[:60]}")
+        return {"text": "", "words": [], "duration": 0.0, "hallucination": True}
+
+    # Extract word-level timestamps
+    words = []
+    for seg in result.get("segments", []):
+        for w in seg.get("words", []):
+            words.append({
+                "word": w["word"].strip(),
+                "start": w["start"],
+                "end": w["end"],
+            })
+
+    # Get clip duration via ffprobe
+    duration = 0.0
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(clip_path)],
+            capture_output=True, text=True,
+        )
+        duration = float(probe.stdout.strip())
+    except (ValueError, OSError):
+        pass
+
+    return {"text": text, "words": words, "duration": duration}
+
+
 # OpenCV DNN face detector
 _face_net = None
 _face_detector_checked = False
@@ -363,6 +519,7 @@ class RSLTXVPrepareDataset:
                 "ollama_model": ("STRING", {"default": "gemma4:26b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
                 "skip_id_pass": ("BOOLEAN", {"default": False, "tooltip": "Skip cast/location ID passes — send ALL reference images directly to the captioner and let it identify characters and locations itself in one shot."}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
+                "transcribe_speech": ("BOOLEAN", {"default": False, "tooltip": "Transcribe speech in clips using Whisper and append to captions. Also adjusts clip boundaries to avoid cutting words."}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0, "step": 0.001, "tooltip": "Target framerate for output clips (0=keep source fps). Drops frames to match target without affecting audio speed."}),
                 "max_samples": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Maximum clips in dataset (0=unlimited). When set, enables rolling dataset — random videos are selected and clipped until max_samples is reached. Deleted clips are blacklisted and backfilled."}),
@@ -409,6 +566,7 @@ class RSLTXVPrepareDataset:
         load_text_encoder_in_8bit: bool = True,
         crop_mode: str = "face_crop",
         face_detection: bool = True,
+        transcribe_speech: bool = False,
         target_face=None,
         character_refs_folder: str = "",
         location_refs_folder: str = "",
@@ -514,13 +672,18 @@ class RSLTXVPrepareDataset:
 
         # Load rejected clips so we don't re-process them
         rejected_path = output_dir / "rejected.json"
-        rejected_clips = set()
+        rejected_clips = set()       # source_file and media_path strings
+        rejected_chunk_files = set()  # specific clip filenames to exclude from chunk pool
         if rejected_path.exists():
             try:
                 with open(rejected_path) as rf:
                     for r in json.load(rf):
                         rejected_clips.add(r.get("media_path", ""))
                         rejected_clips.add(r.get("source_file", ""))
+                        # Track specific clip filenames for chunk-level rejection
+                        mp = r.get("media_path", "")
+                        if mp:
+                            rejected_chunk_files.add(Path(mp).name)
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -582,6 +745,118 @@ class RSLTXVPrepareDataset:
                 with open(rejected_path, "w") as rf:
                     json.dump(existing_rejected, rf, indent=2)
 
+        # Reconcile: add dataset entries for any clips on disk missing from JSON.
+        # Clips on disk are the source of truth.
+        known_media = {e["media_path"] for e in existing_entries}
+        orphans_added = 0
+        orphan_clips = []
+        for clip_file in sorted(clips_dir.iterdir()):
+            if clip_file.suffix != ".mp4" or str(clip_file) in known_media:
+                continue
+            # Derive source file from clip name (strip _chunkNNNN suffix)
+            stem = clip_file.stem
+            source_file = ""
+            if "_chunk" in stem:
+                base = stem.rsplit("_chunk", 1)[0]
+                for item in media_files:
+                    if item["path"].stem == base:
+                        source_file = str(item["path"])
+                        break
+            entry = {"caption": "", "media_path": str(clip_file), "source_file": source_file}
+            existing_entries.append(entry)
+            orphan_clips.append((entry, clip_file))
+            orphans_added += 1
+        if orphans_added:
+            logger.info(f"Reconciling {orphans_added} clips on disk missing from dataset.json")
+            for entry, clip_file in orphan_clips:
+                # Detect characters from clip's first frame
+                if character_refs:
+                    frame = self._read_frame(clip_file, 0)
+                    if frame is not None:
+                        chars = self._match_characters_in_frame(
+                            frame, character_refs, face_similarity,
+                            clip_vision=clip_vision,
+                            first_match_only=False,
+                        )
+                        if chars:
+                            entry["characters"] = sorted(chars)
+                            logger.info(f"  Detected {', '.join(sorted(chars))} in {clip_file.name}")
+                # Transcribe if speech transcription is enabled
+                if transcribe_speech and not entry.get("transcript"):
+                    tr = _transcribe_clip(clip_file)
+                    if tr and tr.get("hallucination"):
+                        logger.info(f"  No usable speech, deleting orphan: {clip_file.name}")
+                        try:
+                            clip_file.unlink()
+                        except OSError:
+                            pass
+                        existing_entries.remove(entry)
+                        orphans_added -= 1
+                        continue
+                    if tr and tr["text"]:
+                        entry["transcript"] = tr["text"]
+                        logger.info(f"  Transcribed {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
+            with open(dataset_json_path, "w") as f:
+                json.dump(existing_entries, f, indent=2)
+            if orphans_added > 0:
+                logger.info(f"Reconciled {orphans_added} clips into dataset.json")
+
+        # Backfill characters and transcripts for any existing entries missing them
+        if character_refs:
+            chars_backfilled = 0
+            for entry in existing_entries:
+                if entry.get("characters"):
+                    continue
+                clip_file = Path(entry["media_path"])
+                if not clip_file.exists():
+                    continue
+                frame = self._read_frame(clip_file, 0)
+                if frame is not None:
+                    chars = self._match_characters_in_frame(
+                        frame, character_refs, face_similarity,
+                        clip_vision=clip_vision,
+                        first_match_only=False,
+                    )
+                    if chars:
+                        entry["characters"] = sorted(chars)
+                        chars_backfilled += 1
+            if chars_backfilled:
+                with open(dataset_json_path, "w") as f:
+                    json.dump(existing_entries, f, indent=2)
+                logger.info(f"Backfilled characters for {chars_backfilled} entries")
+
+        if transcribe_speech:
+            backfilled = 0
+            hallucination_purge = []
+            for entry in existing_entries:
+                if entry.get("transcript"):
+                    continue
+                clip_file = Path(entry["media_path"])
+                if not clip_file.exists():
+                    continue
+                tr = _transcribe_clip(clip_file)
+                if tr and tr.get("hallucination"):
+                    logger.info(f"  No usable speech, deleting: {clip_file.name}")
+                    try:
+                        clip_file.unlink()
+                    except OSError:
+                        pass
+                    hallucination_purge.append(entry)
+                    continue
+                if tr and tr["text"]:
+                    entry["transcript"] = tr["text"]
+                    backfilled += 1
+                    logger.info(f"  Backfill transcript {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
+            for entry in hallucination_purge:
+                existing_entries.remove(entry)
+            if backfilled or hallucination_purge:
+                with open(dataset_json_path, "w") as f:
+                    json.dump(existing_entries, f, indent=2)
+                if backfilled:
+                    logger.info(f"Backfilled {backfilled} missing transcripts")
+                if hallucination_purge:
+                    logger.info(f"Purged {len(hallucination_purge)} clips with no usable speech")
+
         # --- Rolling dataset budget check ---
         # When max_samples is set, skip clip extraction entirely if we're full.
         if max_samples > 0 and len(existing_entries) >= max_samples:
@@ -598,11 +873,9 @@ class RSLTXVPrepareDataset:
 
             if use_rolling:
                 # ---- Rolling dataset mode ----
-                clips_budget = max_samples - len(existing_entries)
-                logger.info(
-                    f"Rolling dataset mode: need {clips_budget} more clips "
-                    f"({len(existing_entries)}/{max_samples} slots used)"
-                )
+                # Balanced per-character budgets when character_refs_folder is set.
+                char_names = sorted(character_refs.keys()) if character_refs else []
+                per_char_quota = {}
 
                 # Use media_folder as the source pool — video-only for rolling
                 # mode because images have nothing to resume from.
@@ -612,9 +885,122 @@ class RSLTXVPrepareDataset:
                 ]
                 if not pool_media:
                     logger.warning(f"No videos found in media_folder: {media_folder}")
-                else:
-                    # Load video_progress.json — tracks per-source progress so we
-                    # can resume from where we left off and avoid reprocessing.
+
+                # Outer loop: sweep deletions → rebalance → extract → check equilibrium → repeat
+                balance_pass = 0
+                total_clips_produced = 0
+                while pool_media:
+                    balance_pass += 1
+
+                    # Sweep for clips deleted from disk since last pass
+                    sweep_valid = []
+                    sweep_removed = 0
+                    sweep_rejected = []
+                    for entry in existing_entries:
+                        cp = Path(entry["media_path"])
+                        if cp.exists():
+                            sweep_valid.append(entry)
+                        else:
+                            sweep_removed += 1
+                            logger.info(f"Clip deleted, rejecting: {cp.name}")
+                            rejected_chunk_files.add(cp.name)
+                            rej = {"source_file": entry.get("source_file", ""),
+                                   "media_path": str(cp), "reason": "user_deleted"}
+                            stem = cp.stem
+                            if "_chunk" in stem:
+                                try:
+                                    rej["chunk_idx"] = int(stem.rsplit("_chunk", 1)[1])
+                                except (ValueError, IndexError):
+                                    pass
+                            sweep_rejected.append(rej)
+                    if sweep_removed:
+                        existing_entries = sweep_valid
+                        with open(dataset_json_path, "w") as f:
+                            json.dump(existing_entries, f, indent=2)
+                        rej_list: list[dict] = []
+                        if rejected_path.exists():
+                            try:
+                                with open(rejected_path) as rf:
+                                    rej_list = json.load(rf)
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        rej_list.extend(sweep_rejected)
+                        with open(rejected_path, "w") as rf:
+                            json.dump(rej_list, rf, indent=2)
+                        logger.info(f"Swept {sweep_removed} deleted clips into rejected.json")
+
+                    clips_budget = max_samples - len(existing_entries)
+
+                    # Compute per-character quotas and counts
+                    char_counts = {}
+                    if char_names and max_samples > 0:
+                        quota_each = max_samples // len(char_names)
+                        remainder = max_samples % len(char_names)
+                        per_char_quota = {}
+                        for ci, name in enumerate(char_names):
+                            per_char_quota[name] = quota_each + (1 if ci < remainder else 0)
+                            char_counts[name] = 0
+                        for entry in existing_entries:
+                            for name in entry.get("characters", []):
+                                if name in char_counts:
+                                    char_counts[name] += 1
+                        logger.info(
+                            f"Pass {balance_pass} — {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
+                        )
+
+                        # Rebalance: remove excess clips from over-quota characters
+                        over_quota = {n for n in char_names if char_counts[n] > per_char_quota[n]}
+                        under_quota = {n for n in char_names if char_counts[n] < per_char_quota[n]}
+                        if over_quota and under_quota:
+                            removed_for_balance = 0
+                            removable: list[dict] = []
+                            for entry in existing_entries:
+                                entry_chars = set(entry.get("characters", []))
+                                if not entry_chars:
+                                    continue
+                                if entry_chars.issubset(over_quota):
+                                    excess = max(char_counts[c] - per_char_quota[c] for c in entry_chars)
+                                    removable.append((excess, entry))
+                            removable.sort(key=lambda x: -x[0])
+
+                            for _, entry in removable:
+                                entry_chars = set(entry.get("characters", []))
+                                if not all(char_counts.get(c, 0) > per_char_quota.get(c, 0) for c in entry_chars):
+                                    continue
+                                clip_path = Path(entry["media_path"])
+                                if clip_path.exists():
+                                    clip_path.unlink()
+                                    logger.info(f"  Rebalance: removed {clip_path.name} ({', '.join(sorted(entry_chars))})")
+                                rejected_chunk_files.add(clip_path.name)
+                                for c in entry_chars:
+                                    if c in char_counts:
+                                        char_counts[c] -= 1
+                                existing_entries.remove(entry)
+                                removed_for_balance += 1
+
+                            if removed_for_balance:
+                                clips_budget = max_samples - len(existing_entries)
+                                with open(dataset_json_path, "w") as f:
+                                    json.dump(existing_entries, f, indent=2)
+                                logger.info(
+                                    f"Rebalanced: removed {removed_for_balance} clips, "
+                                    f"{clips_budget} slots now available"
+                                )
+                                logger.info(
+                                    f"After rebalance: {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
+                                )
+
+                    clips_budget = max_samples - len(existing_entries)
+                    if clips_budget <= 0:
+                        logger.info(f"Dataset at capacity ({len(existing_entries)}/{max_samples})")
+                        break
+
+                    logger.info(
+                        f"Rolling dataset: need {clips_budget} more clips "
+                        f"({len(existing_entries)}/{max_samples} slots used)"
+                    )
+
+                    # Load video_progress.json
                     vp_path = output_dir / "video_progress.json"
                     video_progress: dict[str, dict] = {}
                     if vp_path.exists():
@@ -624,8 +1010,6 @@ class RSLTXVPrepareDataset:
                         except (json.JSONDecodeError, KeyError):
                             video_progress = {}
 
-                    # Filter out fully-completed videos, non-existent files,
-                    # and source videos already fully rejected.
                     incomplete = [
                         item for item in pool_media
                         if video_progress.get(item["path"].name, {}).get("status") != "complete"
@@ -635,121 +1019,134 @@ class RSLTXVPrepareDataset:
 
                     if not incomplete:
                         logger.info("All source videos marked complete — nothing left to draw from")
-                    else:
-                        # Shuffle so each run distributes clips across different
-                        # source videos rather than draining the same one repeatedly.
-                        random.shuffle(incomplete)
+                        break
 
-                        pbar = comfy.utils.ProgressBar(clips_budget)
-                        clips_produced_this_run = 0
+                    pbar = comfy.utils.ProgressBar(clips_budget)
+                    clips_produced_this_pass = 0
+                    known_paths = {e["media_path"] for e in existing_entries}
 
-                        for item in incomplete:
-                            if clips_budget <= 0:
-                                break
+                    # Build chunk pool
+                    chunk_pool: list[tuple[dict, int]] = []
+                    for item in incomplete:
+                        cap = cv2.VideoCapture(str(item["path"]))
+                        if not cap.isOpened():
+                            continue
+                        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                        vid_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.release()
+                        if vid_total <= 0:
+                            continue
 
-                            source_path = str(item["path"])
+                        skip_s = int(round(skip_start_seconds * vid_fps))
+                        skip_e = int(round(skip_end_seconds * vid_fps))
+                        ff = max(0, skip_s)
+                        lf = max(ff, vid_total - skip_e)
+                        if target_fps > 0 and abs(vid_fps - target_fps) > 0.5:
+                            vid_chunk_frames = int(round(target_frames * (vid_fps / target_fps)))
+                        else:
+                            vid_chunk_frames = target_frames
+                        n_chunks = (lf - ff) // vid_chunk_frames
 
-                            results = self._process_video(
-                                item["path"], clips_dir, target_w, target_h, target_frames,
-                                face_detection,
-                                target_embedding=target_embedding,
-                                face_similarity=face_similarity,
-                                crop_mode=crop_mode, with_audio=with_audio,
-                                character_refs=character_refs,
-                                clip_vision=clip_vision,
-                                skip_start_seconds=skip_start_seconds,
-                                skip_end_seconds=skip_end_seconds,
-                                target_fps=target_fps,
-                            )
+                        for ci in range(n_chunks):
+                            clip_file = clips_dir / f"{item['path'].stem}_chunk{ci:04d}.mp4"
+                            if not clip_file.exists() and clip_file.name not in rejected_chunk_files:
+                                chunk_pool.append((item, ci))
 
-                            # _process_video returns ALL clips (existing + new).
-                            # Only add ones not already tracked in existing_entries.
-                            known_paths = {e["media_path"] for e in existing_entries}
-                            new_from_video = [r for r in results if str(r) not in known_paths]
-                            produced_clips = bool(new_from_video) or bool(results)
-                            for result in results:
-                                if clips_budget <= 0:
-                                    break
-                                if str(result) in known_paths:
-                                    continue
-                                entry = {
-                                    "caption": "",
-                                    "media_path": str(result),
-                                    "source_file": source_path,
-                                }
-                                if ref_folder and ref_folder.exists():
-                                    for ext in VIDEO_EXTENSIONS:
-                                        ref_file = ref_folder / (result.stem + ext)
-                                        if ref_file.exists():
-                                            entry["reference_path"] = str(ref_file)
-                                            break
-                                existing_entries.append(entry)
-                                known_paths.add(str(result))
-                                clips_budget -= 1
-                                clips_produced_this_run += 1
-                                pbar.update_absolute(clips_produced_this_run, max_samples - len(existing_entries) + clips_produced_this_run)
+                    random.shuffle(chunk_pool)
+                    logger.info(f"Chunk pool: {len(chunk_pool)} available chunks across {len(incomplete)} videos")
 
-                            if not produced_clips:
-                                # Source video yielded nothing — log to rejected.json
-                                existing_rejected = []
-                                if rejected_path.exists():
-                                    try:
-                                        with open(rejected_path) as rf:
-                                            existing_rejected = json.load(rf)
-                                    except (json.JSONDecodeError, KeyError):
-                                        pass
-                                existing_rejected.append({
-                                    "source_file": source_path,
-                                    "reason": "no clips produced (all chunks rejected)",
-                                })
-                                with open(rejected_path, "w") as rf:
-                                    json.dump(existing_rejected, rf, indent=2)
-                                logger.info(f"No clips from {item['path'].name} — added to rejected.json")
+                    while clips_budget > 0 and chunk_pool:
+                        item, ci = chunk_pool.pop()
+                        source_path = str(item["path"])
 
-                            # Update video_progress.json for this source.
-                            # Derive last_chunk_idx from the .progress file written
-                            # by _process_video (it stores the NEXT chunk to process).
-                            progress_file = clips_dir / f"{item['path'].stem}.progress"
-                            last_chunk_idx = 0
-                            vid_status = "partial"
-                            if progress_file.exists():
-                                try:
-                                    last_chunk_idx = int(progress_file.read_text().strip())
-                                except (ValueError, OSError):
-                                    pass
-
-                            # Read video metadata to know total frames for status check
-                            cap = cv2.VideoCapture(str(item["path"]))
-                            if cap.isOpened():
-                                fps_raw = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                                total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                                cap.release()
-                                total_chunks = (total_frames_raw + target_frames - 1) // target_frames
-                                if last_chunk_idx >= total_chunks:
-                                    vid_status = "complete"
-                                video_progress[item["path"].name] = {
-                                    "total_frames": total_frames_raw,
-                                    "fps": round(fps_raw, 3),
-                                    "last_chunk_idx": last_chunk_idx,
-                                    "status": vid_status,
-                                }
-                            else:
-                                video_progress[item["path"].name] = {
-                                    "last_chunk_idx": last_chunk_idx,
-                                    "status": vid_status,
-                                }
-
-                            with open(vp_path, "w") as vpf:
-                                json.dump(video_progress, vpf, indent=2)
-
-                            # Save dataset.json after each source so progress persists
-                            with open(dataset_json_path, "w") as f:
-                                json.dump(existing_entries, f, indent=2)
-
-                        logger.info(
-                            f"Rolling dataset: added {clips_produced_this_run} clips "
-                            f"({len(existing_entries)}/{max_samples} total)"
+                        results = self._process_video(
+                            item["path"], clips_dir, target_w, target_h, target_frames,
+                            face_detection,
+                            target_embedding=target_embedding,
+                            face_similarity=face_similarity,
+                            crop_mode=crop_mode, with_audio=with_audio,
+                            character_refs=character_refs,
+                            clip_vision=clip_vision,
+                            skip_start_seconds=skip_start_seconds,
+                            skip_end_seconds=skip_end_seconds,
+                            target_fps=target_fps,
+                            transcribe_speech=transcribe_speech,
+                            target_chunk_idx=ci,
                         )
+
+                        for result_path, result_transcript in results:
+                            if str(result_path) in known_paths:
+                                continue
+                            clip_chars = getattr(self, "_clip_characters", {}).get(str(result_path), [])
+                            if per_char_quota and clip_chars:
+                                if all(char_counts.get(c, 0) >= per_char_quota.get(c, 0) for c in clip_chars):
+                                    try:
+                                        result_path.unlink()
+                                    except OSError:
+                                        pass
+                                    continue
+                            entry = {
+                                "caption": "",
+                                "media_path": str(result_path),
+                                "source_file": source_path,
+                            }
+                            if result_transcript:
+                                entry["transcript"] = result_transcript
+                            if clip_chars:
+                                entry["characters"] = clip_chars
+                            if ref_folder and ref_folder.exists():
+                                for ext in VIDEO_EXTENSIONS:
+                                    ref_file = ref_folder / (result_path.stem + ext)
+                                    if ref_file.exists():
+                                        entry["reference_path"] = str(ref_file)
+                                        break
+                            existing_entries.append(entry)
+                            known_paths.add(str(result_path))
+                            for c in clip_chars:
+                                if c in char_counts:
+                                    char_counts[c] += 1
+                            clips_budget -= 1
+                            clips_produced_this_pass += 1
+                            total_clips_produced += 1
+                            pbar.update_absolute(clips_produced_this_pass, max_samples - len(existing_entries) + clips_produced_this_pass)
+
+                        # Save dataset.json after each chunk
+                        with open(dataset_json_path, "w") as f:
+                            json.dump(existing_entries, f, indent=2)
+
+                    logger.info(
+                        f"Pass {balance_pass}: added {clips_produced_this_pass} clips "
+                        f"({len(existing_entries)}/{max_samples} total)"
+                    )
+                    if per_char_quota:
+                        logger.info(
+                            f"Counts: {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
+                        )
+
+                    # Check if we need another rebalance pass
+                    if clips_produced_this_pass == 0:
+                        logger.info("No new clips produced this pass, stopping")
+                        break
+                    if not per_char_quota:
+                        break  # No character balancing needed
+                    # Check if balanced — all characters within 1 of quota
+                    all_balanced = all(
+                        abs(char_counts.get(n, 0) - per_char_quota.get(n, 0)) <= 1
+                        for n in char_names
+                    )
+                    if all_balanced or len(existing_entries) >= max_samples:
+                        break
+                    # Still imbalanced — check if any over-quota chars exist to rebalance
+                    over_quota = {n for n in char_names if char_counts[n] > per_char_quota[n]}
+                    under_quota = {n for n in char_names if char_counts[n] < per_char_quota[n]}
+                    if not (over_quota and under_quota):
+                        break  # Can't rebalance further
+                    logger.info("Characters still imbalanced, starting rebalance pass...")
+
+                if per_char_quota:
+                    logger.info(
+                        f"Final counts: {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
+                    )
 
             else:
                 # ---- Classic sequential mode ----
@@ -797,16 +1194,22 @@ class RSLTXVPrepareDataset:
                                 skip_start_seconds=skip_start_seconds,
                                 skip_end_seconds=skip_end_seconds,
                                 target_fps=target_fps,
+                                transcribe_speech=transcribe_speech,
                             )
                             if results:
                                 produced_clips = True
-                            for result in results:
+                            for result_path, result_transcript in results:
                                 if max_samples > 0 and len(existing_entries) >= max_samples:
                                     break
-                                entry = {"caption": "", "media_path": str(result), "source_file": source_path}
+                                entry = {"caption": "", "media_path": str(result_path), "source_file": source_path}
+                                if result_transcript:
+                                    entry["transcript"] = result_transcript
+                                clip_chars = getattr(self, "_clip_characters", {}).get(str(result_path), [])
+                                if clip_chars:
+                                    entry["characters"] = clip_chars
                                 if ref_folder and ref_folder.exists():
                                     for ext in VIDEO_EXTENSIONS:
-                                        ref_file = ref_folder / (result.stem + ext)
+                                        ref_file = ref_folder / (result_path.stem + ext)
                                         if ref_file.exists():
                                             entry["reference_path"] = str(ref_file)
                                             break
@@ -844,6 +1247,48 @@ class RSLTXVPrepareDataset:
                         with open(dataset_json_path, "w") as f:
                             json.dump(existing_entries, f, indent=2)
 
+        # Post-extraction cleanup: remove entries for clips deleted during the run
+        # and add them to rejected.json so they won't be re-extracted
+        post_valid = []
+        post_removed = 0
+        post_rejected = []
+        for entry in existing_entries:
+            clip_path = Path(entry["media_path"])
+            if clip_path.exists():
+                post_valid.append(entry)
+            else:
+                post_removed += 1
+                logger.info(f"Clip deleted during run, rejecting: {clip_path.name}")
+                rej_entry: dict = {
+                    "source_file": entry.get("source_file", ""),
+                    "media_path": str(clip_path),
+                    "reason": "user_deleted",
+                }
+                stem = clip_path.stem
+                if "_chunk" in stem:
+                    try:
+                        chunk_num = int(stem.rsplit("_chunk", 1)[1])
+                        rej_entry["chunk_idx"] = chunk_num
+                    except (ValueError, IndexError):
+                        pass
+                post_rejected.append(rej_entry)
+        if post_removed:
+            existing_entries = post_valid
+            with open(dataset_json_path, "w") as f:
+                json.dump(existing_entries, f, indent=2)
+            # Append to rejected.json
+            existing_rejected_list: list[dict] = []
+            if rejected_path.exists():
+                try:
+                    with open(rejected_path) as rf:
+                        existing_rejected_list = json.load(rf)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            existing_rejected_list.extend(post_rejected)
+            with open(rejected_path, "w") as rf:
+                json.dump(existing_rejected_list, rf, indent=2)
+            logger.info(f"Removed {post_removed} deleted clips, added to rejected.json ({len(existing_entries)} remain)")
+
         if not existing_entries:
             raise RuntimeError(
                 "No usable clips produced. All media was discarded "
@@ -851,6 +1296,27 @@ class RSLTXVPrepareDataset:
             )
 
         clip_paths = [Path(e["media_path"]) for e in existing_entries]
+
+        # Transcripts are now stored directly in dataset entries during extraction
+
+        # Unload whisper + demucs before captioning to free VRAM
+        global _whisper_model, _demucs_model, _demucs_device
+        freed = []
+        if _whisper_model is not None:
+            del _whisper_model
+            _whisper_model = None
+            freed.append("Whisper")
+        if _demucs_model is not None:
+            del _demucs_model
+            _demucs_model = None
+            _demucs_device = None
+            freed.append("Demucs")
+        if freed:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info(f"Unloaded {' + '.join(freed)} to free VRAM for captioning")
 
         # --- PHASE 2: Caption uncaptioned clips (with LLM-based QC if target face provided) ---
         # Encode target face as base64 for Ollama verification
@@ -924,6 +1390,20 @@ class RSLTXVPrepareDataset:
         with open(dataset_json_path) as f:
             existing_entries = json.load(f)
 
+        # Merge transcripts into captions for text encoding.
+        # The combined text goes into a separate "caption_with_transcript" field
+        # so the original caption stays clean.  For subprocess encoding we
+        # temporarily write the combined text into "caption" then restore it.
+        if transcribe_speech:
+            for entry in existing_entries:
+                transcript = entry.get("transcript", "")
+                if transcript:
+                    cap = entry.get("caption", "")
+                    entry["_caption_original"] = cap
+                    entry["caption"] = f'{cap} Dialogue: "{transcript}"' if cap else f'Dialogue: "{transcript}"'
+            with open(dataset_json_path, "w") as f:
+                json.dump(existing_entries, f, indent=2)
+
         conditions_dir = output_dir / "conditions"
         latents_dir = output_dir / "latents"
         need_subprocess = False
@@ -979,6 +1459,14 @@ class RSLTXVPrepareDataset:
 
             if returncode != 0:
                 raise RuntimeError(f"Dataset preprocessing failed with return code {returncode}")
+
+        # Restore original captions after encoding (remove merged transcript)
+        if transcribe_speech:
+            for entry in existing_entries:
+                if "_caption_original" in entry:
+                    entry["caption"] = entry.pop("_caption_original")
+            with open(dataset_json_path, "w") as f:
+                json.dump(existing_entries, f, indent=2)
 
         return (str(output_dir), str(dataset_json_path))
 
@@ -1530,9 +2018,14 @@ class RSLTXVPrepareDataset:
         skip_start_seconds: float = 0.0,
         skip_end_seconds: float = 0.0,
         target_fps: float = 0.0,
+        transcribe_speech: bool = False,
+        max_new_clips: int = 0,
+        target_chunk_idx: int = -1,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
         Returns list of output clip paths (skips chunks with no face when face_detection is on).
+        max_new_clips: stop after producing this many NEW clips (0=unlimited).
+        target_chunk_idx: if >= 0, jump straight to this chunk and process only it.
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -1547,6 +2040,11 @@ class RSLTXVPrepareDataset:
 
         if total_frames <= 0:
             return []
+
+        # Per-clip character tracking for balanced sampling.
+        # Populated when character_refs is set; keyed by clip path string.
+        if not hasattr(self, "_clip_characters"):
+            self._clip_characters = {}
 
         # Apply intro / outro skip ranges (useful for cutting show intros and
         # end credits that would otherwise be duplicated across every episode).
@@ -1578,6 +2076,7 @@ class RSLTXVPrepareDataset:
 
         # Split into chunks of source_chunk_frames (yields target_frames output frames)
         clips = []
+        new_clips_produced = 0
 
         # Resume support: we keep a per-video `.progress` file in clips_dir
         # that records the NEXT chunk index to process.  Unlike a glob of
@@ -1599,53 +2098,66 @@ class RSLTXVPrepareDataset:
             ),
             key=lambda p: p.name,
         )
-        clips.extend(existing_chunks)
+        # In targeted mode, don't return existing chunks — only the targeted one.
+        # Otherwise all on-disk clips get added as new entries, blowing past max_samples.
+        if target_chunk_idx < 0:
+            clips.extend((p, None) for p in existing_chunks)
 
-        resume_chunk_idx = 0
-        if progress_file.exists():
-            try:
-                resume_chunk_idx = int(progress_file.read_text().strip())
-            except (ValueError, OSError):
-                resume_chunk_idx = 0
-        # Fallback: if no progress file but extracted clips exist, derive a
-        # lower bound from the highest extracted chunk index so we don't
-        # reprocess clearly-complete chunks on old runs.
-        if resume_chunk_idx == 0 and existing_chunks:
-            for p in existing_chunks:
+        # When target_chunk_idx is set, jump straight to that chunk.
+        # Otherwise use sequential resume logic.
+        if target_chunk_idx >= 0:
+            chunk_idx = target_chunk_idx
+            start_frame = first_frame + chunk_idx * source_chunk_frames
+            # Force max_new_clips=1 for targeted extraction
+            max_new_clips = 1
+        else:
+            resume_chunk_idx = 0
+            if progress_file.exists():
                 try:
-                    idx = int(p.stem.rsplit("_chunk", 1)[1])
-                    if idx + 1 > resume_chunk_idx:
-                        resume_chunk_idx = idx + 1
-                except (ValueError, IndexError):
-                    continue
+                    resume_chunk_idx = int(progress_file.read_text().strip())
+                except (ValueError, OSError):
+                    resume_chunk_idx = 0
+            # Fallback: if no progress file but extracted clips exist, derive a
+            # lower bound from the highest extracted chunk index so we don't
+            # reprocess clearly-complete chunks on old runs.
+            if resume_chunk_idx == 0 and existing_chunks:
+                for p in existing_chunks:
+                    try:
+                        idx = int(p.stem.rsplit("_chunk", 1)[1])
+                        if idx + 1 > resume_chunk_idx:
+                            resume_chunk_idx = idx + 1
+                    except (ValueError, IndexError):
+                        continue
 
-        chunk_idx = resume_chunk_idx
-        start_frame = first_frame + chunk_idx * source_chunk_frames
+            chunk_idx = resume_chunk_idx
+            start_frame = first_frame + chunk_idx * source_chunk_frames
 
-        if chunk_idx > 0:
-            logger.info(
-                f"{video_path.name}: resuming from chunk {chunk_idx} "
-                f"(frame {start_frame}) — {len(existing_chunks)} existing clips kept"
-            )
+            if chunk_idx > 0:
+                logger.info(
+                    f"{video_path.name}: resuming from chunk {chunk_idx} "
+                    f"(frame {start_frame}) — {len(existing_chunks)} existing clips kept"
+                )
 
         while start_frame < last_frame:
             end_frame = min(start_frame + source_chunk_frames, last_frame)
             # Skip chunks that are too short (less than half the target)
             if end_frame - start_frame < source_chunk_frames // 2:
                 break
+            clip_transcript = None
 
-            # Persist resume progress before doing any work on this chunk.
-            # On a crash / interrupt, the next run resumes at exactly this
-            # chunk index and fast-forwards everything before it.
-            try:
-                progress_file.write_text(str(chunk_idx))
-            except OSError:
-                pass
+            # Persist resume progress for sequential mode only.
+            # Rolling mode tracks by clip file existence instead.
+            if target_chunk_idx < 0:
+                try:
+                    progress_file.write_text(str(chunk_idx))
+                except OSError:
+                    pass
 
             # Sample a frame from the middle of the chunk for face detection
             sample_frame_idx = start_frame + (end_frame - start_frame) // 2
             crop = None
             matched_sample = None
+            matched_names = set()
 
             # Clip-selection gating.  Two modes:
             #   - Multi-character: chunk must contain at least one known
@@ -1654,10 +2166,12 @@ class RSLTXVPrepareDataset:
             #     otherwise falls back to center crop.
             #   - Single-character / default: requires a detected face; if a
             #     target_embedding is set, that face must match the target.
+            # Check start frame first — clip must have a known character
+            # visible from the beginning, not just somewhere in the middle.
             sample_positions = [
-                sample_frame_idx,
                 start_frame,
                 start_frame + (end_frame - start_frame) // 4,
+                sample_frame_idx,
                 start_frame + 3 * (end_frame - start_frame) // 4,
             ]
             sample_positions = [p for p in sample_positions if start_frame <= p < end_frame]
@@ -1665,8 +2179,10 @@ class RSLTXVPrepareDataset:
             if face_detection and character_refs:
                 matched_names: set[str] = set()
                 face_anchor = None  # (frame, rect) for crop if we find one
-                for try_idx in sample_positions:
-                    sample = self._read_frame(video_path, try_idx)
+                # Character must appear in majority of sample positions
+                hits_per_pos = 0
+                for sp in sample_positions:
+                    sample = self._read_frame(video_path, sp)
                     if sample is None:
                         continue
                     hits = self._match_characters_in_frame(
@@ -1675,16 +2191,18 @@ class RSLTXVPrepareDataset:
                         first_match_only=True,
                     )
                     if hits:
+                        hits_per_pos += 1
                         matched_names |= hits
-                        # Remember the first face we see in any matched sample
-                        # so face_crop mode still gets a proper anchor.
                         if face_anchor is None:
                             face = _detect_face_dnn(sample)
                             if face is not None:
                                 face_anchor = (sample, face)
-                        break
-                if not matched_names:
+                # Require any known character visible in at least 3 of 4 sample positions
+                min_hits = max(1, (len(sample_positions) + 1) // 2 + 1)
+                if hits_per_pos < min_hits:
                     logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
+                    if target_chunk_idx >= 0:
+                        break  # targeted mode — don't search forward
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
@@ -1717,6 +2235,8 @@ class RSLTXVPrepareDataset:
                         break
                 if not face_found:
                     logger.info(f"No face in chunk {chunk_idx} of {video_path.name}, skipping")
+                    if target_chunk_idx >= 0:
+                        break
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
@@ -1725,6 +2245,8 @@ class RSLTXVPrepareDataset:
                     face = _detect_face_dnn(matched_sample)
                     if face is None or not self._check_face_match(matched_sample, face, target_embedding, face_similarity):
                         logger.info(f"Face doesn't match target in chunk {chunk_idx} of {video_path.name}, skipping")
+                        if target_chunk_idx >= 0:
+                            break
                         start_frame = end_frame
                         chunk_idx += 1
                         continue
@@ -1733,9 +2255,9 @@ class RSLTXVPrepareDataset:
                 crop = self._center_crop(frame_w, frame_h, target_w, target_h)
 
             out_path = clips_dir / f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
+            start_time = start_frame / fps
 
             if not out_path.exists():
-                start_time = start_frame / fps
                 num_source_frames = end_frame - start_frame
                 clip_duration = num_source_frames / fps
 
@@ -1781,11 +2303,94 @@ class RSLTXVPrepareDataset:
                     chunk_idx += 1
                     continue
 
-            clips.append(out_path)
+            # --- Transcribe speech and fix word boundaries ---
+            if transcribe_speech and out_path.exists():
+                tr = _transcribe_clip(out_path)
+                if tr and tr.get("hallucination"):
+                    # No usable speech — delete clip and skip
+                    logger.info(f"  Deleting clip with no usable speech: {out_path.name}")
+                    try:
+                        out_path.unlink()
+                    except OSError:
+                        pass
+                    start_frame = end_frame
+                    chunk_idx += 1
+                    continue
+                if tr and tr["text"]:
+                    # Check if the last word is cut off — if so, shift the
+                    # clip start backward so the end lands in the gap before
+                    # the cut word.  Frame count stays exactly the same.
+                    if tr["words"]:
+                        last_word = tr["words"][-1]
+                        clip_dur = tr["duration"]
+                        if clip_dur > 0 and (clip_dur - last_word["end"]) < _WORD_CUT_THRESHOLD:
+                            # Find the gap before the cut word to land in
+                            if len(tr["words"]) >= 2:
+                                prev_word_end = tr["words"][-2]["end"]
+                            else:
+                                prev_word_end = 0.0
+                            # Shift so clip ends at the midpoint of the gap
+                            gap_mid = (prev_word_end + last_word["start"]) / 2.0
+                            shift_seconds = clip_dur - gap_mid
+                            shift_frames = int(round(shift_seconds * fps))
+                            new_start = max(first_frame, start_frame - shift_frames)
+
+                            if new_start < start_frame:
+                                new_start_time = new_start / fps
+                                logger.info(
+                                    f"  Word '{last_word['word']}' cut at {last_word['end']:.2f}s "
+                                    f"— shifting start back by {shift_frames} frames"
+                                )
+                                # Re-extract from shifted position, same frame count
+                                vf_parts_re = []
+                                if crop_mode != "full_frame" and crop is not None:
+                                    cx, cy, cw, ch = crop
+                                    vf_parts_re.append(f"crop={cw}:{ch}:{cx}:{cy}")
+                                if use_fps_conversion:
+                                    vf_parts_re.append(f"fps={target_fps}")
+
+                                re_cmd = [
+                                    "ffmpeg", "-y",
+                                    "-ss", f"{new_start_time:.4f}",
+                                    "-i", str(video_path),
+                                ]
+                                if use_fps_conversion:
+                                    re_cmd += ["-t", f"{source_chunk_frames / fps:.4f}"]
+                                else:
+                                    re_cmd += ["-frames:v", str(source_chunk_frames)]
+                                if vf_parts_re:
+                                    re_cmd += ["-vf", ",".join(vf_parts_re)]
+                                re_cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+                                if with_audio:
+                                    re_cmd += ["-t", f"{source_chunk_frames / fps:.4f}", "-c:a", "aac", "-b:a", "128k"]
+                                else:
+                                    re_cmd += ["-an"]
+                                re_cmd += [str(out_path)]
+
+                                re_result = subprocess.run(re_cmd, capture_output=True, text=True)
+                                if re_result.returncode == 0:
+                                    # Re-transcribe the shifted clip
+                                    tr = _transcribe_clip(out_path)
+
+                    # Store transcript text to return to caller
+                    if tr and tr["text"]:
+                        clip_transcript = tr["text"]
+                        logger.info(f"  Transcript: {clip_transcript[:80]}{'...' if len(clip_transcript) > 80 else ''}")
+
+            clips.append((out_path, clip_transcript if transcribe_speech else None))
+            # Store matched characters for balanced sampling
+            if face_detection and character_refs and matched_names:
+                self._clip_characters[str(out_path)] = sorted(matched_names)
+            if out_path not in existing_chunks:
+                new_clips_produced += 1
             logger.info(f"Extracted clip: {video_path.name} chunk {chunk_idx} -> {out_path.name}")
 
             start_frame = end_frame
             chunk_idx += 1
+
+            # Stop early if we've produced enough new clips for this video
+            if max_new_clips > 0 and new_clips_produced >= max_new_clips:
+                break
 
         return clips
 
