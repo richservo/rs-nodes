@@ -493,7 +493,7 @@ class RSLTXVPrepareDataset:
                 "face_similarity": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Face match threshold (0-1). Higher = stricter matching. 0.40 is a good default."}),
                 "face_padding": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Padding around detected face (0.6 = 60% extra for head+shoulders)"}),
                 "sample_count": ("INT", {"default": 4, "min": 2, "max": 16, "step": 1, "tooltip": "Number of evenly-spaced sample positions per chunk for character detection. Higher = less likely to miss a character who appears briefly between samples (e.g. at 10% and 40%), but slower. Positions are laid out as 0%, 1/N, 2/N, ..., (N-1)/N."}),
-                "char_positions_required": ("INT", {"default": 3, "min": 1, "max": 16, "step": 1, "tooltip": "How many of the sample positions must contain ANY named character. Capped at sample_count. 3-of-4 (default) = strict majority. Any mix of named characters across positions counts."}),
+                "char_positions_required": (["10%", "25%", "50%", "75%", "100%"], {"default": "75%", "tooltip": "Fraction of sample positions that must contain ANY named character. Scales with sample_count (e.g. 75% of 4 = 3, 75% of 8 = 6). Any mix of named characters across positions counts — they don't need to be the same character."}),
                 "allow_unknown_faces_in": ("INT", {"default": 1, "min": 0, "max": 16, "step": 1, "tooltip": "Tolerate unknown (non-reference) faces in up to this many sample positions. 0 = reject any extras, 1 = tolerate a single detection blip (default), higher = progressively allow background extras. Capped at sample_count."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
@@ -538,7 +538,7 @@ class RSLTXVPrepareDataset:
         face_similarity: float = 0.40,
         face_padding: float = 0.6,
         sample_count: int = 4,
-        char_positions_required: int = 3,
+        char_positions_required: str = "75%",
         allow_unknown_faces_in: int = 1,
         conditioning_folder: str = "",
         clip=None,
@@ -2085,7 +2085,7 @@ class RSLTXVPrepareDataset:
         max_new_clips: int = 0,
         target_chunk_idx: int = -1,
         sample_count: int = 4,
-        char_positions_required: int = 3,
+        char_positions_required: str = "75%",
         allow_unknown_faces_in: int = 1,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
@@ -2264,10 +2264,16 @@ class RSLTXVPrepareDataset:
                             face = _detect_face_dnn(sample)
                             if face is not None:
                                 face_anchor = (sample, face)
-                # Require any named character visible in at least `char_positions_required`
-                # of the sample positions (default 3 of 4). Doesn't have to be the same
-                # character across positions — any mix of named refs counts.
-                min_hits = min(char_positions_required, len(sample_positions))
+                # Require any named character visible in at least this fraction of
+                # sample positions (default 75% → e.g. 3 of 4, 6 of 8). Doesn't have
+                # to be the same character across positions — any mix of named refs
+                # counts. Floor of 1 so a 10% setting on a tiny sample_count still
+                # requires at least one hit.
+                try:
+                    _pct = int(str(char_positions_required).rstrip("%")) / 100.0
+                except ValueError:
+                    _pct = 0.75
+                min_hits = max(1, int(round(_pct * len(sample_positions))))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
                 if hits_per_pos < min_hits:
                     logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
