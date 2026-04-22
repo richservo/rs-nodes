@@ -513,7 +513,7 @@ class RSLTXVPrepareDataset:
                 "transcribe_speech": ("BOOLEAN", {"default": False, "tooltip": "Transcribe speech in clips using Whisper and append to captions. Also adjusts clip boundaries to avoid cutting words."}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0, "step": 0.001, "tooltip": "Target framerate for output clips (0=keep source fps). Drops frames to match target without affecting audio speed."}),
-                "max_samples": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Maximum clips in dataset (0=unlimited). When set, enables rolling dataset — random videos are selected and clipped until max_samples is reached. Deleted clips are blacklisted and backfilled."}),
+                "max_samples": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Maximum total character appearances across the dataset (0=unlimited). With N characters defined, each character gets a quota of max_samples/N appearances. Total clip count can be less than max_samples when characters share clips — the goal is even per-character distribution, not a specific clip count."}),
                 "crop_mode": (["face_crop", "pan_and_scan", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=tight crop around face, pan_and_scan=max crop at target aspect ratio slid to include face (preserves natural framing), full_frame=scale entire frame. All modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
@@ -960,10 +960,14 @@ class RSLTXVPrepareDataset:
                             f"Pass {balance_pass} — {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
                         )
 
-                        # Rebalance: remove excess clips from over-quota characters
+                        # Rebalance: remove excess clips from over-quota
+                        # characters. Runs whenever ANY character is over
+                        # quota (even if no character is under quota) so that
+                        # startup state with extra appearances of a character
+                        # gets trimmed to the quota automatically.
                         over_quota = {n for n in char_names if char_counts[n] > per_char_quota[n]}
                         under_quota = {n for n in char_names if char_counts[n] < per_char_quota[n]}
-                        if over_quota and under_quota:
+                        if over_quota:
                             removed_for_balance = 0
                             removable: list[dict] = []
                             for entry in existing_entries:
@@ -1003,14 +1007,27 @@ class RSLTXVPrepareDataset:
                                     f"After rebalance: {', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)}"
                                 )
 
-                    clips_budget = max_samples - len(existing_entries)
-                    if clips_budget <= 0:
+                    # Budget is measured in character APPEARANCES, not clips.
+                    # Total appearances = sum of char_counts; max appearances
+                    # is max_samples. A clip contributes one appearance per
+                    # named character, so total clip count can be less than
+                    # max_samples when characters share clips.
+                    appearances = sum(char_counts.values()) if per_char_quota else len(existing_entries)
+                    clips_budget = max(0, max_samples - appearances) if max_samples > 0 else 0
+                    if per_char_quota:
+                        if all(char_counts.get(n, 0) >= per_char_quota[n] for n in char_names):
+                            logger.info(
+                                f"All characters at or above quota "
+                                f"({', '.join(f'{n}={char_counts[n]}/{per_char_quota[n]}' for n in char_names)})"
+                            )
+                            break
+                    elif max_samples > 0 and clips_budget <= 0:
                         logger.info(f"Dataset at capacity ({len(existing_entries)}/{max_samples})")
                         break
 
                     logger.info(
-                        f"Rolling dataset: need {clips_budget} more clips "
-                        f"({len(existing_entries)}/{max_samples} slots used)"
+                        f"Rolling dataset: {appearances}/{max_samples} appearances, "
+                        f"{len(existing_entries)} clips"
                     )
 
                     # Load video_progress.json
@@ -1110,7 +1127,17 @@ class RSLTXVPrepareDataset:
 
                     _save_pool()
 
-                    while clips_budget > 0 and chunk_pool:
+                    def _any_under_quota() -> bool:
+                        if per_char_quota:
+                            return any(
+                                char_counts.get(n, 0) < per_char_quota[n]
+                                for n in char_names
+                            )
+                        if max_samples > 0:
+                            return len(existing_entries) < max_samples
+                        return True
+
+                    while chunk_pool and _any_under_quota():
                         item, ci = chunk_pool.pop()
                         _save_pool()
                         # Skip chunks that a previous shifted extraction in this
@@ -1163,18 +1190,91 @@ class RSLTXVPrepareDataset:
                             if str(result_path) in known_paths:
                                 continue
                             clip_chars = getattr(self, "_clip_characters", {}).get(str(result_path), [])
-                            if per_char_quota and clip_chars:
-                                if all(char_counts.get(c, 0) >= per_char_quota.get(c, 0) for c in clip_chars):
+                            clip_set = set(clip_chars)
+
+                            # Quota-aware intake: the new clip must (a)
+                            # contain at least one under-quota character
+                            # and (b) if it contains any at-quota
+                            # characters, we must be able to swap out a
+                            # SUBSET clip whose char set is a proper subset
+                            # of the new clip AND contains every at-quota
+                            # character. That way the at-quota chars stay
+                            # exactly at quota (remove once, add once)
+                            # while under-quota chars gain (+1).
+                            swap_target = None
+                            if per_char_quota and clip_set:
+                                under_in_clip = [
+                                    c for c in clip_set
+                                    if char_counts.get(c, 0) < per_char_quota.get(c, 0)
+                                ]
+                                if not under_in_clip:
+                                    # No under-quota char in this clip — it
+                                    # contributes nothing useful. Reject.
                                     try:
                                         result_path.unlink()
                                     except OSError:
                                         pass
-                                    # Quota-based rejection: skip in-memory only
-                                    # so this chunk doesn't come back in subsequent
-                                    # rebalance passes this run. Not persisted —
-                                    # quotas can change between runs.
                                     rejected_chunk_files.add(result_path.name)
                                     continue
+                                at_quota_in_clip = {
+                                    c for c in clip_set
+                                    if char_counts.get(c, 0) >= per_char_quota.get(c, 0)
+                                }
+                                if at_quota_in_clip:
+                                    # Need to swap. Look for an existing clip
+                                    # whose char set contains every at-quota
+                                    # char in the new clip AND is a proper
+                                    # subset of the new clip's char set.
+                                    # Prefer the smallest such subset (solo
+                                    # first) so we keep maximal clip variety.
+                                    candidates = []
+                                    for old in existing_entries:
+                                        old_chars = set(old.get("characters", []))
+                                        if not old_chars:
+                                            continue
+                                        if old_chars == clip_set:
+                                            continue
+                                        if not old_chars.issubset(clip_set):
+                                            continue
+                                        if not at_quota_in_clip.issubset(old_chars):
+                                            continue
+                                        candidates.append((len(old_chars), old))
+                                    if not candidates:
+                                        try:
+                                            result_path.unlink()
+                                        except OSError:
+                                            pass
+                                        rejected_chunk_files.add(result_path.name)
+                                        logger.info(
+                                            f"Rejected {result_path.name}: "
+                                            f"{sorted(at_quota_in_clip)} at quota and "
+                                            f"no subset clip available to swap"
+                                        )
+                                        continue
+                                    candidates.sort(key=lambda t: t[0])
+                                    swap_target = candidates[0][1]
+
+                            # Perform the swap, if any, BEFORE appending so
+                            # counts stay consistent throughout.
+                            if swap_target is not None:
+                                swap_chars = set(swap_target.get("characters", []))
+                                swap_path = Path(swap_target["media_path"])
+                                if swap_path.exists():
+                                    try:
+                                        swap_path.unlink()
+                                    except OSError:
+                                        pass
+                                rejected_chunk_files.add(swap_path.name)
+                                known_paths.discard(swap_target["media_path"])
+                                existing_entries.remove(swap_target)
+                                for c in swap_chars:
+                                    if c in char_counts:
+                                        char_counts[c] -= 1
+                                logger.info(
+                                    f"Auto-balance: swapped {sorted(swap_chars)} clip "
+                                    f"({swap_path.name}) for new {sorted(clip_set)} clip"
+                                )
+
                             entry = {
                                 "caption": "",
                                 "media_path": str(result_path),
@@ -1195,9 +1295,9 @@ class RSLTXVPrepareDataset:
                             for c in clip_chars:
                                 if c in char_counts:
                                     char_counts[c] += 1
-                            clips_budget -= 1
                             clips_produced_this_pass += 1
                             total_clips_produced += 1
+
                             pbar.update_absolute(clips_produced_this_pass, max_samples - len(existing_entries) + clips_produced_this_pass)
                             _emit_status()
 
@@ -1230,18 +1330,21 @@ class RSLTXVPrepareDataset:
                         break
                     if not per_char_quota:
                         break  # No character balancing needed
-                    # Check if balanced — all characters within 1 of quota
+                    # Goal: every character at or above quota. Stop once that
+                    # holds (target distribution reached).
                     all_balanced = all(
-                        abs(char_counts.get(n, 0) - per_char_quota.get(n, 0)) <= 1
+                        char_counts.get(n, 0) >= per_char_quota.get(n, 0)
                         for n in char_names
                     )
-                    if all_balanced or len(existing_entries) >= max_samples:
+                    if all_balanced:
                         break
-                    # Still imbalanced — check if any over-quota chars exist to rebalance
+                    # Still under-quota somewhere. If nothing is over-quota to
+                    # trim AND nothing is under, we're stuck; otherwise loop
+                    # back through the rebalance + extract steps.
                     over_quota = {n for n in char_names if char_counts[n] > per_char_quota[n]}
                     under_quota = {n for n in char_names if char_counts[n] < per_char_quota[n]}
-                    if not (over_quota and under_quota):
-                        break  # Can't rebalance further
+                    if not under_quota:
+                        break
                     logger.info("Characters still imbalanced, starting rebalance pass...")
 
                 if per_char_quota:
