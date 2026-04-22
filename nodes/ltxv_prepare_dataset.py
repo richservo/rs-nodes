@@ -225,181 +225,117 @@ def _transcribe_clip(clip_path: Path) -> dict | None:
     return {"text": text, "words": words, "duration": duration}
 
 
-# OpenCV DNN face detector
-_face_net = None
-_face_detector_checked = False
-_FACE_CONFIDENCE_THRESHOLD = 0.5
+# InsightFace (SCRFD detection + ArcFace recognition, antelopev2 model pack).
+# One FaceAnalysis call returns bboxes + 512-d L2-normalized embeddings together;
+# detection helpers cache the last analyzed frame so the embedding lookup is free.
+_face_app = None
+_face_app_checked = False
 _FACE_PADDING = 0.6  # 60% padding around detected face for head+shoulders context
 _FACE_MATCH_THRESHOLD = 0.40  # Cosine similarity threshold for face matching (lower = stricter)
 
-# Face recognition DNN (OpenFace embedding model)
-_face_recognizer = None
-_face_recognizer_checked = False
-_RECOGNIZER_MODEL_URL = "https://raw.githubusercontent.com/pyannote/pyannote-data/master/openface.nn4.small2.v1.t7"
-
-_DNN_MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20180205_fp16/res10_300x300_ssd_iter_140000_fp16.caffemodel"
-_DNN_CONFIG_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+_last_analysis_frame_id: int | None = None
+_last_analysis_faces: list = []
 
 
-def _get_face_detector():
-    """Load OpenCV DNN face detector (res10_300x300_ssd). Downloads model if needed. Cached after first call."""
-    global _face_net, _face_detector_checked
-    if _face_net is not None:
-        return _face_net
-    if _face_detector_checked:
-        return None  # Already tried and failed, don't retry
-
-    _face_detector_checked = True
-
-    # Store models alongside this file
-    model_dir = Path(__file__).parent.parent / "models" / "face_detector"
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    model_file = model_dir / "res10_300x300_ssd_iter_140000_fp16.caffemodel"
-    config_file = model_dir / "deploy.prototxt"
-
-    # Download if missing
-    if not model_file.exists():
-        logger.info("Downloading OpenCV DNN face detector model...")
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(_DNN_MODEL_URL, str(model_file))
-            logger.info(f"Downloaded face detector model to {model_file}")
-        except Exception as e:
-            logger.warning(f"Failed to download DNN face model: {e}. Using Haar cascade.")
-            return None
-
-    if not config_file.exists():
-        logger.info("Downloading OpenCV DNN face detector config...")
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(_DNN_CONFIG_URL, str(config_file))
-            logger.info(f"Downloaded face detector config to {config_file}")
-        except Exception as e:
-            logger.warning(f"Failed to download DNN face config: {e}. Using Haar cascade.")
-            return None
+def _get_face_app():
+    """Load InsightFace FaceAnalysis (antelopev2). Lazy, cached, one-shot."""
+    global _face_app, _face_app_checked
+    if _face_app is not None:
+        return _face_app
+    if _face_app_checked:
+        return None
+    _face_app_checked = True
 
     try:
-        _face_net = cv2.dnn.readNetFromCaffe(str(config_file), str(model_file))
-        logger.info("Loaded OpenCV DNN face detector")
-        return _face_net
-    except Exception as e:
-        logger.warning(f"Failed to load DNN face detector: {e}. Using Haar cascade.")
+        from insightface.app import FaceAnalysis
+    except ImportError:
+        logger.warning(
+            "insightface not installed — face detection disabled. "
+            "Run: pip install insightface onnxruntime-gpu"
+        )
         return None
+
+    try:
+        app = FaceAnalysis(
+            name="antelopev2",
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        _face_app = app
+        logger.info("Loaded InsightFace (antelopev2) — SCRFD detect + ArcFace embed")
+        return app
+    except Exception as e:
+        logger.warning(f"Failed to load InsightFace: {e}")
+        return None
+
+
+def _analyze_frame(frame: np.ndarray) -> list:
+    """Run InsightFace on frame; memoize by id(frame) so repeat calls are free."""
+    global _last_analysis_frame_id, _last_analysis_faces
+    app = _get_face_app()
+    if app is None:
+        _last_analysis_frame_id = id(frame)
+        _last_analysis_faces = []
+        return []
+    if id(frame) == _last_analysis_frame_id:
+        return _last_analysis_faces
+    faces = app.get(frame)
+    _last_analysis_frame_id = id(frame)
+    _last_analysis_faces = faces
+    return faces
 
 
 def _detect_face_dnn(frame: np.ndarray) -> tuple[int, int, int, int] | None:
-    """Detect the largest face using OpenCV DNN. Returns (x, y, w, h) or None."""
+    """Largest face bbox (x, y, w, h) or None."""
     faces = _detect_all_faces_dnn(frame)
     if not faces:
         return None
-    # Return largest
     return max(faces, key=lambda r: r[2] * r[3])
 
 
 def _detect_all_faces_dnn(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Detect all faces using OpenCV DNN. Returns list of (x, y, w, h)."""
-    net = _get_face_detector()
-    if net is None:
-        haar = _detect_face_haar(frame)
-        return [haar] if haar is not None else []
-
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
-    net.setInput(blob)
-    detections = net.forward()
-
-    faces: list[tuple[int, int, int, int]] = []
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence < _FACE_CONFIDENCE_THRESHOLD:
+    """All face bboxes as (x, y, w, h)."""
+    out: list[tuple[int, int, int, int]] = []
+    for f in _analyze_frame(frame):
+        x1, y1, x2, y2 = f.bbox.astype(int).tolist()
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
             continue
-        x1 = int(detections[0, 0, i, 3] * w)
-        y1 = int(detections[0, 0, i, 4] * h)
-        x2 = int(detections[0, 0, i, 5] * w)
-        y2 = int(detections[0, 0, i, 6] * h)
-        fw, fh = x2 - x1, y2 - y1
-        if fw <= 0 or fh <= 0:
-            continue
-        faces.append((x1, y1, fw, fh))
-    return faces
-
-
-def _detect_face_haar(frame: np.ndarray) -> tuple[int, int, int, int] | None:
-    """Fallback: detect largest face using Haar cascade."""
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    if len(faces) == 0:
-        return None
-    # Return largest face
-    areas = [w * h for (x, y, w, h) in faces]
-    idx = np.argmax(areas)
-    return tuple(faces[idx])
-
-
-def _get_face_recognizer():
-    """Load OpenFace DNN embedding model for face recognition. Downloads if needed."""
-    global _face_recognizer, _face_recognizer_checked
-    if _face_recognizer is not None:
-        return _face_recognizer
-    if _face_recognizer_checked:
-        return None
-
-    _face_recognizer_checked = True
-
-    model_dir = Path(__file__).parent.parent / "models" / "face_detector"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    model_file = model_dir / "openface.nn4.small2.v1.t7"
-
-    if not model_file.exists():
-        logger.info("Downloading OpenFace face recognition model...")
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(_RECOGNIZER_MODEL_URL, str(model_file))
-            logger.info(f"Downloaded face recognition model to {model_file}")
-        except Exception as e:
-            logger.warning(f"Failed to download face recognition model: {e}")
-            return None
-
-    try:
-        _face_recognizer = cv2.dnn.readNetFromTorch(str(model_file))
-        logger.info("Loaded OpenFace face recognition model")
-        return _face_recognizer
-    except Exception as e:
-        logger.warning(f"Failed to load face recognition model: {e}")
-        return None
+        out.append((x1, y1, w, h))
+    return out
 
 
 def _get_face_embedding(frame: np.ndarray, face_rect: tuple[int, int, int, int]) -> np.ndarray | None:
-    """Extract a 128-d face embedding from a detected face region."""
-    net = _get_face_recognizer()
-    if net is None:
+    """Return the 512-d L2-normalized ArcFace embedding for the face at face_rect.
+    Matches face_rect against the cached analysis by IoU."""
+    faces = _analyze_frame(frame)
+    if not faces:
         return None
-
-    x, y, w, h = face_rect
-    # Clamp to frame bounds
-    fh, fw = frame.shape[:2]
-    x, y = max(0, x), max(0, y)
-    w = min(w, fw - x)
-    h = min(h, fh - y)
-    if w <= 0 or h <= 0:
+    fx, fy, fw, fh = face_rect
+    fa = fw * fh
+    best = None
+    best_iou = 0.0
+    for f in faces:
+        x1, y1, x2, y2 = f.bbox.tolist()
+        ix1 = max(fx, x1)
+        iy1 = max(fy, y1)
+        ix2 = min(fx + fw, x2)
+        iy2 = min(fy + fh, y2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        union = fa + (x2 - x1) * (y2 - y1) - inter
+        if union <= 0:
+            continue
+        iou = inter / union
+        if iou > best_iou:
+            best_iou = iou
+            best = f
+    if best is None or best_iou < 0.3:
         return None
-
-    face_crop = frame[y:y+h, x:x+w]
-    blob = cv2.dnn.blobFromImage(face_crop, 1.0 / 255, (96, 96), (0, 0, 0), swapRB=True, crop=False)
-    net.setInput(blob)
-    embedding = net.forward().flatten()
-    # Normalize
-    norm = np.linalg.norm(embedding)
-    if norm > 0:
-        embedding = embedding / norm
-    return embedding
+    return np.asarray(best.normed_embedding, dtype=np.float32)
 
 
 def _match_face(embedding: np.ndarray, target_embedding: np.ndarray) -> float:
-    """Compute cosine similarity between two face embeddings. Returns 0-1 (1 = identical)."""
+    """Cosine similarity between two L2-normalized embeddings. Range [-1, 1]; ~0.5+ = same person for ArcFace."""
     return float(np.dot(embedding, target_embedding))
 
 

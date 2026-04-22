@@ -15,3 +15,5 @@ scenedetect>=0.6.5.2
 av>=14.2.1
 psutil
 einops
+insightface
+onnxruntime-gpu
