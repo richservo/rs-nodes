@@ -492,6 +492,8 @@ class RSLTXVPrepareDataset:
                 "skip_end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 1.0, "tooltip": "Skip the last N seconds of every video (useful for cutting out end credits)."}),
                 "face_similarity": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Face match threshold (0-1). Higher = stricter matching. 0.40 is a good default."}),
                 "face_padding": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Padding around detected face (0.6 = 60% extra for head+shoulders)"}),
+                "char_positions_required": ("INT", {"default": 3, "min": 1, "max": 4, "step": 1, "tooltip": "How many of 4 sample positions (start, 25%, 50%, 75%) must contain ANY named character. 3 = strict majority (default). Lower = more permissive about cuts/partial coverage."}),
+                "allow_unknown_faces_in": ("INT", {"default": 1, "min": 0, "max": 4, "step": 1, "tooltip": "Tolerate unknown (non-reference) faces in up to this many of the 4 sample positions. 0 = reject any extras, 1 = tolerate one-frame detection blip (default), higher = progressively allow background extras."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
                 "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
@@ -534,6 +536,8 @@ class RSLTXVPrepareDataset:
         skip_end_seconds: float = 0.0,
         face_similarity: float = 0.40,
         face_padding: float = 0.6,
+        char_positions_required: int = 3,
+        allow_unknown_faces_in: int = 1,
         conditioning_folder: str = "",
         clip=None,
         vae=None,
@@ -1075,6 +1079,8 @@ class RSLTXVPrepareDataset:
                             target_fps=target_fps,
                             transcribe_speech=transcribe_speech,
                             target_chunk_idx=ci,
+                            char_positions_required=char_positions_required,
+                            allow_unknown_faces_in=allow_unknown_faces_in,
                         )
                         # Persist any content-level rejections recorded by _process_video
                         self._flush_rejected_chunks(rejected_path, rejected_chunk_files)
@@ -1215,6 +1221,8 @@ class RSLTXVPrepareDataset:
                                 skip_end_seconds=skip_end_seconds,
                                 target_fps=target_fps,
                                 transcribe_speech=transcribe_speech,
+                                char_positions_required=char_positions_required,
+                                allow_unknown_faces_in=allow_unknown_faces_in,
                             )
                             self._flush_rejected_chunks(rejected_path, rejected_chunk_files)
                             if results:
@@ -2072,6 +2080,8 @@ class RSLTXVPrepareDataset:
         transcribe_speech: bool = False,
         max_new_clips: int = 0,
         target_chunk_idx: int = -1,
+        char_positions_required: int = 3,
+        allow_unknown_faces_in: int = 1,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
         Returns list of output clip paths (skips chunks with no face when face_detection is on).
@@ -2253,8 +2263,10 @@ class RSLTXVPrepareDataset:
                             face = _detect_face_dnn(sample)
                             if face is not None:
                                 face_anchor = (sample, face)
-                # Require any known character visible in at least 3 of 4 sample positions
-                min_hits = max(1, (len(sample_positions) + 1) // 2 + 1)
+                # Require any named character visible in at least `char_positions_required`
+                # of the sample positions (default 3 of 4). Doesn't have to be the same
+                # character across positions — any mix of named refs counts.
+                min_hits = min(char_positions_required, len(sample_positions))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
                 if hits_per_pos < min_hits:
                     logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
@@ -2291,10 +2303,11 @@ class RSLTXVPrepareDataset:
                             need_more_chars = False
                     if _has_unknown_face(sample, character_refs, face_similarity):
                         unknown_face_positions += 1
-                if unknown_face_positions >= 2:
+                if unknown_face_positions > allow_unknown_faces_in:
                     logger.info(
                         f"Chunk {chunk_idx}: rejected — unknown faces in "
-                        f"{unknown_face_positions}/{len(sample_positions)} sample positions"
+                        f"{unknown_face_positions}/{len(sample_positions)} sample positions "
+                        f"(tolerance: {allow_unknown_faces_in})"
                     )
                     self._rejected_chunks.append({
                         "source_file": str(video_path),
