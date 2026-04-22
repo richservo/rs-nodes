@@ -2615,61 +2615,56 @@ class RSLTXVPrepareDataset:
                 # fractions (25/50/75/100%) handle short character windows
                 # that need only a small shift as well as long ones that need
                 # a full chunk move.
+                # Seek for the best position: evaluate the original plus
+                # every candidate shift (both directions, all fractions),
+                # then pick the candidate with the highest hit count, using
+                # lowest unknown-face count as tiebreaker. The floor
+                # (min_hits) and unknown_tol act as pass/fail gates — they
+                # only mark candidates ineligible, not chosen. So 50% is the
+                # minimum; a position with 100% coverage will always beat
+                # a position with 50% coverage, regardless of which one we
+                # "found first".
+                hit_indices = [i for i, h in enumerate(pos_has_hit) if h]
+                n_pos = len(sample_positions)
                 original_passes = (
                     hits_per_pos >= min_hits
                     and unknown_face_positions <= unknown_tol
                 )
-                hit_indices = [i for i, h in enumerate(pos_has_hit) if h]
-                n_pos = len(sample_positions)
-                half = n_pos / 2
-                all_front = hit_indices and all(i < half for i in hit_indices)
-                all_back = hit_indices and all(i >= half for i in hit_indices)
-                # Where are the unknown faces concentrated? Used both for
-                # stand-alone clean-up shifts and to bias the rescue direction
-                # order.
-                unknowns_all_front = unknown_at and all(i < half for i in unknown_at)
-                unknowns_all_back = unknown_at and all(i >= half for i in unknown_at)
-                shift_directions: list[int] = []
-                if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
-                    if not original_passes:
-                        # Rescue: try both directions. Prefer the one that
-                        # moves AWAY from concentrated extras so the first
-                        # attempt has the best chance of landing clean.
-                        if unknowns_all_front:
-                            shift_directions = [1, -1]
-                        elif unknowns_all_back:
-                            shift_directions = [-1, 1]
-                        else:
-                            shift_directions = [-1, 1]
-                    elif all_front:
-                        shift_directions = [-1]
-                    elif all_back:
-                        shift_directions = [1]
-                    elif unknown_at and (unknowns_all_front or unknowns_all_back):
-                        # Clean-up: character is balanced and original passes,
-                        # but there are unknown faces clustered at one end.
-                        # Shift AWAY from them to drop the extras entirely.
-                        shift_directions = [1] if unknowns_all_front else [-1]
 
-                if shift_directions:
-                    if not original_passes:
-                        _reason = "rescue"
-                    elif all_front or all_back:
-                        _reason = "balance"
-                    else:
-                        _reason = "cleanup"
+                candidates: list[dict] = []
+                if original_passes:
+                    candidates.append({
+                        "shift": 0,
+                        "start": start_frame,
+                        "end": end_frame,
+                        "sample_positions": sample_positions,
+                        "matched_names": matched_names,
+                        "hits_per_pos": hits_per_pos,
+                        "pos_has_hit": pos_has_hit,
+                        "face_anchor": face_anchor,
+                        "unknown_face_positions": unknown_face_positions,
+                        "unknown_at": unknown_at,
+                    })
+
+                # Shifts only meaningful when we already found at least one
+                # character hit at the original position (direction cue) and
+                # we're in rolling/targeted mode (sequential mode can't
+                # mutate start/end without cascading into the next chunk).
+                if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
                     logger.info(
-                        f"Chunk {chunk_idx}: {_reason} — hits at positions "
-                        f"{hit_indices}/{n_pos}, unknowns at {unknown_at}/{n_pos} "
-                        f"— trying expand-to-fit shifts"
+                        f"Chunk {chunk_idx}: seeking better coverage — "
+                        f"original hits {hits_per_pos}/{n_pos} at positions "
+                        f"{hit_indices}, unknowns at {unknown_at}/{n_pos}"
                     )
                     _chunk_len = end_frame - start_frame
                     _snap8 = lambda x: (x // 8) * 8
-                    _accepted_shift = 0
-                    for _sign in shift_directions:
-                        if _accepted_shift:
-                            break
-                        for _frac in (0.25, 0.5, 0.75, 1.0):
+                    # Seek up to 2 full chunk lengths in either direction —
+                    # enough to catch a character whose on-screen window
+                    # spans multiple chunk slots, but not so wide that we're
+                    # effectively scanning the whole video. A real editor
+                    # would scrub this far to find a clean in/out point.
+                    for _sign in (-1, 1):
+                        for _frac in (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0):
                             _shift = _sign * _snap8(int(_chunk_len * _frac))
                             if _shift == 0:
                                 continue
@@ -2684,83 +2679,87 @@ class RSLTXVPrepareDataset:
                                 continue
                             alt = _validate_at(_ns, _ne)
                             _alt_hits = [i for i, h in enumerate(alt["pos_has_hit"]) if h]
-                            _alt_balanced = (
-                                bool(_alt_hits)
-                                and not all(i < half for i in _alt_hits)
-                                and not all(i >= half for i in _alt_hits)
-                            )
                             _alt_passes = (
                                 alt["hits_per_pos"] >= min_hits
                                 and alt["unknown_face_positions"] <= unknown_tol
                             )
-                            # Accept criteria by mode:
-                            #   rescue: any position that meets both gates
-                            #   balance: passes AND is now better-balanced
-                            #   cleanup: passes AND has strictly fewer unknowns
-                            if _reason == "rescue":
-                                accept = _alt_passes
-                            elif _reason == "cleanup":
-                                accept = (
-                                    _alt_passes
-                                    and alt["unknown_face_positions"] < unknown_face_positions
-                                )
-                            else:  # balance
-                                accept = _alt_passes and _alt_balanced
-                            if accept:
+                            if _alt_passes:
                                 logger.info(
-                                    f"Chunk {chunk_idx}: shift accepted {_shift:+d} "
-                                    f"({int(_frac * 100)}%) — hits {alt['hits_per_pos']}/{n_pos} "
-                                    f"at positions {_alt_hits}, "
-                                    f"unknown faces {alt['unknown_face_positions']}/{n_pos}, "
+                                    f"Chunk {chunk_idx}: shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) candidate — hits "
+                                    f"{alt['hits_per_pos']}/{n_pos} at {_alt_hits}, "
+                                    f"unknowns {alt['unknown_face_positions']}/{n_pos}, "
                                     f"chars {sorted(alt['matched_names'])}"
                                 )
-                                start_frame, end_frame = _ns, _ne
-                                sample_positions = alt["sample_positions"]
-                                matched_names = alt["matched_names"]
-                                hits_per_pos = alt["hits_per_pos"]
-                                face_anchor = alt["face_anchor"]
-                                unknown_face_positions = alt["unknown_face_positions"]
-                                pos_has_hit = alt["pos_has_hit"]
-                                _accepted_shift = _shift
-                                # Mark the adjacent chunk in the shift
-                                # direction as consumed so we don't re-extract
-                                # mostly-duplicate content when the pool pops
-                                # it later. Only consume when the shift
-                                # actually crosses into neighbor territory
-                                # (i.e. shift magnitude > 0).
-                                _adj_ci = chunk_idx + (1 if _shift > 0 else -1)
-                                if _adj_ci >= 0:
-                                    self._consumed_chunks.append(
-                                        f"{video_path.stem}_chunk{_adj_ci:04d}.mp4"
+                                candidates.append({
+                                    "shift": _shift,
+                                    "start": _ns,
+                                    "end": _ne,
+                                    **alt,
+                                })
+                            else:
+                                _reasons = []
+                                if alt["hits_per_pos"] < min_hits:
+                                    _reasons.append(f"hits {alt['hits_per_pos']}<{min_hits}")
+                                if alt["unknown_face_positions"] > unknown_tol:
+                                    _reasons.append(
+                                        f"unknown {alt['unknown_face_positions']}>{unknown_tol}"
                                     )
-                                break
-                            _reasons = []
-                            if alt["hits_per_pos"] < min_hits:
-                                _reasons.append(f"hits {alt['hits_per_pos']}<{min_hits}")
-                            if alt["unknown_face_positions"] > unknown_tol:
-                                _reasons.append(
-                                    f"unknown {alt['unknown_face_positions']}>{unknown_tol}"
+                                logger.info(
+                                    f"Chunk {chunk_idx}: shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) ineligible — {', '.join(_reasons)}"
                                 )
-                            if _reason == "balance" and not _alt_balanced:
-                                _reasons.append(
-                                    f"still imbalanced (positions {_alt_hits})"
-                                )
-                            if (
-                                _reason == "cleanup"
-                                and alt["unknown_face_positions"] >= unknown_face_positions
-                            ):
-                                _reasons.append(
-                                    f"unknowns not reduced "
-                                    f"({alt['unknown_face_positions']} vs {unknown_face_positions})"
-                                )
-                            logger.info(
-                                f"Chunk {chunk_idx}: shift {_shift:+d} "
-                                f"({int(_frac * 100)}%) rejected — {', '.join(_reasons)}"
-                            )
-                    if not _accepted_shift:
-                        logger.info(
-                            f"Chunk {chunk_idx}: no shift worked; keeping original position"
+
+                if candidates:
+                    # Best = max hits, tiebreak min unknowns, tiebreak shift
+                    # magnitude ascending (stay closer to the original pool
+                    # position when truly tied).
+                    candidates.sort(
+                        key=lambda c: (
+                            -c["hits_per_pos"],
+                            c["unknown_face_positions"],
+                            abs(c["shift"]),
                         )
+                    )
+                    best = candidates[0]
+                    if best["shift"] != 0:
+                        logger.info(
+                            f"Chunk {chunk_idx}: chose shift {best['shift']:+d} — "
+                            f"hits {best['hits_per_pos']}/{n_pos}, "
+                            f"unknowns {best['unknown_face_positions']}/{n_pos}"
+                        )
+                        start_frame = best["start"]
+                        end_frame = best["end"]
+                        sample_positions = best["sample_positions"]
+                        matched_names = best["matched_names"]
+                        hits_per_pos = best["hits_per_pos"]
+                        face_anchor = best["face_anchor"]
+                        unknown_face_positions = best["unknown_face_positions"]
+                        pos_has_hit = best["pos_has_hit"]
+                        # The shifted range crosses into neighbor pool
+                        # entries' territory. Shifts in (0, 100%] touch one
+                        # adjacent chunk; shifts in (100%, 200%] touch two.
+                        # Mark them all consumed so we don't re-extract
+                        # near-duplicate content from the same frames.
+                        _shift = best["shift"]
+                        _direction = 1 if _shift > 0 else -1
+                        _num_adj = 1 if abs(_shift) <= _chunk_len else 2
+                        for _offset in range(1, _num_adj + 1):
+                            _adj_ci = chunk_idx + _direction * _offset
+                            if _adj_ci >= 0:
+                                self._consumed_chunks.append(
+                                    f"{video_path.stem}_chunk{_adj_ci:04d}.mp4"
+                                )
+                    else:
+                        logger.info(
+                            f"Chunk {chunk_idx}: original is best — "
+                            f"hits {hits_per_pos}/{n_pos}, unknowns {unknown_face_positions}/{n_pos}"
+                        )
+                elif target_chunk_idx >= 0 and hit_indices:
+                    logger.info(
+                        f"Chunk {chunk_idx}: no eligible position found "
+                        f"(floor {min_hits}/{n_pos} hits, tolerance {unknown_tol}/{n_pos} unknowns)"
+                    )
 
                 # Final gate checks (may have been satisfied by a shift).
                 if hits_per_pos < min_hits:
