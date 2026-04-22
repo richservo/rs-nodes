@@ -339,6 +339,30 @@ def _match_face(embedding: np.ndarray, target_embedding: np.ndarray) -> float:
     return float(np.dot(embedding, target_embedding))
 
 
+def _has_unknown_face(
+    frame: np.ndarray,
+    character_refs: dict[str, dict],
+    threshold: float,
+) -> bool:
+    """True if any face detected in the frame fails to match any known face-ref
+    at or above `threshold`. Returns False when there are no face-refs to check
+    against (can't adjudicate), or when no faces are detected."""
+    face_refs = [r["embedding"] for r in character_refs.values() if r["type"] == "face"]
+    if not face_refs:
+        return False
+    faces = _detect_all_faces_dnn(frame)
+    if not faces:
+        return False
+    for rect in faces:
+        emb = _get_face_embedding(frame, rect)
+        if emb is None:
+            continue
+        best_sim = max(_match_face(emb, ref) for ref in face_refs)
+        if best_sim < threshold:
+            return True
+    return False
+
+
 def _compute_face_crop(
     face_x: int, face_y: int, face_w: int, face_h: int,
     frame_w: int, frame_h: int,
@@ -961,38 +985,81 @@ class RSLTXVPrepareDataset:
                     clips_produced_this_pass = 0
                     known_paths = {e["media_path"] for e in existing_entries}
 
-                    # Build chunk pool
+                    # Build (or resume) chunk pool. Persisted to chunk_pool.json
+                    # so a crashed or interrupted run can pick up where it left
+                    # off without reshuffling and re-trying the same chunks.
+                    pool_path = output_dir / "chunk_pool.json"
+                    pool_items_by_path = {str(item["path"]): item for item in incomplete}
                     chunk_pool: list[tuple[dict, int]] = []
-                    for item in incomplete:
-                        cap = cv2.VideoCapture(str(item["path"]))
-                        if not cap.isOpened():
-                            continue
-                        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                        vid_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        cap.release()
-                        if vid_total <= 0:
-                            continue
 
-                        skip_s = int(round(skip_start_seconds * vid_fps))
-                        skip_e = int(round(skip_end_seconds * vid_fps))
-                        ff = max(0, skip_s)
-                        lf = max(ff, vid_total - skip_e)
-                        if target_fps > 0 and abs(vid_fps - target_fps) > 0.5:
-                            vid_chunk_frames = int(round(target_frames * (vid_fps / target_fps)))
-                        else:
-                            vid_chunk_frames = target_frames
-                        n_chunks = (lf - ff) // vid_chunk_frames
-
-                        for ci in range(n_chunks):
+                    if pool_path.exists():
+                        try:
+                            with open(pool_path) as pf:
+                                saved = json.load(pf)
+                        except (json.JSONDecodeError, OSError):
+                            saved = []
+                        for entry in saved:
+                            vp = entry.get("video")
+                            ci = entry.get("chunk")
+                            if vp is None or ci is None:
+                                continue
+                            item = pool_items_by_path.get(vp)
+                            if item is None:
+                                continue  # video no longer in incomplete set
                             clip_file = clips_dir / f"{item['path'].stem}_chunk{ci:04d}.mp4"
-                            if not clip_file.exists() and clip_file.name not in rejected_chunk_files:
-                                chunk_pool.append((item, ci))
+                            if clip_file.exists() or clip_file.name in rejected_chunk_files:
+                                continue  # already extracted or rejected
+                            chunk_pool.append((item, ci))
+                        if chunk_pool:
+                            logger.info(
+                                f"Resumed chunk pool from disk: "
+                                f"{len(chunk_pool)} chunks remaining"
+                            )
 
-                    random.shuffle(chunk_pool)
-                    logger.info(f"Chunk pool: {len(chunk_pool)} available chunks across {len(incomplete)} videos")
+                    if not chunk_pool:
+                        for item in incomplete:
+                            cap = cv2.VideoCapture(str(item["path"]))
+                            if not cap.isOpened():
+                                continue
+                            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                            vid_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            cap.release()
+                            if vid_total <= 0:
+                                continue
+
+                            skip_s = int(round(skip_start_seconds * vid_fps))
+                            skip_e = int(round(skip_end_seconds * vid_fps))
+                            ff = max(0, skip_s)
+                            lf = max(ff, vid_total - skip_e)
+                            if target_fps > 0 and abs(vid_fps - target_fps) > 0.5:
+                                vid_chunk_frames = int(round(target_frames * (vid_fps / target_fps)))
+                            else:
+                                vid_chunk_frames = target_frames
+                            n_chunks = (lf - ff) // vid_chunk_frames
+
+                            for ci in range(n_chunks):
+                                clip_file = clips_dir / f"{item['path'].stem}_chunk{ci:04d}.mp4"
+                                if not clip_file.exists() and clip_file.name not in rejected_chunk_files:
+                                    chunk_pool.append((item, ci))
+
+                        random.shuffle(chunk_pool)
+                        logger.info(f"Chunk pool: {len(chunk_pool)} available chunks across {len(incomplete)} videos")
+
+                    def _save_pool() -> None:
+                        try:
+                            with open(pool_path, "w") as pf:
+                                json.dump(
+                                    [{"video": str(it["path"]), "chunk": c} for it, c in chunk_pool],
+                                    pf,
+                                )
+                        except OSError as e:
+                            logger.warning(f"Could not write chunk_pool.json: {e}")
+
+                    _save_pool()
 
                     while clips_budget > 0 and chunk_pool:
                         item, ci = chunk_pool.pop()
+                        _save_pool()
                         source_path = str(item["path"])
 
                         results = self._process_video(
@@ -1009,6 +1076,8 @@ class RSLTXVPrepareDataset:
                             transcribe_speech=transcribe_speech,
                             target_chunk_idx=ci,
                         )
+                        # Persist any content-level rejections recorded by _process_video
+                        self._flush_rejected_chunks(rejected_path, rejected_chunk_files)
 
                         for result_path, result_transcript in results:
                             if str(result_path) in known_paths:
@@ -1020,6 +1089,11 @@ class RSLTXVPrepareDataset:
                                         result_path.unlink()
                                     except OSError:
                                         pass
+                                    # Quota-based rejection: skip in-memory only
+                                    # so this chunk doesn't come back in subsequent
+                                    # rebalance passes this run. Not persisted —
+                                    # quotas can change between runs.
+                                    rejected_chunk_files.add(result_path.name)
                                     continue
                             entry = {
                                 "caption": "",
@@ -1049,6 +1123,16 @@ class RSLTXVPrepareDataset:
                         # Save dataset.json after each chunk
                         with open(dataset_json_path, "w") as f:
                             json.dump(existing_entries, f, indent=2)
+
+                    # Pass concluded normally — remove chunk_pool.json so the
+                    # next pass rebuilds a fresh shuffle. (If the run crashed
+                    # inside the loop, the file is left in place and a restart
+                    # will resume from it.)
+                    if pool_path.exists():
+                        try:
+                            pool_path.unlink()
+                        except OSError:
+                            pass
 
                     logger.info(
                         f"Pass {balance_pass}: added {clips_produced_this_pass} clips "
@@ -1132,6 +1216,7 @@ class RSLTXVPrepareDataset:
                                 target_fps=target_fps,
                                 transcribe_speech=transcribe_speech,
                             )
+                            self._flush_rejected_chunks(rejected_path, rejected_chunk_files)
                             if results:
                                 produced_clips = True
                             for result_path, result_transcript in results:
@@ -1943,6 +2028,36 @@ class RSLTXVPrepareDataset:
         logger.info(f"Processed image: {img_path.name} -> {out_path.name}")
         return out_path
 
+    def _flush_rejected_chunks(
+        self,
+        rejected_path: Path,
+        rejected_chunk_files: set,
+    ) -> None:
+        """Drain self._rejected_chunks (populated by _process_video on content
+        failures) into rejected.json and the in-memory rejected_chunk_files set,
+        then clear the list. Safe no-op when the list is empty."""
+        pending = getattr(self, "_rejected_chunks", [])
+        if not pending:
+            return
+        for rej in pending:
+            cf = rej.get("chunk_file")
+            if cf:
+                rejected_chunk_files.add(cf)
+        existing: list[dict] = []
+        if rejected_path.exists():
+            try:
+                with open(rejected_path) as rf:
+                    existing = json.load(rf)
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        existing.extend(pending)
+        try:
+            with open(rejected_path, "w") as rf:
+                json.dump(existing, rf, indent=2)
+        except OSError as e:
+            logger.warning(f"Could not write rejected.json: {e}")
+        self._rejected_chunks = []
+
     def _process_video(
         self, video_path: Path, clips_dir: Path,
         target_w: int, target_h: int, target_frames: int,
@@ -1981,6 +2096,11 @@ class RSLTXVPrepareDataset:
         # Populated when character_refs is set; keyed by clip path string.
         if not hasattr(self, "_clip_characters"):
             self._clip_characters = {}
+        # Content-based chunk rejections collected during this call so the
+        # caller can flush them into rejected.json. Each entry is a dict with
+        # media_path, source_file, reason, chunk_file.
+        if not hasattr(self, "_rejected_chunks"):
+            self._rejected_chunks = []
 
         # Apply intro / outro skip ranges (useful for cutting show intros and
         # end credits that would otherwise be duplicated across every episode).
@@ -2135,10 +2255,55 @@ class RSLTXVPrepareDataset:
                                 face_anchor = (sample, face)
                 # Require any known character visible in at least 3 of 4 sample positions
                 min_hits = max(1, (len(sample_positions) + 1) // 2 + 1)
+                chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
                 if hits_per_pos < min_hits:
                     logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
+                    self._rejected_chunks.append({
+                        "source_file": str(video_path),
+                        "media_path": str(clips_dir / chunk_file),
+                        "chunk_file": chunk_file,
+                        "reason": "no_known_character",
+                    })
                     if target_chunk_idx >= 0:
                         break  # targeted mode — don't search forward
+                    start_frame = end_frame
+                    chunk_idx += 1
+                    continue
+                # Gate passed — single pass over sample positions that both
+                # enumerates additional known characters (first_match_only=False)
+                # and counts positions containing any unknown face. User wants
+                # clips containing ONLY named characters; small amounts of noise
+                # are tolerated, so we reject only when 2 or more sample positions
+                # show an unknown face.
+                unknown_face_positions = 0
+                need_more_chars = len(matched_names) < len(character_refs)
+                for sp in sample_positions:
+                    sample = self._read_frame(video_path, sp)
+                    if sample is None:
+                        continue
+                    if need_more_chars:
+                        matched_names |= self._match_characters_in_frame(
+                            sample, character_refs, face_similarity,
+                            clip_vision=clip_vision,
+                            first_match_only=False,
+                        )
+                        if len(matched_names) == len(character_refs):
+                            need_more_chars = False
+                    if _has_unknown_face(sample, character_refs, face_similarity):
+                        unknown_face_positions += 1
+                if unknown_face_positions >= 2:
+                    logger.info(
+                        f"Chunk {chunk_idx}: rejected — unknown faces in "
+                        f"{unknown_face_positions}/{len(sample_positions)} sample positions"
+                    )
+                    self._rejected_chunks.append({
+                        "source_file": str(video_path),
+                        "media_path": str(clips_dir / chunk_file),
+                        "chunk_file": chunk_file,
+                        "reason": "unknown_face",
+                    })
+                    if target_chunk_idx >= 0:
+                        break
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
@@ -2171,6 +2336,13 @@ class RSLTXVPrepareDataset:
                         break
                 if not face_found:
                     logger.info(f"No face in chunk {chunk_idx} of {video_path.name}, skipping")
+                    cf = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
+                    self._rejected_chunks.append({
+                        "source_file": str(video_path),
+                        "media_path": str(clips_dir / cf),
+                        "chunk_file": cf,
+                        "reason": "no_face",
+                    })
                     if target_chunk_idx >= 0:
                         break
                     start_frame = end_frame
@@ -2181,6 +2353,13 @@ class RSLTXVPrepareDataset:
                     face = _detect_face_dnn(matched_sample)
                     if face is None or not self._check_face_match(matched_sample, face, target_embedding, face_similarity):
                         logger.info(f"Face doesn't match target in chunk {chunk_idx} of {video_path.name}, skipping")
+                        cf = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
+                        self._rejected_chunks.append({
+                            "source_file": str(video_path),
+                            "media_path": str(clips_dir / cf),
+                            "chunk_file": cf,
+                            "reason": "face_mismatch",
+                        })
                         if target_chunk_idx >= 0:
                             break
                         start_frame = end_frame
@@ -2249,6 +2428,12 @@ class RSLTXVPrepareDataset:
                         out_path.unlink()
                     except OSError:
                         pass
+                    self._rejected_chunks.append({
+                        "source_file": str(video_path),
+                        "media_path": str(out_path),
+                        "chunk_file": out_path.name,
+                        "reason": "speech_hallucination",
+                    })
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
@@ -2439,6 +2624,7 @@ class RSLTXVPrepareDataset:
                     cast_refs=cast_refs,
                     location_refs=location_refs,
                     skip_id_pass=skip_id_pass,
+                    expected_cast=entry.get("characters") or None,
                 )
 
                 if prep is None:
@@ -2718,6 +2904,7 @@ class RSLTXVPrepareDataset:
         cast_refs: list[tuple[str, str]] | None = None,
         location_refs: list[tuple[str, str]] | None = None,
         skip_id_pass: bool = False,
+        expected_cast: list[str] | None = None,
     ) -> dict | None:
         """Prepare a clip for captioning: extract frames, run cast ID and
         location ID.  Returns a dict with all info needed for the caption
@@ -2795,6 +2982,14 @@ class RSLTXVPrepareDataset:
             total_refs = num_cast + num_loc
 
             frame_listing = ", ".join(f"Frame {i + 1}" for i in range(num_frames))
+            skip_hint_block = ""
+            if expected_cast:
+                skip_hint_block = (
+                    f"HINT: a face-detection pre-pass flagged these characters "
+                    f"as likely present: {', '.join(expected_cast)}. Treat this "
+                    f"as a prior — confirm each one visually, and still check "
+                    f"every other reference in case the pre-pass missed someone.\n\n"
+                )
             user_content = (
                 f"You will first see {total_refs} labeled reference images "
                 f"for character and location identification:\n\n"
@@ -2802,6 +2997,7 @@ class RSLTXVPrepareDataset:
                 f"After the references, you will see {num_frames} frames "
                 f"from a video clip in chronological order: {frame_listing}. "
                 f"Frame 1 is the opening shot and the last frame is the end.\n\n"
+                f"{skip_hint_block}"
                 f"YOUR TASK:\n"
                 f"1. Identify which characters from the reference images "
                 f"actually appear in the clip frames. Only name characters "
@@ -2845,7 +3041,10 @@ class RSLTXVPrepareDataset:
             # --- Cast identification ---
             confirmed_cast: list[str] | None = None
             if cast_names and cast_refs:
-                confirmed_cast = self._ollama_identify_cast(base, ollama_model, cast_refs, b64_images)
+                confirmed_cast = self._ollama_identify_cast(
+                    base, ollama_model, cast_refs, b64_images,
+                    expected_cast=expected_cast,
+                )
                 if not confirmed_cast:
                     confirmed_cast = None
 
@@ -3128,6 +3327,7 @@ class RSLTXVPrepareDataset:
         self, base_url: str, model: str,
         cast_refs: list[tuple[str, str]],
         clip_image_b64s: list[str],
+        expected_cast: list[str] | None = None,
     ) -> list[str]:
         """Ask Gemma to identify which referenced characters are visible in
         the clip.  We give Gemma the actual reference images labeled by name
@@ -3157,12 +3357,25 @@ class RSLTXVPrepareDataset:
             ref_lines.append(f"Reference image {i}: this is {name}.")
         ref_block = "\n".join(ref_lines)
 
+        hint_block = ""
+        if expected_cast:
+            hint_names = ", ".join(expected_cast)
+            hint_block = (
+                f"HINT: a face-detection pre-pass flagged these characters as "
+                f"likely present in this clip: {hint_names}. Treat this as a "
+                f"prior, not a guarantee — confirm each one visually against "
+                f"the reference images before naming them, and still check "
+                f"EVERY other reference character too in case the pre-pass "
+                f"missed someone.\n\n"
+            )
+
         user_text = (
             f"First, {num_refs} reference images of known characters "
             f"(labeled 'REF:'):\n\n"
             f"{ref_block}\n\n"
             f"Then, {num_frames} frames from a video clip (labeled "
             f"'Frame 1' through 'Frame {num_frames}').\n\n"
+            f"{hint_block}"
             "TASK: Go through EVERY reference character one by one and "
             "decide if they appear in the clip. List EVERY character you "
             "are confident appears — not just the first or most prominent "
