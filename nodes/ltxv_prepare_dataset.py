@@ -2679,7 +2679,22 @@ class RSLTXVPrepareDataset:
                 # character hit at the original position (direction cue) and
                 # we're in rolling/targeted mode (sequential mode can't
                 # mutate start/end without cascading into the next chunk).
-                if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
+                # Skip the search entirely if the original is already 100%
+                # covered — no shift can do better.
+                _original_perfect = (
+                    original_passes and hits_per_pos == n_pos
+                )
+                if _original_perfect:
+                    logger.info(
+                        f"Chunk {chunk_idx}: original at 100% coverage — "
+                        f"no shift search needed"
+                    )
+                if (
+                    target_chunk_idx >= 0
+                    and hit_indices
+                    and n_pos >= 2
+                    and not _original_perfect
+                ):
                     logger.info(
                         f"Chunk {chunk_idx}: seeking better coverage — "
                         f"original hits {hits_per_pos}/{n_pos} at positions "
@@ -2692,7 +2707,12 @@ class RSLTXVPrepareDataset:
                     # spans multiple chunk slots, but not so wide that we're
                     # effectively scanning the whole video. A real editor
                     # would scrub this far to find a clean in/out point.
+                    # If any shift hits 100% coverage we early-exit both
+                    # loops — no better result possible.
+                    _perfect_found = False
                     for _sign in (-1, 1):
+                        if _perfect_found:
+                            break
                         for _frac in (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0):
                             _shift = _sign * _snap8(int(_chunk_len * _frac))
                             if _shift == 0:
@@ -2726,6 +2746,13 @@ class RSLTXVPrepareDataset:
                                     "end": _ne,
                                     **alt,
                                 })
+                                if alt["hits_per_pos"] == n_pos:
+                                    logger.info(
+                                        f"Chunk {chunk_idx}: shift {_shift:+d} "
+                                        f"hit 100% coverage — stopping search"
+                                    )
+                                    _perfect_found = True
+                                    break
                             else:
                                 _reasons = []
                                 if alt["hits_per_pos"] < min_hits:
