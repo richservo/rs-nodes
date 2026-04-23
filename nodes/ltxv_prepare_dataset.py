@@ -3004,6 +3004,83 @@ class RSLTXVPrepareDataset:
                                 )
                                 break
 
+                # Conditional half-step probing: if nothing in the initial
+                # search hit 100% AND we can see two ADJACENT same-direction
+                # shifts with similar hit counts (same, or off by 1), the
+                # character's window likely centers BETWEEN them. Probe the
+                # halfway shift to see if a tighter fit exists. Only fires
+                # for these promising pairs, so the extra validation cost
+                # is small and targeted — no blanket doubling of shifts.
+                if (
+                    candidates
+                    and target_chunk_idx >= 0
+                    and not any(c["hits_per_pos"] == n_pos for c in candidates)
+                ):
+                    _step = _snap8(int(_chunk_len * 0.25))
+                    _existing_shifts = {c["shift"] for c in candidates}
+                    _by_dir: dict[int, list[dict]] = {-1: [], 1: []}
+                    for c in candidates:
+                        if c["shift"] == 0:
+                            continue
+                        _by_dir[-1 if c["shift"] < 0 else 1].append(c)
+                    for _dir, _lst in _by_dir.items():
+                        _lst.sort(key=lambda c: abs(c["shift"]))
+                        for i in range(len(_lst) - 1):
+                            a, b = _lst[i], _lst[i + 1]
+                            # Truly adjacent in the 25% ladder? Allow a few
+                            # frames of tolerance for _snap8 rounding.
+                            gap = abs(abs(b["shift"]) - abs(a["shift"]))
+                            if not (_step - 8 <= gap <= _step + 8):
+                                continue
+                            # Similar hit count (equal, or off by one).
+                            if abs(a["hits_per_pos"] - b["hits_per_pos"]) > 1:
+                                continue
+                            _mid = (a["shift"] + b["shift"]) // 2
+                            _mid = _dir * _snap8(abs(_mid))
+                            if _mid in (0, a["shift"], b["shift"]):
+                                continue
+                            if _mid in _existing_shifts:
+                                continue
+                            _ns, _ne = start_frame + _mid, end_frame + _mid
+                            if _ns < first_frame or _ne > last_frame:
+                                continue
+                            alt = _validate_at(_ns, _ne)
+                            _alt_hits = [j for j, h in enumerate(alt["pos_has_hit"]) if h]
+                            _alt_passes = (
+                                alt["hits_per_pos"] >= min_hits
+                                and alt["unknown_face_positions"] <= unknown_tol
+                            )
+                            _tag = f"between {a['shift']:+d} ({a['hits_per_pos']}/{n_pos}) and {b['shift']:+d} ({b['hits_per_pos']}/{n_pos})"
+                            if _alt_passes:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: half-step {_mid:+d} {_tag} "
+                                    f"candidate — hits {alt['hits_per_pos']}/{n_pos} at {_alt_hits}, "
+                                    f"unknowns {alt['unknown_face_positions']}/{n_pos}"
+                                )
+                                candidates.append({
+                                    "shift": _mid,
+                                    "start": _ns,
+                                    "end": _ne,
+                                    **alt,
+                                })
+                                _existing_shifts.add(_mid)
+                                if alt["hits_per_pos"] == n_pos:
+                                    break
+                            else:
+                                _reasons = []
+                                if alt["hits_per_pos"] < min_hits:
+                                    _reasons.append(f"hits {alt['hits_per_pos']}<{min_hits}")
+                                if alt["unknown_face_positions"] > unknown_tol:
+                                    _reasons.append(
+                                        f"unknown {alt['unknown_face_positions']}>{unknown_tol}"
+                                    )
+                                logger.info(
+                                    f"Chunk {chunk_idx}: half-step {_mid:+d} {_tag} "
+                                    f"ineligible — {', '.join(_reasons)}"
+                                )
+                        if any(c["hits_per_pos"] == n_pos for c in candidates):
+                            break
+
                 if candidates:
                     # Best = max hits, tiebreak min unknowns, tiebreak shift
                     # magnitude ascending (stay closer to the original pool
