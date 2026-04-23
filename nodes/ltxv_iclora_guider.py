@@ -233,8 +233,40 @@ class RSLTXVICLoRAGuider:
                         f"(video=embed, audio=0)"
                     )
 
+                # SageAttention's int8 / fp8 kernels require the sequence
+                # dimension to be divisible by 64. Round up the concatenated
+                # length to the next 64-multiple and zero-pad the tail. If
+                # the conditioning carries an attention_mask, extend it
+                # with zeros so the padded tokens are properly masked out
+                # (zero-padded tokens with a zero mask produce no attention
+                # contribution).
+                _SAGE_SEQ_ALIGN = 64
+
+                def _align_seq(cond_t, meta):
+                    seq = cond_t.shape[1]
+                    aligned = ((seq + _SAGE_SEQ_ALIGN - 1) // _SAGE_SEQ_ALIGN) * _SAGE_SEQ_ALIGN
+                    if aligned == seq:
+                        return cond_t, meta
+                    pad = torch.zeros(
+                        cond_t.shape[0], aligned - seq, cond_t.shape[2],
+                        device=cond_t.device, dtype=cond_t.dtype,
+                    )
+                    cond_t = torch.cat([cond_t, pad], dim=1)
+                    # Extend attention_mask if present so padding is masked.
+                    if isinstance(meta, dict):
+                        am = meta.get("attention_mask")
+                        if torch.is_tensor(am) and am.shape[-1] == seq:
+                            am_pad = torch.zeros(
+                                *am.shape[:-1], aligned - seq,
+                                device=am.device, dtype=am.dtype,
+                            )
+                            meta = dict(meta)
+                            meta["attention_mask"] = torch.cat([am, am_pad], dim=-1)
+                    return cond_t, meta
+
                 new_positive = []
                 first_desc = ""
+                first_seq_info = ""
                 for entry in positive:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         cond_t, meta = entry[0], entry[1]
@@ -247,12 +279,19 @@ class RSLTXVICLoRAGuider:
                     if e.shape[0] != cond_t.shape[0]:
                         e = e.expand(cond_t.shape[0], *e.shape[1:])
                     combined = torch.cat([cond_t, e], dim=1)
+                    pre_align = combined.shape[1]
+                    combined, meta = _align_seq(combined, meta)
+                    if not first_seq_info:
+                        first_seq_info = (
+                            f"seq_len {pre_align}->{combined.shape[1]} "
+                            f"(aligned to {_SAGE_SEQ_ALIGN})"
+                        ) if combined.shape[1] != pre_align else f"seq_len {pre_align}"
                     new_positive.append([combined, meta])
                 positive = new_positive
                 logger.info(
                     f"Scene embed concatenated to positive conditioning "
                     f"(shape={tuple(embed_tensor.shape)}, {first_desc}, "
-                    f"strength={scene_embed_strength})"
+                    f"{first_seq_info}, strength={scene_embed_strength})"
                 )
             else:
                 logger.warning(f"Scene embed: no tensor found in {scene_embed}, skipping")
