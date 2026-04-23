@@ -163,43 +163,87 @@ class RSLTXVICLoRAGuider:
         # it rides along with the user's prompt tokens. Negative is left
         # untouched — the embed is a "what we want" signal, not "what we
         # don't want".
+        #
+        # LTX-2's conditioning feature dim is structured: the first
+        # cross_attention_dim (4096 for 22B) is video/text context, the
+        # remaining tail is audio context. An audio-only embed (key name
+        # 'audio_context', feature dim 2048) gets zero-padded on the
+        # video portion before concat so its feature dim matches.
         if scene_embed and scene_embed != "none" and scene_embed_strength != 0:
             embed_path = folder_paths.get_full_path_or_raise("loras", scene_embed)
             embed_data = comfy.utils.load_torch_file(embed_path, safe_load=True)
+            embed_tensor = None
+            embed_key = ""
             if isinstance(embed_data, dict):
-                # Prefer conventional keys, else fall back to the first tensor in the file.
-                embed_tensor = None
                 for _key in (
                     "scene_embed", "scene_embedding",
                     "prompt_embed", "prompt_embedding",
+                    "audio_context", "audio_embed", "audio_embedding",
                     "conditioning", "embedding",
                 ):
                     if _key in embed_data and torch.is_tensor(embed_data[_key]):
                         embed_tensor = embed_data[_key]
-                        logger.info(f"Scene embed: using key '{_key}' from {scene_embed}")
+                        embed_key = _key
                         break
                 if embed_tensor is None:
                     for _k, _v in embed_data.items():
                         if torch.is_tensor(_v):
                             embed_tensor = _v
-                            logger.info(f"Scene embed: using first tensor key '{_k}' from {scene_embed}")
+                            embed_key = _k
                             break
             else:
                 embed_tensor = embed_data
+                embed_key = "<root tensor>"
             if embed_tensor is not None:
+                logger.info(f"Scene embed: using key '{embed_key}' from {scene_embed}")
                 if embed_tensor.dim() == 2:
                     embed_tensor = embed_tensor.unsqueeze(0)
                 elif embed_tensor.dim() == 1:
                     embed_tensor = embed_tensor.unsqueeze(0).unsqueeze(0)
                 if scene_embed_strength != 1.0:
                     embed_tensor = embed_tensor * scene_embed_strength
+
+                def _pad_feature_dim(e, cond_t, key_name):
+                    """Pad the embed's feature dim to match the conditioning's,
+                    placing the embed values in the correct slot based on the
+                    key name. Returns (padded_tensor, descriptor_str)."""
+                    cond_feat = cond_t.shape[-1]
+                    embed_feat = e.shape[-1]
+                    if embed_feat == cond_feat:
+                        return e, f"full ({embed_feat})"
+                    if embed_feat > cond_feat:
+                        # Truncate — rare, but protect against mismatched files.
+                        return e[..., :cond_feat], f"truncated {embed_feat}->{cond_feat}"
+                    # Smaller → need to pad. Decide slot from the key name.
+                    pad_len = cond_feat - embed_feat
+                    zeros = torch.zeros(
+                        *e.shape[:-1], pad_len,
+                        device=e.device, dtype=e.dtype,
+                    )
+                    kl = (key_name or "").lower()
+                    if "audio" in kl:
+                        # Video portion first, then audio embed.
+                        return torch.cat([zeros, e], dim=-1), (
+                            f"audio-only {embed_feat} padded in video {pad_len} "
+                            f"(video=0, audio=embed)"
+                        )
+                    # Default: assume it's video/text → put it up front.
+                    return torch.cat([e, zeros], dim=-1), (
+                        f"video-only {embed_feat} padded in audio {pad_len} "
+                        f"(video=embed, audio=0)"
+                    )
+
                 new_positive = []
+                first_desc = ""
                 for entry in positive:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         cond_t, meta = entry[0], entry[1]
                     else:
                         cond_t, meta = entry, {}
                     e = embed_tensor.to(cond_t.device, cond_t.dtype)
+                    e, desc = _pad_feature_dim(e, cond_t, embed_key)
+                    if not first_desc:
+                        first_desc = desc
                     if e.shape[0] != cond_t.shape[0]:
                         e = e.expand(cond_t.shape[0], *e.shape[1:])
                     combined = torch.cat([cond_t, e], dim=1)
@@ -207,7 +251,8 @@ class RSLTXVICLoRAGuider:
                 positive = new_positive
                 logger.info(
                     f"Scene embed concatenated to positive conditioning "
-                    f"(shape={tuple(embed_tensor.shape)}, strength={scene_embed_strength})"
+                    f"(shape={tuple(embed_tensor.shape)}, {first_desc}, "
+                    f"strength={scene_embed_strength})"
                 )
             else:
                 logger.warning(f"Scene embed: no tensor found in {scene_embed}, skipping")
