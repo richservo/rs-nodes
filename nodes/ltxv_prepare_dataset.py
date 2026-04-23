@@ -3021,11 +3021,19 @@ class RSLTXVPrepareDataset:
                         key=lambda c: (-c["hits_per_pos"], c["unknown_face_positions"]),
                     )
                     _best_seed = _best_sorted[0]
-                    _seed_hit_frames = [
-                        _best_seed["sample_positions"][i]
-                        for i, _h in enumerate(_best_seed["pos_has_hit"])
-                        if _h
-                    ]
+                    # Pool hit frames from every candidate whose shift is
+                    # within one chunk_len of the best shift — same local
+                    # on-screen window. Candidates far from the best
+                    # (e.g. a +2 chunk shift that found a DIFFERENT
+                    # window) are excluded so their hits don't drag the
+                    # center off the current cluster.
+                    _seed_hit_frames: list[int] = []
+                    for c in candidates:
+                        if abs(c["shift"] - _best_seed["shift"]) > _chunk_len:
+                            continue
+                        for _i, _h in enumerate(c["pos_has_hit"]):
+                            if _h:
+                                _seed_hit_frames.append(c["sample_positions"][_i])
                     if _seed_hit_frames:
                         # Center of the hit frame range — min + max halved
                         # is more robust than the mean when hits cluster at
@@ -3050,9 +3058,9 @@ class RSLTXVPrepareDataset:
                                     and alt["unknown_face_positions"] <= unknown_tol
                                 )
                                 _seed_tag = (
-                                    f"centered on {_best_seed['shift']:+d}'s hit "
-                                    f"frames ({len(_seed_hit_frames)} frames, "
-                                    f"center {_hit_center})"
+                                    f"centered on {len(_seed_hit_frames)} "
+                                    f"pooled hit frames near shift "
+                                    f"{_best_seed['shift']:+d} (center {_hit_center})"
                                 )
                                 if _alt_passes:
                                     logger.info(
