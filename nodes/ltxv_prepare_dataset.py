@@ -905,16 +905,21 @@ class RSLTXVPrepareDataset:
                 logger.info(f"Backfilled characters for {chars_backfilled} entries")
 
         # clip_check: re-scan EVERY existing clip and rewrite its
-        # characters field. Useful when the user has added a new
-        # reference character and wants existing clips updated to reflect
-        # it. Uses the same sample_count as the main gate so the scan
-        # is as thorough as extraction itself — a character who only
-        # appears briefly is still caught.
+        # characters field. Uses identical settings to the main
+        # scanner — same character_refs, same face_similarity
+        # threshold, same clip_vision, same sample_count, same
+        # first_match_only=False enumeration. The SCRFD detection
+        # confidence floor (_FACE_DET_MIN_CONFIDENCE) applies
+        # automatically through _analyze_frame. Identification
+        # results here will exactly match what extraction would
+        # produce for the same clip.
         if character_refs and clip_check:
             n_check = max(2, sample_count)
             total_clips = len(existing_entries)
             logger.info(
-                f"clip_check: re-scanning {total_clips} clips at {n_check} sample positions each..."
+                f"clip_check: re-scanning {total_clips} clips at {n_check} sample positions, "
+                f"face_similarity={face_similarity}, "
+                f"refs={sorted(character_refs.keys())}"
             )
             changed = 0
             added_by_char: dict[str, int] = {}
