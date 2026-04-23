@@ -41,6 +41,11 @@ class RSLTXVICLoRAGuider:
             },
             "optional": {
                 "lora_strength":     ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "lora_name_2": (["none"] + folder_paths.get_filename_list("loras"),
+                                {"default": "none",
+                                 "tooltip": "Optional second LoRA stacked on top of the primary IC-LoRA. Use for weights-only LoRAs that don't do their own guide injection — e.g. stack a detailer LoRA on a union canny/depth/pose LoRA. Only the primary LoRA's reference_downscale_factor is used; the second is loaded as pure weight deltas."}),
+                "lora_strength_2": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
+                                               "tooltip": "Strength for the second LoRA. 0 = disabled."}),
                 "scene_embed": (["none"] + folder_paths.get_filename_list("loras"),
                                 {"default": "none",
                                  "tooltip": "Optional scene / prompt embedding tensor (.safetensors) shipped alongside the LoRA. Concatenated to the positive conditioning to reliably trigger the LoRA's effect (e.g. Lightricks HDR LoRA's LogC scene embed)."}),
@@ -112,6 +117,7 @@ class RSLTXVICLoRAGuider:
         sampler=None, rediffusion_passes=1,
         distilled_lora="none", distilled_lora_strength=1.0,
         scene_embed="none", scene_embed_strength=1.0,
+        lora_name_2="none", lora_strength_2=1.0,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -126,6 +132,13 @@ class RSLTXVICLoRAGuider:
         if lora_strength != 0:
             m, _ = comfy.sd.load_lora_for_models(m, None, lora_data, lora_strength, 0)
             logger.info(f"Applied LoRA (strength={lora_strength})")
+
+        # --- Optional second LoRA stacked on top ---
+        if lora_name_2 and lora_name_2 != "none" and lora_strength_2 != 0:
+            lora_path_2 = folder_paths.get_full_path_or_raise("loras", lora_name_2)
+            lora_data_2 = comfy.utils.load_torch_file(lora_path_2, safe_load=True)
+            m, _ = comfy.sd.load_lora_for_models(m, None, lora_data_2, lora_strength_2, 0)
+            logger.info(f"Applied second LoRA: {lora_name_2} (strength={lora_strength_2})")
 
         # --- Attention override ---
         attn_func = None
