@@ -41,6 +41,11 @@ class RSLTXVICLoRAGuider:
             },
             "optional": {
                 "lora_strength":     ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "scene_embed": (["none"] + folder_paths.get_filename_list("loras"),
+                                {"default": "none",
+                                 "tooltip": "Optional scene / prompt embedding tensor (.safetensors) shipped alongside the LoRA. Concatenated to the positive conditioning to reliably trigger the LoRA's effect (e.g. Lightricks HDR LoRA's LogC scene embed)."}),
+                "scene_embed_strength": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.01,
+                                                    "tooltip": "Multiplier applied to the scene embed tensor before concat. 1.0 = as released; <1.0 = softer effect; >1.0 = stronger."}),
                 "control_strength":  ("FLOAT", {"default": 1.0, "min": 0.0,   "max": 1.0,  "step": 0.01}),
                 "guide_frame_idx":   ("INT",   {"default": 0,   "min": -1,    "max": 10000}),
                 "crf":               ("INT",   {"default": 35,  "min": 0,     "max": 100,
@@ -106,6 +111,7 @@ class RSLTXVICLoRAGuider:
         audio_modality_scale=3.0, video_attn_scale=1.03,
         sampler=None, rediffusion_passes=1,
         distilled_lora="none", distilled_lora_strength=1.0,
+        scene_embed="none", scene_embed_strength=1.0,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -149,6 +155,62 @@ class RSLTXVICLoRAGuider:
                 processed_frames.append(ltxv_preprocess(img[i], crf))
             img = torch.stack(processed_frames)
             logger.info(f"CRF preprocessed {img.shape[0]} control frame(s) (crf={crf})")
+
+        # --- Optional scene / prompt embedding concat ---
+        # Some LoRAs (e.g. Lightricks HDR) ship a pre-computed conditioning
+        # tensor that reliably triggers the LoRA's effect. Concatenate it
+        # to each positive conditioning along the sequence dimension so
+        # it rides along with the user's prompt tokens. Negative is left
+        # untouched — the embed is a "what we want" signal, not "what we
+        # don't want".
+        if scene_embed and scene_embed != "none" and scene_embed_strength != 0:
+            embed_path = folder_paths.get_full_path_or_raise("loras", scene_embed)
+            embed_data = comfy.utils.load_torch_file(embed_path, safe_load=True)
+            if isinstance(embed_data, dict):
+                # Prefer conventional keys, else fall back to the first tensor in the file.
+                embed_tensor = None
+                for _key in (
+                    "scene_embed", "scene_embedding",
+                    "prompt_embed", "prompt_embedding",
+                    "conditioning", "embedding",
+                ):
+                    if _key in embed_data and torch.is_tensor(embed_data[_key]):
+                        embed_tensor = embed_data[_key]
+                        logger.info(f"Scene embed: using key '{_key}' from {scene_embed}")
+                        break
+                if embed_tensor is None:
+                    for _k, _v in embed_data.items():
+                        if torch.is_tensor(_v):
+                            embed_tensor = _v
+                            logger.info(f"Scene embed: using first tensor key '{_k}' from {scene_embed}")
+                            break
+            else:
+                embed_tensor = embed_data
+            if embed_tensor is not None:
+                if embed_tensor.dim() == 2:
+                    embed_tensor = embed_tensor.unsqueeze(0)
+                elif embed_tensor.dim() == 1:
+                    embed_tensor = embed_tensor.unsqueeze(0).unsqueeze(0)
+                if scene_embed_strength != 1.0:
+                    embed_tensor = embed_tensor * scene_embed_strength
+                new_positive = []
+                for entry in positive:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        cond_t, meta = entry[0], entry[1]
+                    else:
+                        cond_t, meta = entry, {}
+                    e = embed_tensor.to(cond_t.device, cond_t.dtype)
+                    if e.shape[0] != cond_t.shape[0]:
+                        e = e.expand(cond_t.shape[0], *e.shape[1:])
+                    combined = torch.cat([cond_t, e], dim=1)
+                    new_positive.append([combined, meta])
+                positive = new_positive
+                logger.info(
+                    f"Scene embed concatenated to positive conditioning "
+                    f"(shape={tuple(embed_tensor.shape)}, strength={scene_embed_strength})"
+                )
+            else:
+                logger.warning(f"Scene embed: no tensor found in {scene_embed}, skipping")
 
         # --- Stamp frame rate on conditioning ---
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
