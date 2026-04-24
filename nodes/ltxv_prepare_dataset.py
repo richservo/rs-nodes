@@ -666,15 +666,6 @@ class RSLTXVPrepareDataset:
         target_w, target_h = int(bucket_parts[0]), int(bucket_parts[1])
         target_frames = int(bucket_parts[2]) if len(bucket_parts) > 2 else 49
 
-        # Compute target face embedding if provided
-        target_embedding = None
-        if target_face is not None and face_detection:
-            target_embedding = self._compute_target_embedding(target_face)
-            if target_embedding is not None:
-                logger.info(f"Target face embedding computed, similarity threshold: {face_similarity}")
-            else:
-                logger.warning("Could not extract face from target_face image, face matching disabled")
-
         # Multi-character mode: load a folder of reference images.  Each file's
         # stem becomes that character's trigger word.  Face-containing refs are
         # matched via face embeddings; non-face refs (puppets, props, objects)
@@ -692,6 +683,40 @@ class RSLTXVPrepareDataset:
                     f"({n_face} face, {n_clip} clip-vision) "
                     f"— {', '.join(sorted(character_refs.keys()))}"
                 )
+
+        # target_face pin: wired through the same character_refs pipeline as the
+        # folder path, using lora_trigger as the trigger name (equivalent to
+        # dropping one image in a folder named <lora_trigger>.jpg).
+        target_embedding = None
+        if target_face is not None and face_detection:
+            target_embedding = self._compute_target_embedding(target_face)
+            if target_embedding is None:
+                logger.warning("Could not extract face from target_face image, face matching disabled")
+            else:
+                trigger = (lora_trigger or "").strip().lower().replace("_", "-")
+                if not trigger:
+                    trigger = "subject"
+                    logger.warning("target_face connected without lora_trigger — defaulting trigger to 'subject'")
+                # Encode target_face tensor as base64 JPEG so Gemma can see the
+                # reference at caption time (matches _load_character_refs format).
+                import base64 as _b64
+                frame = target_face[0].cpu().numpy()
+                frame = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if ok:
+                    image_b64 = _b64.b64encode(buf.tobytes()).decode("utf-8")
+                    character_refs[trigger] = {
+                        "type": "face",
+                        "embedding": target_embedding,
+                        "image_b64": image_b64,
+                    }
+                    logger.info(f"target_face pin registered as character reference: {trigger} (similarity threshold: {face_similarity})")
+                    # Route exclusively through character_refs — avoid double-filtering
+                    # via the legacy target_embedding codepath.
+                    target_embedding = None
+                else:
+                    logger.warning("Could not JPEG-encode target_face — falling back to legacy target_embedding filter (no Gemma cast entry)")
 
         # Location references: labeled images of distinct sets/locations.
         # Gemma is shown these alongside the clip frames during captioning
