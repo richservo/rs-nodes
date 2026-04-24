@@ -322,6 +322,8 @@ class RSLTXVICLoRAGuider:
             "crf": crf,
             "lora_name": lora_name,
             "lora_strength": lora_strength,
+            "lora_name_2": lora_name_2,
+            "lora_strength_2": lora_strength_2,
             "attention_mode": attention_mode,
             "cfg": cfg,
             "audio_cfg": audio_cfg,

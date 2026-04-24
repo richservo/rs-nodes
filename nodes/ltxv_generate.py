@@ -1941,6 +1941,18 @@ class RSLTXVGenerate:
             logger.info(f"IC-LoRA re-applied: {ci['lora_name']} (strength={ci['lora_strength']})")
         del lora
 
+        # Re-apply optional second stacked LoRA (must run on every pass to match pass 1)
+        lora_name_2 = ci.get("lora_name_2", "none")
+        lora_strength_2 = ci.get("lora_strength_2", 0.0)
+        if lora_name_2 and lora_name_2 != "none" and lora_strength_2 != 0:
+            lora_path_2 = folder_paths.get_full_path_or_raise("loras", lora_name_2)
+            lora_2 = comfy.utils.load_torch_file(lora_path_2, safe_load=True)
+            up_model, _ = comfy.sd.load_lora_for_models(
+                up_model, None, lora_2, lora_strength_2, 0
+            )
+            logger.info(f"Second LoRA re-applied: {lora_name_2} (strength={lora_strength_2})")
+            del lora_2
+
         # Attention override
         attn_func = None
         attn_mode = ci.get("attention_mode", "auto")
