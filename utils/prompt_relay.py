@@ -21,9 +21,6 @@ from typing import Literal
 import torch
 
 EPS_FLOOR = 1e-4
-PAD_NEG = 1.0  # match _prepare_attention_mask's (mask - 1) convention; soft, but our
-               # C-penalty dominates anyway and we don't want to be MORE aggressive than
-               # the existing pipeline on real padding.
 
 
 def _seconds_to_video_latent(t_sec: float, frame_rate: float, T_lat: int) -> float:
@@ -99,14 +96,15 @@ def _convert_base_mask(
     """Normalize an incoming attention_mask to a float additive tensor that broadcasts
     against [B, 1, Q, K_total]. Returns None if base_mask is None.
 
-    Bool/int input is converted via (mask - 1) * PAD_NEG, matching the convention in
+    Bool/int input is converted via (mask - 1) * finfo.max, matching the convention in
     LTX's _prepare_attention_mask. Float input is passed through (with reshape to add
     the head/Q dims as needed).
     """
     if base_mask is None:
         return None
     if base_mask.dtype == torch.bool or not torch.is_floating_point(base_mask):
-        m = (base_mask.to(dtype) - 1.0) * PAD_NEG  # [B, K] or similar -> 0/-PAD_NEG
+        big = torch.finfo(dtype).max if dtype.is_floating_point else 1e4
+        m = (base_mask.to(dtype) - 1.0) * big   # 0 for valid, -big for padding
     else:
         m = base_mask.to(dtype)
     # Normalize shape -> [B, 1, ?, K]. We allow Q-dim to be 1 (broadcast) or full.
@@ -292,9 +290,9 @@ if __name__ == "__main__":
     pad_val = mask_pad[0, 0, 0, 19].item()
     valid_global = mask_pad[0, 0, 0, 0].item()
     assert valid_global == 0.0
-    # Padding contributes -PAD_NEG on top of any segment penalty.
-    assert pad_val <= -PAD_NEG + 1e-6, f"padding additive should be at most -{PAD_NEG}, got {pad_val}"
-    print(f"[video pad] valid_global={valid_global} pad_val={pad_val:.3f}  (expected <= -{PAD_NEG})")
+    # Padding contributes -finfo.max (effectively -inf for softmax) on top of any penalty.
+    assert pad_val < -1e30, f"padding should be very large negative (-finfo.max), got {pad_val}"
+    print(f"[video pad] valid_global={valid_global} pad_val={pad_val:.3e}  (expected very large negative)")
 
     # --- Audio stream ---
     audio_T_lat = 24  # 24 latent audio frames -> with dsf=4 hop=160 sr=16000:

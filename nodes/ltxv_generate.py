@@ -294,6 +294,14 @@ class RSLTXVGenerate:
         if ffn_chunks > 0:
             self._apply_ffn_chunking(m, ffn_chunks)
 
+        # Prompt Relay (auto-enabled when conditioning carries metadata)
+        pr_meta = self._extract_prompt_relay(positive)
+        if pr_meta is not None:
+            n_seg = len(pr_meta.get("segments", []))
+            logger.info(f"Prompt Relay active: {n_seg} segment(s), "
+                        f"global_len={pr_meta.get('global_len')}, ε={pr_meta.get('epsilon')}")
+            self._install_prompt_relay(m, pr_meta)
+
         # When audio is provided, derive video length from audio duration
         if audio is not None and audio_vae is not None:
             waveform = audio["waveform"]
@@ -2062,6 +2070,67 @@ class RSLTXVGenerate:
         torch.cuda.empty_cache()
         mm.soft_empty_cache()
 
+
+    @staticmethod
+    def _extract_prompt_relay(conditioning):
+        """Pull prompt_relay metadata off the first cond entry that carries it."""
+        if not conditioning:
+            return None
+        for entry in conditioning:
+            if len(entry) < 2 or not isinstance(entry[1], dict):
+                continue
+            pr = entry[1].get("prompt_relay")
+            if pr is not None:
+                return pr
+        return None
+
+    @staticmethod
+    def _install_prompt_relay(model_clone, pr_meta):
+        """Wrap diffusion_model.forward to inject the Prompt Relay cross-attention
+        penalty (arXiv 2604.10030).
+
+        The wrapper replaces `attention_mask` with a float [B, 1, Q, K] additive
+        mask before delegating to the original forward — LTX's _prepare_attention_mask
+        passes float-typed masks through unchanged, so the penalty reaches every
+        cross-attention block at every step (paper-faithful)."""
+        from ..utils.prompt_relay import build_relay_mask
+
+        # Compute expected K so we can sanity-check this is the cond we encoded
+        # (and skip the mask build for unrelated conditioning, e.g. negatives).
+        segs = pr_meta.get("segments", [])
+        expected_K = max((s["end_token"] for s in segs), default=pr_meta.get("global_len", 0))
+
+        original_forward = model_clone.model.diffusion_model.forward
+
+        def wrapped_forward(x, timestep, context, attention_mask=None,
+                            frame_rate=25, transformer_options={},
+                            keyframe_idxs=None, denoise_mask=None, **kwargs):
+            xs = x[0] if isinstance(x, list) else x
+            if (context is not None and context.ndim >= 2
+                    and context.shape[1] == expected_K and expected_K > 0):
+                attention_mask = build_relay_mask(
+                    "video",
+                    B=xs.shape[0],
+                    K_total=int(context.shape[1]),
+                    pr=pr_meta,
+                    base_mask=attention_mask,
+                    dtype=xs.dtype,
+                    device=xs.device,
+                    T_lat=int(xs.shape[2]),
+                    H_lat=int(xs.shape[3]),
+                    W_lat=int(xs.shape[4]),
+                    frame_rate=float(frame_rate),
+                )
+            return original_forward(
+                x, timestep, context, attention_mask,
+                frame_rate=frame_rate,
+                transformer_options=transformer_options,
+                keyframe_idxs=keyframe_idxs,
+                denoise_mask=denoise_mask,
+                **kwargs,
+            )
+
+        model_clone.add_object_patch("diffusion_model.forward", wrapped_forward)
 
     @staticmethod
     def _apply_ffn_chunking(model_clone, num_chunks):
