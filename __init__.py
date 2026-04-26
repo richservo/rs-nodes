@@ -23,6 +23,7 @@ from .nodes.sigma_scheduler import RSSigmaScheduler
 from .nodes.video_save import RSVideoSave
 from .nodes.exr_sequence_save import RSEXRSequenceSave
 from .nodes.logc3_decode import RSLogC3Decode
+from .nodes.prompt_relay_encode import RSPromptRelayEncode
 
 WEB_DIRECTORY = "./web"
 
@@ -52,6 +53,7 @@ NODE_CLASS_MAPPINGS = {
     "RSVideoSave": RSVideoSave,
     "RSEXRSequenceSave": RSEXRSequenceSave,
     "RSLogC3Decode": RSLogC3Decode,
+    "RSPromptRelayEncode": RSPromptRelayEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -80,6 +82,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSVideoSave": "RS Video Save (ProRes)",
     "RSEXRSequenceSave": "RS EXR Sequence Save",
     "RSLogC3Decode": "RS LogC3 HDR Decode",
+    "RSPromptRelayEncode": "RS Prompt Relay Encode",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
