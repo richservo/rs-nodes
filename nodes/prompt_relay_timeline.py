@@ -35,14 +35,28 @@ class RSPromptRelayTimeline:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("relay_json",)
+    RETURN_TYPES = ("STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("relay_json", "num_frames", "frame_rate")
     FUNCTION = "build"
     CATEGORY = "rs-nodes"
     OUTPUT_NODE = False
+
+    @staticmethod
+    def _legal_num_frames(total_duration_sec: float, frame_rate: float) -> int:
+        """Round total_duration_sec * frame_rate to the nearest LTX-legal frame
+        count, i.e. (N - 1) % 8 == 0 and N >= 9.
+
+        LTX's VAE has temporal stride 8 with a special first frame, so legal
+        clip lengths are 9, 17, 25, 33, ... = 8k + 1.
+        """
+        raw = max(int(round(total_duration_sec * frame_rate)), 1)
+        # Snap to nearest k for (8k + 1)
+        k = round((raw - 1) / 8.0)
+        return max(8 * k + 1, 9)
 
     def build(self, total_duration_sec, frame_rate, timeline_data):
         s = (timeline_data or "").strip()
         if not s:
             s = "{}"
-        return (s,)
+        num_frames = self._legal_num_frames(float(total_duration_sec), float(frame_rate))
+        return (s, num_frames, float(frame_rate))
