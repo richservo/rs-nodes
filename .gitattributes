@@ -1,0 +1,4 @@
+# Force LF line endings for shell scripts so Windows checkouts don't mangle
+# them with CRLF — bash treats \r as part of the command and errors with
+# "illegal character" / "$'\r': command not found".
+*.sh text eol=lf

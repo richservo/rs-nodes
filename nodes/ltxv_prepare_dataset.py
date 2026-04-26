@@ -123,24 +123,51 @@ def _list_text_encoder_dirs() -> list[str]:
 
 # Whisper speech transcription (lazy-loaded)
 _whisper_model = None
-_WHISPER_MODEL_SIZE = "base"  # small footprint, good enough for word boundaries
+_whisper_model_size_loaded: str | None = None
+# Default to large-v3 (~3GB) for best transcription quality.  Smaller sizes
+# (base, small, medium) hallucinate badly on music/SFX/chants which is exactly
+# the failure mode that pollutes character voice-attribution downstream.
+# The user can override via the prep node's `whisper_model` input.
+_WHISPER_MODEL_SIZE = "large-v3"
 _WORD_CUT_THRESHOLD = 0.3  # seconds — if last word ends within this of clip end, it's likely cut
 
 # Demucs vocal isolation (lazy-loaded)
 _demucs_model = None
 _demucs_device = None
 
+# Speechbrain ECAPA-TDNN speaker embedding (lazy-loaded).
+# Used for voice-attribution: embed each Whisper segment and match to enrolled
+# voice references via cosine distance.  No HF token required, no torchcodec.
+_speechbrain_embedder = None
+_VOICE_MATCH_THRESHOLD = 0.70  # cosine distance — lower = stricter
+_VOICE_MATCH_MARGIN = 0.05     # require winner to beat runner-up by this much
+_FACE_HINT_BONUS = 0.15        # subtract from distance when character is on-screen
+                                # (per face detection) — biases ambiguous matches
+                                # toward the visible character without overriding
+                                # strong off-screen voice evidence.
 
-def _get_whisper_model():
-    """Load Whisper model on first use. Cached after first call."""
-    global _whisper_model
-    if _whisper_model is not None:
+
+def _get_whisper_model(size: str | None = None):
+    """Load Whisper model on first use. Cached after first call.
+
+    If size differs from the cached model's size, the old model is dropped
+    and the requested size is loaded fresh.
+    """
+    global _whisper_model, _whisper_model_size_loaded
+    target = size or _WHISPER_MODEL_SIZE
+    if _whisper_model is not None and _whisper_model_size_loaded == target:
         return _whisper_model
+    if _whisper_model is not None and _whisper_model_size_loaded != target:
+        # Different size requested — drop the old model and reload.
+        logger.info(f"Whisper model size changed: {_whisper_model_size_loaded} -> {target}, reloading")
+        del _whisper_model
+        _whisper_model = None
     try:
         import whisper
-        logger.info(f"Loading Whisper model ({_WHISPER_MODEL_SIZE})...")
-        _whisper_model = whisper.load_model(_WHISPER_MODEL_SIZE)
-        logger.info("Whisper model loaded")
+        logger.info(f"Loading Whisper model ({target})...")
+        _whisper_model = whisper.load_model(target)
+        _whisper_model_size_loaded = target
+        logger.info(f"Whisper model loaded ({target})")
         return _whisper_model
     except ImportError:
         logger.error("openai-whisper not installed. Run: pip install openai-whisper")
@@ -214,67 +241,321 @@ def _isolate_vocals(clip_path: Path) -> Path | None:
         return None
 
 
-def _transcribe_clip(clip_path: Path) -> dict | None:
+_ECAPA_TARGET_SR = 16000  # speechbrain ECAPA-TDNN expects 16 kHz mono
+
+
+def _get_speechbrain_embedder():
+    """Lazy-load speechbrain ECAPA-TDNN speaker-embedding model.
+    No HF token required; weights are downloaded and cached on first use."""
+    global _speechbrain_embedder
+    if _speechbrain_embedder is not None:
+        return _speechbrain_embedder
+    try:
+        from speechbrain.inference.speaker import EncoderClassifier
+    except ImportError:
+        logger.error(
+            "speechbrain not installed. Run 'pip install speechbrain' in "
+            "ComfyUI's venv (or re-run install.bat). Voice attribution disabled."
+        )
+        return None
+    try:
+        logger.info("Loading speechbrain ECAPA-TDNN speaker embedder...")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # Cache weights under the custom-node folder so they're co-located with
+        # the rest of the project (and easy to wipe on reinstall).
+        savedir = Path(__file__).parent.parent / "models" / "spkrec-ecapa-voxceleb"
+        savedir.mkdir(parents=True, exist_ok=True)
+        # LocalStrategy.COPY avoids the default symlink behaviour, which fails
+        # on Windows without Developer Mode (WinError 1314: A required
+        # privilege is not held by the client).  Costs ~80MB extra disk for
+        # the duplicate vs the HF cache; portable across all platforms.
+        kwargs = dict(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=str(savedir),
+            run_opts={"device": device},
+        )
+        try:
+            from speechbrain.utils.fetching import LocalStrategy
+            kwargs["local_strategy"] = LocalStrategy.COPY
+        except ImportError:
+            pass  # older speechbrain — fall through to default symlink
+        embedder = EncoderClassifier.from_hparams(**kwargs)
+        _speechbrain_embedder = embedder
+        logger.info("Speechbrain ECAPA-TDNN loaded")
+        return embedder
+    except Exception as e:
+        logger.error(f"Failed to load speechbrain embedder: {e}")
+        return None
+
+
+def _load_audio_for_embedding(audio_path: Path):
+    """Load audio as a 1-channel 16 kHz tensor suitable for ECAPA-TDNN.
+    Returns (waveform[1, samples], sample_rate=16000) or (None, 0) on failure."""
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(str(audio_path))
+    except Exception as e:
+        logger.warning(f"Could not load audio {audio_path.name}: {e}")
+        return None, 0
+    if waveform.numel() == 0:
+        return None, 0
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != _ECAPA_TARGET_SR:
+        import torchaudio
+        waveform = torchaudio.functional.resample(waveform, sr, _ECAPA_TARGET_SR)
+    return waveform, _ECAPA_TARGET_SR
+
+
+def _embed_audio_segment(audio_path: Path, start: float, end: float) -> np.ndarray | None:
+    """Embed audio [start, end] seconds with ECAPA-TDNN.
+    Returns 192-d numpy array (L2-normalized) or None on failure."""
+    embedder = _get_speechbrain_embedder()
+    if embedder is None:
+        return None
+    waveform, sr = _load_audio_for_embedding(audio_path)
+    if waveform is None:
+        return None
+    s = max(0, int(start * sr))
+    e = min(waveform.shape[1], int(end * sr))
+    if e - s < int(0.3 * sr):  # need at least 0.3s for a stable embedding
+        return None
+    slice_wave = waveform[:, s:e]
+    try:
+        emb = embedder.encode_batch(slice_wave).squeeze().detach().cpu().numpy()
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb
+    except Exception as e:
+        logger.warning(f"Embedding failed for {audio_path.name} [{start:.2f}-{end:.2f}]: {e}")
+        return None
+
+
+def _embed_audio_full(audio_path: Path) -> np.ndarray | None:
+    """Embed an entire audio file (used for voice reference enrollment)."""
+    embedder = _get_speechbrain_embedder()
+    if embedder is None:
+        return None
+    waveform, _ = _load_audio_for_embedding(audio_path)
+    if waveform is None:
+        return None
+    try:
+        emb = embedder.encode_batch(waveform).squeeze().detach().cpu().numpy()
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb
+    except Exception as e:
+        logger.warning(f"Voice reference embedding failed for {audio_path.name}: {e}")
+        return None
+
+
+def _format_speaker_display(trigger: str) -> str:
+    """pee-wee → Pee-wee, miss-yvonne → Miss Yvonne, cowboy-curtis → Cowboy Curtis."""
+    if not trigger or trigger == "unknown":
+        return "Someone"
+    parts = trigger.replace("_", "-").split("-")
+    return " ".join(p[:1].upper() + p[1:] for p in parts if p)
+
+
+def _transcribe_clip(clip_path: Path, voice_refs: dict | None = None,
+                     face_chars: set | None = None) -> dict | None:
     """Run Demucs vocal isolation then Whisper on a clip.
     Returns dict with 'text', 'words' list of {word, start, end}, 'duration'.
-    Returns None if transcription fails or no speech detected."""
+    Returns None if transcription fails or no speech detected.
+
+    When voice_refs is provided, also runs pyannote speaker diarization +
+    embedding to attribute each segment to a known speaker.  In that case
+    the returned dict additionally contains 'segments': list of {speaker,
+    text, start, end} and 'text' is rewritten with speaker labels of the
+    form `<Speaker Display Name>: "<line>"`, joined sequentially.  Speakers
+    that don't match any enrolled voice above threshold are tagged as
+    'unknown' (rendered as "Someone").
+    """
     model = _get_whisper_model()
     if model is None:
         return None
 
     import whisper
 
-    # Isolate vocals to remove music/sfx before transcribing
+    # Isolate vocals to remove music/sfx before transcribing.  We keep the
+    # vocals file alive across both Whisper and pyannote so diarization and
+    # speaker embedding see the same isolated audio Whisper transcribed.
     vocals_path = _isolate_vocals(clip_path)
     audio_source = str(vocals_path) if vocals_path else str(clip_path)
 
+    whisper_segs: list[dict] = []
+    text = ""
     try:
-        result = whisper.transcribe(model, audio_source, word_timestamps=True)
-    except Exception as e:
-        logger.warning(f"Whisper transcription failed for {clip_path.name}: {e}")
-        return None
+        try:
+            result = whisper.transcribe(model, audio_source, word_timestamps=True)
+        except Exception as e:
+            logger.warning(f"Whisper transcription failed for {clip_path.name}: {e}")
+            return None
+
+        text = result.get("text", "").strip()
+        if not text:
+            return None
+
+        # Detect Whisper hallucinations — non-Latin gibberish when there's no speech
+        latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+        total_alpha = sum(1 for c in text if c.isalpha())
+        if total_alpha > 0 and latin_chars / total_alpha < 0.5:
+            logger.info(f"  Whisper hallucination detected, no usable speech: {text[:60]}")
+            return {"text": "", "words": [], "duration": 0.0, "hallucination": True}
+
+        # Extract word-level timestamps
+        words = []
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                words.append({
+                    "word": w["word"].strip(),
+                    "start": w["start"],
+                    "end": w["end"],
+                })
+
+        # Get clip duration via ffprobe
+        duration = 0.0
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(clip_path)],
+                capture_output=True, text=True,
+            )
+            duration = float(probe.stdout.strip())
+        except (ValueError, OSError):
+            pass
+
+        whisper_segs = [
+            {"start": float(s["start"]), "end": float(s["end"]),
+             "text": s.get("text", "").strip()}
+            for s in result.get("segments", [])
+            if s.get("text", "").strip()
+        ]
+
+        # No voice references → return flat-text format (legacy callers).
+        if not voice_refs:
+            return {"text": text, "words": words, "duration": duration}
+
+        # Voice attribution: embed each Whisper segment with ECAPA-TDNN and
+        # match against enrolled voice prints.  When face_chars is provided
+        # (the visible characters from face detection), it biases ambiguous
+        # matches toward on-screen speakers.
+        embedded_audio = Path(audio_source)
+        segments = _attribute_whisper_segments(
+            embedded_audio, whisper_segs, voice_refs, face_chars=face_chars,
+        )
+        if segments is None:
+            # Diarization unavailable — fall back to flat text but flag it.
+            logger.info(
+                f"  Voice attribution unavailable for {clip_path.name} — "
+                f"emitting flat transcript without speaker labels"
+            )
+            return {"text": text, "words": words, "duration": duration}
+
+        # Rebuild flat text with `<Speaker>: "<line>"` labels so any consumer
+        # reading the legacy 'text' field still gets the speaker context.
+        flat_parts = []
+        for s in segments:
+            sp_disp = _format_speaker_display(s["speaker"])
+            line = s["text"].strip().rstrip(".!?")
+            flat_parts.append(f'{sp_disp}: "{line}".')
+        flat_text = " ".join(flat_parts) if flat_parts else text
+
+        return {
+            "text": flat_text,
+            "words": words,
+            "duration": duration,
+            "segments": segments,
+        }
     finally:
-        # Clean up vocals temp file
+        # Clean up vocals temp file (after both Whisper AND any diarization)
         if vocals_path:
             try:
                 vocals_path.unlink()
             except OSError:
                 pass
 
-    text = result.get("text", "").strip()
-    if not text:
+
+def _attribute_whisper_segments(
+    audio_path: Path, whisper_segs: list[dict], voice_refs: dict,
+    face_chars: set | None = None,
+) -> list[dict] | None:
+    """For each Whisper segment, embed its audio slice and match against
+    enrolled voice_refs via cosine distance. Returns one entry per Whisper
+    segment tagged with the matched speaker name (or 'unknown').
+
+    Whisper's segments are already speech-bounded, so we don't need a
+    separate diarization pass — each segment gets independently attributed.
+    Trade-off: segments that contain TWO speakers (overlap) get a single
+    label.  In practice, Whisper's segmenter cuts on speaker change boundaries
+    fairly often, and our use case has mostly single-speaker clips anyway.
+
+    Returns None if the embedder isn't available — caller falls back to
+    flat-text transcripts.
+    """
+    embedder = _get_speechbrain_embedder()
+    if embedder is None:
         return None
 
-    # Detect Whisper hallucinations — non-Latin gibberish when there's no speech
-    latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
-    total_alpha = sum(1 for c in text if c.isalpha())
-    if total_alpha > 0 and latin_chars / total_alpha < 0.5:
-        logger.info(f"  Whisper hallucination detected, no usable speech: {text[:60]}")
-        return {"text": "", "words": [], "duration": 0.0, "hallucination": True}
+    waveform, sr = _load_audio_for_embedding(audio_path)
+    if waveform is None:
+        return None
 
-    # Extract word-level timestamps
-    words = []
-    for seg in result.get("segments", []):
-        for w in seg.get("words", []):
-            words.append({
-                "word": w["word"].strip(),
-                "start": w["start"],
-                "end": w["end"],
-            })
-
-    # Get clip duration via ffprobe
-    duration = 0.0
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(clip_path)],
-            capture_output=True, text=True,
-        )
-        duration = float(probe.stdout.strip())
-    except (ValueError, OSError):
-        pass
-
-    return {"text": text, "words": words, "duration": duration}
+    segments_out: list[dict] = []
+    for ws in whisper_segs:
+        s_frame = max(0, int(ws["start"] * sr))
+        e_frame = min(waveform.shape[1], int(ws["end"] * sr))
+        slice_dur = (e_frame - s_frame) / sr if sr else 0.0
+        speaker = "unknown"
+        match_diag = ""
+        if slice_dur >= 0.3:  # need ~0.3s for a stable embedding
+            try:
+                slice_wave = waveform[:, s_frame:e_frame]
+                emb = embedder.encode_batch(slice_wave).squeeze().detach().cpu().numpy()
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                    # Compute raw + face-hint-adjusted distance per candidate.
+                    # Face hint subtracts a small bonus when the character is
+                    # on-screen for this clip, biasing ambiguous matches toward
+                    # visible speakers without overriding strong off-screen
+                    # voice evidence.
+                    scored = []
+                    for name, ref_emb in voice_refs.items():
+                        raw = 1.0 - float(np.dot(emb, ref_emb))
+                        adj = raw - _FACE_HINT_BONUS if (face_chars and name in face_chars) else raw
+                        scored.append((name, raw, adj))
+                    # Rank by adjusted distance (lower = better match)
+                    scored.sort(key=lambda p: p[2])
+                    best_name, best_raw, best_adj = scored[0]
+                    runner_adj = scored[1][2] if len(scored) > 1 else float("inf")
+                    margin = runner_adj - best_adj
+                    if best_adj <= _VOICE_MATCH_THRESHOLD and margin >= _VOICE_MATCH_MARGIN:
+                        speaker = best_name
+                    # Log raw and adjusted (face-hinted) distances so threshold
+                    # tuning is informed by real data.
+                    summary = ", ".join(
+                        f"{n}={r:.2f}" + (f"→{a:.2f}*" if a != r else "")
+                        for n, r, a in scored
+                    )
+                    match_diag = (
+                        f" [match: best={best_name}@{best_adj:.2f} "
+                        f"margin={margin:.2f} → {speaker}; all: {summary}]"
+                    )
+            except Exception as e:
+                logger.warning(f"Speaker match failed for segment "
+                               f"[{ws['start']:.2f}-{ws['end']:.2f}]: {e}")
+        if match_diag:
+            logger.info(f"  seg [{ws['start']:.1f}-{ws['end']:.1f}]{match_diag}")
+        segments_out.append({
+            "speaker": speaker,
+            "text": ws["text"],
+            "start": ws["start"],
+            "end": ws["end"],
+        })
+    return segments_out
 
 
 # InsightFace (SCRFD detection + ArcFace recognition, antelopev2 model pack).
@@ -579,6 +860,7 @@ class RSLTXVPrepareDataset:
                 "skip_id_pass": ("BOOLEAN", {"default": False, "tooltip": "Skip cast/location ID passes — send ALL reference images directly to the captioner and let it identify characters and locations itself in one shot."}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "transcribe_speech": ("BOOLEAN", {"default": False, "tooltip": "Transcribe speech in clips using Whisper and append to captions. Also adjusts clip boundaries to avoid cutting words."}),
+                "whisper_model": (["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"], {"default": "large-v3", "tooltip": "Whisper model size for transcription. Larger = far better accuracy, especially on music/SFX/unusual vocabulary, at the cost of more VRAM (large-v3 ≈ 3GB) and slower per-clip processing. Drop to 'base' or 'small' only for quick tests."}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0, "step": 0.001, "tooltip": "Target framerate for output clips (0=keep source fps). Drops frames to match target without affecting audio speed."}),
                 "max_samples": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Maximum total character appearances across the dataset (0=unlimited). With N characters defined, each character gets a quota of max_samples/N appearances. Total clip count can be less than max_samples when characters share clips — the goal is even per-character distribution, not a specific clip count."}),
@@ -586,6 +868,7 @@ class RSLTXVPrepareDataset:
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
                 "character_refs_folder": ("STRING", {"default": "", "tooltip": "Multi-character mode: path to a folder of reference face images. Filename (minus extension) is used as that character's trigger word. Clips are kept if ANY reference matches. All matched characters are named in captions."}),
+                "voice_refs_folder": ("STRING", {"default": "", "tooltip": "Optional: path to a folder of voice reference clips (one per character). Filename stem must match the corresponding character_refs_folder entry. When provided, each line of dialogue is attributed to a known speaker via speechbrain ECAPA-TDNN voice matching; the captioner then weaves the dialogue into the caption with speaker attribution. Recommended: 30+ seconds of clean isolated speech per character."}),
                 "location_refs_folder": ("STRING", {"default": "", "tooltip": "Optional: path to a folder of reference images for distinct locations/sets (e.g. 'Main Room', 'Kitchen'). Filename (minus extension) is the location name. Gemma picks the best match per clip and uses it in the caption. Soft — clips with no location match are still captioned normally."}),
                 "skip_start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 1.0, "tooltip": "Skip the first N seconds of every video (useful for cutting out repetitive intros)."}),
                 "skip_end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 1.0, "tooltip": "Skip the last N seconds of every video (useful for cutting out end credits)."}),
@@ -631,8 +914,10 @@ class RSLTXVPrepareDataset:
         crop_mode: str = "face_crop",
         face_detection: bool = True,
         transcribe_speech: bool = False,
+        whisper_model: str = "large-v3",
         target_face=None,
         character_refs_folder: str = "",
+        voice_refs_folder: str = "",
         location_refs_folder: str = "",
         skip_start_seconds: float = 0.0,
         skip_end_seconds: float = 0.0,
@@ -651,6 +936,10 @@ class RSLTXVPrepareDataset:
         unique_id=None,
     ):
         validate_submodule()
+        # Set the global whisper model size from the input — _get_whisper_model
+        # uses this when loading.  Changing this between runs forces a reload.
+        global _WHISPER_MODEL_SIZE
+        _WHISPER_MODEL_SIZE = whisper_model
         # Only validate/download text encoder if we'll need it for the subprocess
         # (when CLIP is provided, text encoding is done in-process and doesn't need Gemma on disk)
         if clip is None:
@@ -684,6 +973,19 @@ class RSLTXVPrepareDataset:
                     f"Multi-character mode: loaded {len(character_refs)} references "
                     f"({n_face} face, {n_clip} clip-vision) "
                     f"— {', '.join(sorted(character_refs.keys()))}"
+                )
+
+        # Voice references: optional folder of audio clips per character (one
+        # clip per character, filename stem = trigger). When populated, the
+        # transcriber runs pyannote diarization + speaker embedding to attribute
+        # each line of dialogue to a known speaker.
+        voice_refs: dict[str, np.ndarray] = {}
+        if voice_refs_folder and transcribe_speech:
+            voice_refs = self._load_voice_refs(voice_refs_folder)
+            if voice_refs:
+                logger.info(
+                    f"Voice attribution: loaded {len(voice_refs)} voice reference(s) "
+                    f"— {', '.join(sorted(voice_refs.keys()))}"
                 )
 
         # target_face pin: wired through the same character_refs pipeline as the
@@ -911,18 +1213,19 @@ class RSLTXVPrepareDataset:
                 # Use key existence so silent clips (transcript=="") don't
                 # trigger another transcription pass on subsequent runs.
                 if transcribe_speech and "transcript" not in entry:
-                    tr = _transcribe_clip(clip_file)
+                    _face_chars = set(entry.get("characters") or [])
+                    tr = _transcribe_clip(clip_file, voice_refs=voice_refs, face_chars=_face_chars)
                     if tr and tr.get("hallucination"):
-                        logger.info(f"  No usable speech, deleting orphan: {clip_file.name}")
-                        try:
-                            clip_file.unlink()
-                        except OSError:
-                            pass
+                        logger.info(f"  No usable speech, quarantining orphan: {clip_file.name}")
+                        q_path = self._quarantine_clip(clip_file, output_dir, "speech_hallucination")
+                        self._record_clip_rejection(rejected_path, entry, "speech_hallucination", quarantined_path=q_path)
                         existing_entries.remove(entry)
                         orphans_added -= 1
                         continue
                     if tr and tr["text"]:
                         entry["transcript"] = tr["text"]
+                        if tr.get("segments"):
+                            entry["transcript_segments"] = tr["segments"]
                         logger.info(f"  Transcribed {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
                     else:
                         # Silent clip — record the attempt so we don't re-load whisper.
@@ -1071,17 +1374,21 @@ class RSLTXVPrepareDataset:
             hallucination_purge = []
             for entry in backfill_targets:
                 clip_file = Path(entry["media_path"])
-                tr = _transcribe_clip(clip_file)
+                _face_chars = set(entry.get("characters") or [])
+                tr = _transcribe_clip(clip_file, voice_refs=voice_refs, face_chars=_face_chars)
                 if tr and tr.get("hallucination"):
-                    logger.info(f"  No usable speech, deleting: {clip_file.name}")
-                    try:
-                        clip_file.unlink()
-                    except OSError:
-                        pass
+                    logger.info(f"  No usable speech, quarantining: {clip_file.name}")
+                    q_path = self._quarantine_clip(clip_file, output_dir, "speech_hallucination")
+                    self._record_clip_rejection(rejected_path, entry, "speech_hallucination", quarantined_path=q_path)
                     hallucination_purge.append(entry)
+                    # Don't mutate existing_entries mid-iteration; the purge
+                    # list is processed after the loop.  Skip the per-clip
+                    # save here — the entry will be removed at end of loop.
                     continue
                 if tr and tr["text"]:
                     entry["transcript"] = tr["text"]
+                    if tr.get("segments"):
+                        entry["transcript_segments"] = tr["segments"]
                     backfilled += 1
                     logger.info(f"  Backfill transcript {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
                 else:
@@ -1089,11 +1396,27 @@ class RSLTXVPrepareDataset:
                     # don't re-load whisper for it on every subsequent run.
                     entry["transcript"] = ""
                     silent_marked += 1
+                # Persist after every successful clip so an interrupted run
+                # doesn't waste the work done so far.  Atomic write via temp +
+                # rename so the file is never half-written.
+                try:
+                    tmp_path = dataset_json_path.with_suffix(dataset_json_path.suffix + ".tmp")
+                    with open(tmp_path, "w") as f:
+                        json.dump(existing_entries, f, indent=2)
+                    os.replace(tmp_path, dataset_json_path)
+                except OSError as e:
+                    logger.warning(f"Could not write dataset.json mid-run: {e}")
             for entry in hallucination_purge:
                 existing_entries.remove(entry)
             if backfilled or hallucination_purge or silent_marked:
-                with open(dataset_json_path, "w") as f:
-                    json.dump(existing_entries, f, indent=2)
+                # Final save after hallucination purge
+                try:
+                    tmp_path = dataset_json_path.with_suffix(dataset_json_path.suffix + ".tmp")
+                    with open(tmp_path, "w") as f:
+                        json.dump(existing_entries, f, indent=2)
+                    os.replace(tmp_path, dataset_json_path)
+                except OSError as e:
+                    logger.warning(f"Could not write dataset.json: {e}")
                 if backfilled:
                     logger.info(f"Backfilled {backfilled} missing transcripts")
                 if silent_marked:
@@ -1443,6 +1766,7 @@ class RSLTXVPrepareDataset:
                             skip_end_seconds=skip_end_seconds,
                             target_fps=target_fps,
                             transcribe_speech=transcribe_speech,
+                            voice_refs=voice_refs,
                             target_chunk_idx=ci,
                             sample_count=sample_count,
                             char_positions_required=char_positions_required,
@@ -1554,6 +1878,9 @@ class RSLTXVPrepareDataset:
                                 # so silent clips don't trigger re-transcription
                                 # on subsequent runs.
                                 entry["transcript"] = result_transcript or ""
+                                clip_segs = getattr(self, "_clip_segments", {}).get(str(result_path))
+                                if clip_segs:
+                                    entry["transcript_segments"] = clip_segs
                             if clip_chars:
                                 entry["characters"] = clip_chars
                             if ref_folder and ref_folder.exists():
@@ -1672,6 +1999,7 @@ class RSLTXVPrepareDataset:
                                 skip_end_seconds=skip_end_seconds,
                                 target_fps=target_fps,
                                 transcribe_speech=transcribe_speech,
+                                voice_refs=voice_refs,
                                 sample_count=sample_count,
                                 char_positions_required=char_positions_required,
                                 allow_unknown_faces_in=allow_unknown_faces_in,
@@ -1687,6 +2015,9 @@ class RSLTXVPrepareDataset:
                                     # Always record the transcript field (even "")
                                     # so silent clips don't trigger re-transcription.
                                     entry["transcript"] = result_transcript or ""
+                                    clip_segs = getattr(self, "_clip_segments", {}).get(str(result_path))
+                                    if clip_segs:
+                                        entry["transcript_segments"] = clip_segs
                                 clip_chars = getattr(self, "_clip_characters", {}).get(str(result_path), [])
                                 if clip_chars:
                                     entry["characters"] = clip_chars
@@ -1783,8 +2114,9 @@ class RSLTXVPrepareDataset:
 
         # Transcripts are now stored directly in dataset entries during extraction
 
-        # Unload whisper + demucs before captioning to free VRAM
+        # Unload whisper + demucs + speechbrain before captioning to free VRAM
         global _whisper_model, _demucs_model, _demucs_device
+        global _speechbrain_embedder
         freed = []
         if _whisper_model is not None:
             del _whisper_model
@@ -1795,6 +2127,13 @@ class RSLTXVPrepareDataset:
             _demucs_model = None
             _demucs_device = None
             freed.append("Demucs")
+        if _speechbrain_embedder is not None:
+            try:
+                del _speechbrain_embedder
+            except Exception:
+                pass
+            _speechbrain_embedder = None
+            freed.append("speechbrain-ecapa")
         if freed:
             import gc
             gc.collect()
@@ -1878,8 +2217,12 @@ class RSLTXVPrepareDataset:
         # The combined text goes into a separate "caption_with_transcript" field
         # so the original caption stays clean.  For subprocess encoding we
         # temporarily write the combined text into "caption" then restore it.
+        # Voice-attributed clips skip this step — their captioner already wove
+        # the dialogue inline (see _prepare_clip_for_caption / DIALOGUE CONTEXT).
         if transcribe_speech:
             for entry in existing_entries:
+                if entry.get("transcript_segments"):
+                    continue
                 transcript = entry.get("transcript", "")
                 if transcript:
                     cap = entry.get("caption", "")
@@ -1964,12 +2307,14 @@ class RSLTXVPrepareDataset:
     @staticmethod
     def _unload_all_prepper_models():
         """Free everything the prepper holds: InsightFace, Whisper, Demucs,
-        memoization caches, and ComfyUI's currently-loaded models. Safe to
-        call even if nothing was loaded — each unload is guarded.
+        speechbrain ECAPA-TDNN, memoization caches, and ComfyUI's currently-
+        loaded models. Safe to call even if nothing was loaded — each unload
+        is guarded.
         """
         global _whisper_model, _demucs_model, _demucs_device
         global _face_app, _face_app_checked
         global _last_analysis_frame_id, _last_analysis_faces
+        global _speechbrain_embedder
 
         freed = []
         if _whisper_model is not None:
@@ -1989,6 +2334,13 @@ class RSLTXVPrepareDataset:
             _face_app = None
             _face_app_checked = False
             freed.append("InsightFace")
+        if _speechbrain_embedder is not None:
+            try:
+                del _speechbrain_embedder
+            except Exception:
+                pass
+            _speechbrain_embedder = None
+            freed.append("speechbrain-ecapa")
 
         # Drop frame memoization (holds a reference to the most recent frame)
         _last_analysis_frame_id = None
@@ -2400,6 +2752,57 @@ class RSLTXVPrepareDataset:
             logger.info(f"Loaded character reference (clip-vision): {trigger}")
         return refs
 
+    # Audio + video extensions accepted for voice references.  Video files
+    # are handled the same way as audio files — _isolate_vocals already runs
+    # ffmpeg to pull audio out of any container, then Demucs isolates vocals.
+    _VOICE_REF_EXTENSIONS = {
+        ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus",
+        ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v",
+    }
+
+    def _load_voice_refs(self, refs_folder: str) -> dict[str, np.ndarray]:
+        """Load voice reference clips. Each file's stem becomes the speaker's
+        trigger (matching character_refs keys). Vocals are isolated via Demucs
+        before embedding so reference embeddings are computed from clean
+        speech, matching how clip-time embeddings are computed.
+
+        Returns {trigger: l2_normalized_embedding (np.ndarray)}.
+        """
+        refs: dict[str, np.ndarray] = {}
+        folder = Path(refs_folder)
+        if not folder.exists() or not folder.is_dir():
+            logger.warning(f"Voice refs folder not found: {refs_folder}")
+            return refs
+        if _get_speechbrain_embedder() is None:
+            logger.warning(
+                "Voice attribution requested but speechbrain embedder unavailable — "
+                "skipping voice reference enrollment."
+            )
+            return refs
+
+        for f in sorted(folder.iterdir()):
+            if f.suffix.lower() not in self._VOICE_REF_EXTENSIONS:
+                continue
+            trigger = f.stem.lower().replace("_", "-")
+            # Demucs isolation matches what _transcribe_clip does so the
+            # enrollment domain matches the inference domain.
+            vocals_path = _isolate_vocals(f)
+            embed_source = vocals_path if vocals_path else f
+            try:
+                emb = _embed_audio_full(embed_source)
+            finally:
+                if vocals_path:
+                    try:
+                        vocals_path.unlink()
+                    except OSError:
+                        pass
+            if emb is None:
+                logger.warning(f"Could not embed voice reference: {f.name}")
+                continue
+            refs[trigger] = emb
+            logger.info(f"Loaded voice reference: {trigger}")
+        return refs
+
     def _load_location_refs(self, refs_folder: str) -> dict[str, str]:
         """Load reference images for distinct locations/sets.  Filename
         stem (underscores -> spaces) becomes the location label.  Returns
@@ -2600,6 +3003,77 @@ class RSLTXVPrepareDataset:
             rejected_chunk_files.add(cf)
         self._consumed_chunks = []
 
+    @staticmethod
+    def _quarantine_clip(clip_path: Path, output_dir: Path, reason: str) -> Path | None:
+        """Move a clip to <output_dir>/rejected_clips/<reason>/ instead of
+        deleting it.  Files stay recoverable for inspection — the user can
+        review what got auto-rejected and restore false positives.  Returns
+        the new path (or None if the move failed).
+        """
+        if not clip_path.exists():
+            return None
+        # Sanitize reason into a folder name (e.g. "speech_hallucination")
+        safe_reason = "".join(c if c.isalnum() or c in "_-" else "_" for c in reason)
+        dest_dir = output_dir / "rejected_clips" / safe_reason
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not create quarantine dir {dest_dir}: {e}")
+            return None
+        dest = dest_dir / clip_path.name
+        # If a file already exists at the destination, append a counter
+        if dest.exists():
+            i = 1
+            while True:
+                alt = dest_dir / f"{clip_path.stem}_{i}{clip_path.suffix}"
+                if not alt.exists():
+                    dest = alt
+                    break
+                i += 1
+        try:
+            shutil.move(str(clip_path), str(dest))
+            logger.info(f"  Quarantined to {dest_dir.name}/: {clip_path.name}")
+            return dest
+        except OSError as e:
+            logger.warning(f"Could not quarantine {clip_path.name}: {e}")
+            return None
+
+    @staticmethod
+    def _record_clip_rejection(rejected_path: Path, entry: dict, reason: str,
+                                quarantined_path: Path | None = None) -> None:
+        """Append a rejection record for a single clip to rejected.json with
+        chunk-level info. Used when a clip is removed mid-run (hallucination,
+        manual delete, etc.) so we have a paper trail and the chunk pool
+        knows the slot is freed."""
+        clip_path = Path(entry.get("media_path", ""))
+        rej = {
+            "source_file": entry.get("source_file", ""),
+            "media_path": str(clip_path),
+            "chunk_file": clip_path.name,
+            "reason": reason,
+        }
+        if quarantined_path is not None:
+            rej["quarantined_path"] = str(quarantined_path)
+        stem = clip_path.stem
+        if "_chunk" in stem:
+            try:
+                rej["chunk_idx"] = int(stem.rsplit("_chunk", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        existing: list[dict] = []
+        if rejected_path.exists():
+            try:
+                with open(rejected_path) as rf:
+                    existing = json.load(rf)
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        existing.append(rej)
+        try:
+            with open(rejected_path, "w") as rf:
+                json.dump(existing, rf, indent=2)
+        except OSError as e:
+            logger.warning(f"Could not write rejected.json: {e}")
+
     def _flush_rejected_chunks(
         self,
         rejected_path: Path,
@@ -2642,6 +3116,7 @@ class RSLTXVPrepareDataset:
         skip_end_seconds: float = 0.0,
         target_fps: float = 0.0,
         transcribe_speech: bool = False,
+        voice_refs: dict | None = None,
         max_new_clips: int = 0,
         target_chunk_idx: int = -1,
         sample_count: int = 4,
@@ -3461,20 +3936,23 @@ class RSLTXVPrepareDataset:
 
             # --- Transcribe speech and fix word boundaries ---
             if transcribe_speech and out_path.exists():
-                tr = _transcribe_clip(out_path)
+                # Use the face-detected characters as a hint for speaker matching.
+                _face_chars = set(matched_names) if matched_names else None
+                tr = _transcribe_clip(out_path, voice_refs=voice_refs, face_chars=_face_chars)
                 if tr and tr.get("hallucination"):
-                    # No usable speech — delete clip and skip
-                    logger.info(f"  Deleting clip with no usable speech: {out_path.name}")
-                    try:
-                        out_path.unlink()
-                    except OSError:
-                        pass
-                    self._rejected_chunks.append({
+                    # No usable speech — quarantine clip (don't delete) so it
+                    # can be inspected later for false positives.
+                    logger.info(f"  No usable speech, quarantining clip: {out_path.name}")
+                    q_path = self._quarantine_clip(out_path, clips_dir.parent, "speech_hallucination")
+                    rej_record = {
                         "source_file": str(video_path),
                         "media_path": str(out_path),
                         "chunk_file": out_path.name,
                         "reason": "speech_hallucination",
-                    })
+                    }
+                    if q_path is not None:
+                        rej_record["quarantined_path"] = str(q_path)
+                    self._rejected_chunks.append(rej_record)
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
@@ -3539,12 +4017,19 @@ class RSLTXVPrepareDataset:
                                 re_result = subprocess.run(re_cmd, capture_output=True, text=True)
                                 if re_result.returncode == 0:
                                     # Re-transcribe the shifted clip
-                                    tr = _transcribe_clip(out_path)
+                                    _face_chars = set(matched_names) if matched_names else None
+                                    tr = _transcribe_clip(out_path, voice_refs=voice_refs, face_chars=_face_chars)
 
                     # Store transcript text to return to caller
                     if tr and tr["text"]:
                         clip_transcript = tr["text"]
                         logger.info(f"  Transcript: {clip_transcript[:80]}{'...' if len(clip_transcript) > 80 else ''}")
+                    # Stash speaker-attributed segments on self so the caller
+                    # can read them by clip path (parallels _clip_characters).
+                    if tr and tr.get("segments"):
+                        if not hasattr(self, "_clip_segments"):
+                            self._clip_segments = {}
+                        self._clip_segments[str(out_path)] = tr["segments"]
 
             clips.append((out_path, clip_transcript if transcribe_speech else None))
             # Store matched characters for balanced sampling
@@ -3673,6 +4158,7 @@ class RSLTXVPrepareDataset:
                     location_refs=location_refs,
                     skip_id_pass=skip_id_pass,
                     expected_cast=entry.get("characters") or None,
+                    transcript_segments=entry.get("transcript_segments"),
                 )
 
                 if prep is None:
@@ -3953,6 +4439,7 @@ class RSLTXVPrepareDataset:
         location_refs: list[tuple[str, str]] | None = None,
         skip_id_pass: bool = False,
         expected_cast: list[str] | None = None,
+        transcript_segments: list[dict] | None = None,
     ) -> dict | None:
         """Prepare a clip for captioning: extract frames, run cast ID and
         location ID.  Returns a dict with all info needed for the caption
@@ -4204,6 +4691,37 @@ class RSLTXVPrepareDataset:
                     f"'{identified_location}'. When describing the environment "
                     f"or location, refer to it by that exact name.\n\n"
                     + user_content
+                )
+
+        # Voice-attributed dialogue: when speaker diarization produced per-line
+        # speaker tags, give them to the captioner as DIALOGUE CONTEXT and
+        # instruct it to weave the lines naturally into the prose.
+        if transcript_segments:
+            dialogue_lines = []
+            for s in transcript_segments:
+                sp = _format_speaker_display(s.get("speaker", "unknown"))
+                line = (s.get("text") or "").strip().rstrip(".!?")
+                if line:
+                    dialogue_lines.append(f'- {sp}: "{line}"')
+            if dialogue_lines:
+                dialogue_block = (
+                    "DIALOGUE CONTEXT (detected speech in this clip, with speaker "
+                    "attribution from voice analysis — treat as ground truth):\n"
+                    + "\n".join(dialogue_lines)
+                    + "\n\nWeave these lines naturally into the caption prose. "
+                    "Attribute each line to the correct speaker by name and "
+                    "render the dialogue as part of the action — e.g. "
+                    "\"<speaker> stands by the window and says, '<line>'\". "
+                    "Do NOT list the lines separately at the end. If a line is "
+                    "tagged as 'Someone' (unmatched speaker), describe it "
+                    "generically (e.g. \"a voice off-screen says, '<line>'\")."
+                )
+                user_content = user_content + "\n\n" + dialogue_block
+                system_prompt = system_prompt + (
+                    " When DIALOGUE CONTEXT is provided in the user message, "
+                    "incorporate every line into the caption inline, attributed "
+                    "to the named speaker. The dialogue is ground-truth audio "
+                    "from the clip — never invent or omit lines."
                 )
 
         return {

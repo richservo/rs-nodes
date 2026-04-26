@@ -17,3 +17,6 @@ psutil
 einops
 insightface
 onnxruntime-gpu
+# Audio: vocal isolation (Demucs) + speaker embedding (speechbrain ECAPA-TDNN)
+demucs
+speechbrain>=1.0

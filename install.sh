@@ -29,3 +29,8 @@ echo
 echo "============================================"
 echo " Installation complete!"
 echo "============================================"
+echo
+echo "Speaker-attributed dialogue captioning (voice_refs_folder) uses"
+echo "speechbrain ECAPA-TDNN, which auto-downloads on first use. No"
+echo "HuggingFace token or terms acceptance required."
+echo

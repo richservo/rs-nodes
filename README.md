@@ -312,7 +312,7 @@ All-in-one Z-Image Turbo generation with Qwen3-4B text encoder, RenormCFG, and s
 
 #### RS LTXV Prepare Dataset
 
-Scans a folder of videos/images, optionally detects and crops faces, generates captions via Ollama, and preprocesses latents for LoRA training.
+Scans a folder of videos/images, optionally detects and crops faces, **identifies speakers by voice**, generates captions via Ollama with woven-in dialogue, and preprocesses latents for LoRA training.
 
 **Required Inputs:**
 
@@ -323,25 +323,49 @@ Scans a folder of videos/images, optionally detects and crops faces, generates c
 | `text_encoder_path` | STRING | Gemma-3 HF directory (auto-download available) |
 | `output_name` | STRING | Name for preprocessed output folder |
 
-**Optional Inputs:**
+**Optional Inputs — Captioning:**
 
 | Input | Type | Default | Description |
 |---|---|---|---|
 | `resolution_buckets` | STRING | "576x576x49" | WxHxF resolution buckets (semicolon-separated) |
 | `lora_trigger` | STRING | "" | Trigger word prepended to all captions |
 | `caption_mode` | ENUM | ollama | `ollama`, `skip`, `auto_filename` |
-| `caption_style` | ENUM | subject | `subject`, `subject + style`, `style`, `motion`, `general` |
-| `ollama_model` | STRING | "gemma3:27b" | Vision model for captioning |
-| `face_detection` | BOOLEAN | True | Enable face detection and cropping |
-| `target_face` | IMAGE | — | Reference face for identity matching |
-| `character_refs_folder` | STRING | "" | Multi-character mode: folder of reference face images |
+| `caption_style` | ENUM | subject | `subject`, `subject + style`, `style`, `motion`, `general`, `multi_character` |
+| `ollama_model` | STRING | "gemma4:26b" | Vision model for captioning |
+| `skip_id_pass` | BOOLEAN | False | Skip cast/location ID pass — send all refs directly to captioner |
+
+**Optional Inputs — Face Detection & Character ID:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `face_detection` | BOOLEAN | True | Enable InsightFace (antelopev2) face detection + ArcFace embedding |
+| `target_face` | IMAGE | — | Reference face for single-character identity matching (uses `lora_trigger` as the character name) |
+| `character_refs_folder` | STRING | "" | Multi-character mode: folder of reference face images. Filename stem = character trigger |
 | `location_refs_folder` | STRING | "" | Location reference images folder |
+| `face_similarity` | FLOAT | 0.40 | Face match threshold |
+| `face_padding` | FLOAT | 0.6 | Padding around detected face for face-crop mode |
+| `crop_mode` | ENUM | face_crop | `face_crop`, `pan_and_scan`, `full_frame` |
+
+**Optional Inputs — Speech Transcription & Voice Attribution:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `transcribe_speech` | BOOLEAN | False | Enable Whisper transcription with Demucs vocal isolation |
+| `whisper_model` | ENUM | large-v3 | Whisper model size (`tiny`/`base`/`small`/`medium`/`large-v2`/`large-v3`/`large-v3-turbo`) |
+| `voice_refs_folder` | STRING | "" | Folder of voice reference clips (audio OR video). Filename stem must match `character_refs` entries. Enables per-line speaker attribution via speechbrain ECAPA-TDNN |
+
+**Optional Inputs — Other:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `target_fps` | FLOAT | 0.0 | Target framerate (0 = source fps). Drops/keeps frames to match without affecting audio speed |
+| `max_samples` | INT | 0 | Max total character appearances. Quotas split evenly across characters (e.g. max=200, 4 chars → 50 each) |
 | `skip_start_seconds` | FLOAT | 0.0 | Skip first N seconds of every video |
 | `skip_end_seconds` | FLOAT | 0.0 | Skip last N seconds of every video |
-| `face_similarity` | FLOAT | 0.40 | Face match threshold |
 | `conditioning_folder` | STRING | "" | IC-LoRA conditioning inputs folder |
-| `clip` | CLIP | — | Text encoder for in-process encoding |
+| `clip` | CLIP | — | Text encoder for in-process condition encoding |
 | `vae` | VAE | — | VAE for in-process latent encoding |
+| `clip_vision` | CLIP_VISION | — | Optional CLIP Vision model for matching non-human characters (puppets, props) |
 
 **Outputs:**
 
@@ -351,14 +375,43 @@ Scans a folder of videos/images, optionally detects and crops faces, generates c
 | `dataset_json_path` | STRING | Path to dataset JSON |
 
 **Key Behaviors:**
-- Two-phase processing: clip generation then latent preprocessing
-- Face detection via OpenCV DNN with optional identity matching
-- **Multi-character mode**: reference folder with named face/CLIP-vision images — auto-identifies cast per clip
-- **Location mode**: reference folder for distinct locations — auto-matches settings per clip
-- **Pan & scan**: face-aware cropping for optimal framing
-- Incremental: skips already-processed clips, tracks rejections, removes missing clips on re-run
-- Caption styles control what gets described (environment vs subject vs both)
-- Captioner carries forward character recognition from previous clips in the session
+
+*Extraction & Selection:*
+- Two-phase processing: clip generation → latent preprocessing
+- Face detection via InsightFace (SCRFD + ArcFace, antelopev2 model pack)
+- **Multi-character mode**: drop face refs in `character_refs_folder` — auto-identifies cast per clip, balances quotas across characters
+- **Location mode**: separate folder for set/location references — Gemma matches location per clip
+- **Pan & scan**: face-aware cropping at any aspect ratio while keeping the face in frame
+- **Frame-count safety**: clip extraction always overshoots target frame count and trims, so clips never come up short of the bucket minimum
+- **Incremental & resumable**: per-clip atomic saves — interrupted runs continue from where they stopped; transcripts and conditions persist as they're generated
+- **Quarantine, never delete**: clips that fail (hallucination, no usable speech, no matching characters, etc.) move to `<output_dir>/rejected_clips/<reason>/` instead of being deleted, so false positives can be reviewed and restored
+
+*Speech Transcription:*
+- Demucs vocal isolation runs first to strip music/SFX before Whisper transcribes
+- Default model is **`large-v3`** for best accuracy on character voices, accents, and unusual vocabulary; configurable down to `tiny` for quick tests
+- Silent clips get an empty transcript `""` (recorded once, never re-attempted on subsequent runs)
+
+*Voice Attribution (when `voice_refs_folder` is set):*
+- Each character's voice reference is embedded with **speechbrain ECAPA-TDNN** (192-d L2-normalized vector, downloaded automatically — no HuggingFace token needed)
+- For each Whisper segment in a clip, ECAPA produces a per-segment embedding that's matched against enrolled voice prints by cosine distance
+- **Face-detection hint**: the on-screen character (from face detection) gets a small distance bonus, biasing ambiguous matches toward the visible speaker without overriding strong off-screen voice evidence
+- Each segment is tagged with the matched character (or `unknown` for short utterances / unenrolled voices)
+- Tagged segments are passed to the captioner as a **DIALOGUE CONTEXT** block, and Gemma weaves the lines naturally into the caption ("X stands by the window and says, '...'") instead of appending dialogue as a separate field
+
+*Caption Encoding (in-process when `clip` is connected):*
+- Captions stay clean in `dataset.json` (visual prose only — dialogue is woven in by the captioner)
+- At text-encode time, captions are normalized: quote-wrapping single quotes are stripped (so `'pee-wee'` becomes `pee-wee` without affecting `Pee-wee's` or `it's`); known character names are case-normalized using the canonical trigger (so a stray `Cowboy curd is` from a Whisper mistranscription still encodes as `Cowboy Curtis`)
+- Original captions in `dataset.json` are never mutated — the normalization only affects the encoded `.pt` tensors
+
+*VRAM Management:*
+- All prepper-loaded models (Whisper, Demucs, ECAPA-TDNN, InsightFace) are unloaded between phases, with a final unload sweep before `prepare()` returns so unattended workflows that follow with training start with a clean GPU
+
+**Voice Reference Files:**
+- Format: any audio (`.wav`, `.mp3`, `.flac`, `.m4a`, `.ogg`, `.opus`) or video (`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.m4v`) — audio is auto-extracted from video via ffmpeg
+- Naming: filename stem must match the `character_refs_folder` entry (e.g. `cowboy curtis.wav` matches `cowboy curtis.jpg`)
+- Length: 10-30 seconds of clean speech is the sweet spot; under 5 seconds risks unstable embeddings
+- Variety helps: different sentences/intonations beat one repeated phrase. Concatenating short clips of the same character with ffmpeg works fine — each character can be built from 4-6 short single-speaker clips spliced together
+- Demucs runs on enrollment too, so background music/effects in your reference clip get stripped automatically
 
 ---
 
