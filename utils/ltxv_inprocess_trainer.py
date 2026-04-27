@@ -402,22 +402,63 @@ class InProcessTrainer:
         data_iter = iter(dataloader)
         start_step = self._global_step
 
-        # Restore loss history from previous run (for chart + divergence continuity)
+        # Restore loss history from previous run (for chart + divergence continuity).
+        # Truncate any entries past `start_step` — those are leftovers from a crashed
+        # run whose checkpoint didn't keep pace with the loss log. Without this, the
+        # chart shows doubled lines and the "current step" header reads the failed
+        # run's max instead of the actual resumed step.
         loss_history_path = self._output_dir / "loss_history.json"
+        self._ema_history: list[tuple[int, float]] = []
+        self._ema_loss = None
+        self._ema_min = None
+        self._ema_min_step = 0
+        self._loss_steps: list[dict] = []
         if start_step > 0 and loss_history_path.exists():
             try:
                 import json
                 with open(loss_history_path) as f:
                     history = json.load(f)
-                self._ema_history = [(s, v) for s, v in history.get("ema_history", [])]
-                self._ema_loss = history.get("ema_loss")
-                self._ema_min = history.get("ema_min")
-                self._ema_min_step = history.get("ema_min_step", 0)
-                # Replay loss data to the chart via websocket
+                all_steps = history.get("steps", [])
+                all_ema   = history.get("ema_history", [])
+                truncated_steps = [e for e in all_steps if int(e.get("step", 0)) <= start_step]
+                truncated_ema   = [(int(s), float(v)) for (s, v) in all_ema if int(s) <= start_step]
+                dropped = len(all_steps) - len(truncated_steps)
+                if dropped > 0:
+                    logger.info(
+                        f"Loss history: dropping {dropped} stale entr"
+                        f"{'y' if dropped == 1 else 'ies'} past resumed step {start_step}"
+                    )
+
+                self._loss_steps = truncated_steps
+                self._ema_history = truncated_ema
+                # Recompute EMA min from the filtered history so the divergence
+                # baseline matches what's actually plotted.
+                if truncated_ema:
+                    min_step, min_val = min(truncated_ema, key=lambda x: x[1])
+                    self._ema_min = min_val
+                    self._ema_min_step = min_step
+                    self._ema_loss = truncated_ema[-1][1]
+
+                # Persist the truncated history immediately so a re-crash before any
+                # new step write doesn't replay the same stale leftovers next time.
+                if dropped > 0:
+                    try:
+                        with open(loss_history_path, "w") as f:
+                            json.dump({
+                                "steps": truncated_steps,
+                                "ema_history": [list(p) for p in truncated_ema],
+                                "ema_loss": self._ema_loss,
+                                "ema_min": self._ema_min,
+                                "ema_min_step": self._ema_min_step,
+                            }, f)
+                    except Exception as e:
+                        logger.warning(f"Could not persist truncated loss history: {e}")
+
+                # Replay (truncated) loss data to the chart via websocket
                 if self._node_id:
                     try:
                         from server import PromptServer
-                        for entry in history.get("steps", []):
+                        for entry in truncated_steps:
                             PromptServer.instance.send_sync("rs-training-update", {
                                 "node_id": self._node_id,
                                 "step": entry["step"],
@@ -432,19 +473,15 @@ class InProcessTrainer:
                             })
                     except Exception:
                         pass
-                logger.info(f"Restored loss history ({len(self._ema_history)} EMA points, min={self._ema_min:.4f} at step {self._ema_min_step})")
+                if self._ema_min is not None:
+                    logger.info(
+                        f"Restored loss history ({len(self._ema_history)} EMA points, "
+                        f"min={self._ema_min:.4f} at step {self._ema_min_step})"
+                    )
+                else:
+                    logger.info(f"Restored loss history (empty after truncation to step {start_step})")
             except Exception as e:
                 logger.warning(f"Could not restore loss history: {e}")
-
-        # Track per-step loss data for saving
-        self._loss_steps: list[dict] = []
-        if start_step > 0 and loss_history_path.exists():
-            try:
-                import json
-                with open(loss_history_path) as f:
-                    self._loss_steps = json.load(f).get("steps", [])
-            except Exception:
-                pass
 
         # Suppress sage attention warnings during training (fp8 quantized weights
         # produce dtypes sage doesn't support — falls back to pytorch attention).

@@ -87,8 +87,8 @@ class RSLTXVGenerate:
                 "upscale_steps":     ("INT",   {"default": 4,   "min": 1,   "max": 10000}),
                 "upscale_cfg":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "upscale_denoise":   ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,   "step": 0.01}),
-                "upscale_sigma_curve": (["auto", "shifted", "linear"], {
-                    "tooltip": "Sigma schedule for upscale re-diffusion. shifted = LTX 2.3 official curve (good for full model). linear = uniform sigmas from denoise to 0 with full step count (no head-trim) — better for distilled LoRAs whose noise trajectory was compressed during distillation. auto picks linear when 'distill' appears in upscale_lora filename, shifted otherwise."}),
+                "upscale_sigma_curve": (["auto", "shifted", "scaled"], {
+                    "tooltip": "Sigma schedule for upscale re-diffusion. shifted = LTX 2.3 official curve with integer head-trim (great quality on full model, but the trim chops to 2 transitions at low step counts and leaves a 0.10→0 leap that produces artifacts on distilled LoRAs). scaled = same shifted curve shape rescaled into [0, denoise] with no trim, so all steps stay as denoising transitions; preserves the curve's quality character at lower noise. auto picks scaled when 'distill' appears in upscale_lora filename, shifted otherwise."}),
                 "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 "upscale_tiling":    ("BOOLEAN", {"default": False, "tooltip": "Enable temporal tiling for upscale. Reduces VRAM but will cause temporal instability in fine details. Use ffn_chunks instead if possible."}),
                 "upscale_tile_t":    ("INT",     {"default": 4, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size (latent frames) when upscale_tiling is enabled (0 = auto). Reduce if OOM during upscale."}),
@@ -1136,11 +1136,9 @@ class RSLTXVGenerate:
                     # Re-diffusion at upscaled resolution
                     has_image_guides = len(up_guides) > 0
                     do_rediffusion = has_image_guides and upscale_denoise > 0 and upscale_steps > 0
-                    if has_image_guides:
-                        rediffusion_label = f"{upscale_steps} steps, cfg={upscale_cfg}"
-                    else:
-                        rediffusion_label = f"3 steps (manual sigmas), cfg={upscale_cfg}"
-                        do_rediffusion = True  # T2V always re-diffuses with manual sigmas
+                    rediffusion_label = f"{upscale_steps} steps, cfg={upscale_cfg}"
+                    if not has_image_guides:
+                        do_rediffusion = True  # T2V always re-diffuses
                     if do_rediffusion:
                         logger.info(f"Re-diffusing at upscaled resolution ({rediffusion_label})")
                         self._free_vram()
@@ -2051,33 +2049,40 @@ class RSLTXVGenerate:
 
     @staticmethod
     def _resolve_upscale_sigma_curve(curve, upscale_lora):
-        """Resolve 'auto' to 'linear' or 'shifted' based on whether the upscale
-        LoRA filename suggests a distilled model. Returns 'shifted' or 'linear'."""
-        if curve in ("shifted", "linear"):
+        """Resolve 'auto' to 'scaled' or 'shifted' based on whether the upscale
+        LoRA filename suggests a distilled model. Returns 'shifted' or 'scaled'."""
+        if curve in ("shifted", "scaled"):
             return curve
         if isinstance(upscale_lora, str) and upscale_lora and "distill" in upscale_lora.lower():
-            return "linear"
+            return "scaled"
         return "shifted"
 
     @staticmethod
     def _build_upscale_sigmas(steps, denoise, shift, curve):
         """Build the sigma schedule for an upscale re-diffusion pass.
 
-        curve='shifted': the LTX 2.3 official shift-warped schedule with the
-            head trimmed by (1-denoise)*steps. Designed for the full model;
-            with low step counts and partial denoise the integer trim chops
-            half the schedule and leaves only 2-3 transitions, which the
-            distilled LoRA can't recover from cleanly (artifacts).
+        Both curves share the LTX 2.3 shift-warped base (which is what
+        produces the model's high-quality refinement character):
 
-        curve='linear': uniform spacing from `denoise` down to 0 across
-            `steps+1` values — no head trim, so all `steps` slots become
-            actual denoising transitions. Better for distilled LoRAs whose
-            noise trajectory was compressed during distillation; lets the
-            user keep their requested step count and denoise without paying
-            the integer-trim tax.
+            t = linspace(1, 0, steps+1)
+            omz = (1/t - 1) / (exp(shift) + (1/t - 1))    # shift warp
+            omz_norm such that last non-zero entry == 0.9 # (= LTX endpoint)
+            base_sig = 1 - omz_norm                        # ends at 0.1, then 0
+
+        curve='shifted': trim the head by int((1-denoise)*steps) to start the
+            schedule at the appropriate sigma. This is the official LTX 2.3
+            workflow behaviour. Keeps the curve's high-sigma transitions and
+            its end-snap. Drawback at low step counts + partial denoise: the
+            integer trim can leave only 2-3 transitions (e.g. steps=4
+            denoise=0.5 → [0.6285, 0.10, 0.0]); the 0.10 → 0 leap can produce
+            artifacts on distilled LoRAs.
+
+        curve='scaled': keep the FULL shifted curve (all `steps` transitions)
+            and uniformly rescale into [0, denoise] so the starting sigma
+            equals denoise. Same shape as 'shifted' (= same quality
+            character) but every requested step is a real denoising
+            transition. Recommended for distilled LoRAs at low step counts.
         """
-        if curve == "linear":
-            return torch.linspace(float(denoise), 0.0, int(steps) + 1).float()
         exp_shift = math.exp(shift)
         t = torch.linspace(1.0, 0.0, int(steps) + 1, dtype=torch.float64)
         non_zero = t != 0
@@ -2086,9 +2091,19 @@ class RSLTXVGenerate:
         nz_omz = omz[non_zero]
         sf = nz_omz[-1] / (1.0 - 0.1)
         omz[non_zero] = nz_omz / sf
-        sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+        base_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+
+        if curve == "scaled":
+            # Rescale the whole curve so its peak == denoise; ends at 0.
+            peak = float(base_sig[0].item())
+            if peak <= 0:
+                return base_sig
+            scale = float(denoise) / peak
+            return (base_sig * scale).float()
+
+        # 'shifted' (default): integer head-trim per denoise.
         start_step = int((1.0 - float(denoise)) * int(steps))
-        return sig[start_step:]
+        return base_sig[start_step:]
 
     @staticmethod
     def _extract_prompt_relay(conditioning):
