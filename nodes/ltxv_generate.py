@@ -1359,6 +1359,54 @@ class RSLTXVGenerate:
                             positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
                             negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
 
+                        # AUDIO POLISH PASS:
+                        # The scaled sigma curve is great for video (no artifacts) but the
+                        # smooth low-magnitude trajectory leaves audio sounding "tinny" — audio
+                        # benefits from the original shifted curve's bigger sigma leaps. Run a
+                        # second short sampling pass with shifted sigmas where the video latent
+                        # is frozen (denoise_mask=0) and audio gets re-refined (denoise_mask=1).
+                        # The audio attends the FINAL clean video during refinement, which is
+                        # better cross-modal coupling than the main pass provides.
+                        _curve_used = self._resolve_upscale_sigma_curve(upscale_sigma_curve, upscale_lora)
+                        if (audio_latent_out is not None
+                                and _curve_used == "scaled"
+                                and upscale_steps > 0 and upscale_denoise > 0):
+                            logger.info("Audio polish pass: shifted sigmas on audio, video frozen")
+                            polish_sig = self._build_upscale_sigmas(
+                                upscale_steps, upscale_denoise, up_shift, "shifted"
+                            )
+                            logger.info(f"Audio polish sigmas (shifted, {len(polish_sig)}): {polish_sig.tolist()}")
+
+                            polish_video = output_latent["samples"]
+                            polish_audio = audio_latent_out
+                            polish_input = comfy.nested_tensor.NestedTensor((polish_video, polish_audio))
+                            polish_noise = comfy.nested_tensor.NestedTensor((
+                                torch.zeros_like(polish_video),
+                                torch.randn_like(polish_audio),
+                            ))
+                            polish_mask = comfy.nested_tensor.NestedTensor((
+                                torch.zeros_like(polish_video),
+                                torch.ones_like(polish_audio),
+                            ))
+
+                            polish_cb = latent_preview.prepare_callback(
+                                up_guider.model_patcher, polish_sig.shape[-1] - 1
+                            )
+                            polish_out = up_guider.sample(
+                                polish_noise, polish_input, up_sampler, polish_sig,
+                                denoise_mask=polish_mask,
+                                callback=polish_cb,
+                                disable_pbar=disable_pbar,
+                                seed=seed + 2,
+                            )
+                            polish_out = polish_out.to(mm.intermediate_device())
+                            if polish_out.is_nested:
+                                _polish_parts = polish_out.unbind()
+                                if len(_polish_parts) > 1:
+                                    audio_latent_out = _polish_parts[1]
+                            logger.info("Audio polish complete")
+                            self._free_vram()
+
                         # Free rediffusion model to reclaim VRAM for VAE decode
                         del up_model, up_guider
                         self._free_vram()
