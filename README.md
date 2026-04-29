@@ -441,7 +441,9 @@ In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer
 | `epochs` | INT | 3 | Number of passes through the full dataset |
 | `auto_stop` | BOOLEAN | False | Ignore epoch count — train until divergence detection stops |
 | `optimizer` | ENUM | adamw8bit | `adamw8bit`, `adamw`, or `rose` |
-| `rose_stabilize` | BOOLEAN | True | ROSE only: CV Trust Gating (try False for some conditions) |
+| `rose_stabilize` | BOOLEAN | True | Rose only: Smooths noisy gradient ranges. |
+| `rose_weight_decay` | FLOAT | 1e-4 | Rose only: Decoupled weight decay strength. |
+| `rose_wd_schedule` | BOOLEAN | True | Rose only: Scale weight decay with LR schedule. |
 | `scheduler` | ENUM | linear | LR schedule: `linear`, `constant`, `cosine`, `cosine_with_restarts`, `polynomial` |
 | `lr_cycle_steps` | INT | 0 | LR schedule cycle length (0 = one cycle per epoch) |
 | `lr_cycle_decay` | FLOAT | 1.0 | Multiply LR by this factor each cycle reset (1.0 = no decay) |
@@ -466,7 +468,7 @@ In-process LoRA training for LTX-2, reusing ComfyUI's already-loaded transformer
 **Key Behaviors:**
 - **In-process**: reuses the loaded 22B transformer — no reload, no double memory
 - **Training monitor**: click "Open Training Monitor" on the node to open a full-page loss chart in a new browser tab. Shows raw loss dots, EMA-smoothed line, color-coded trend line, step timing, and divergence status. Loads history from `loss_history.json` on refresh.
-- **ROSE optimizer**: stateless optimizer — no momentum buffers, lower memory. ROSE-specific settings auto-hide when another optimizer is selected.
+- **Rose optimizer**: stateless optimizer — no momentum buffers, lower memory. Rose-specific settings auto-hide when another optimizer is selected.
 - **Divergence detection**: monitors EMA loss vs minimum. If loss rises above threshold% for too long, saves a checkpoint and attempts LR reset. If unrecoverable, stops training and rewinds to the pre-divergence checkpoint.
 - **LR cycle decay**: progressive learning rate reduction across scheduler cycles (e.g., 0.9 = 10% reduction per cycle)
 - **Loss history persistence**: saves `loss_history.json` every 50 steps for chart continuity across resume/restart
@@ -835,7 +837,7 @@ Persistent incrementing counter. State stored in `counter_state.json` across wor
 - Use **`fp8-quanto`** quantization (no C++ build tools needed).
 - **Subject LoRAs**: enable self-attention + cross-attention. Captions should describe everything *except* the subject.
 - **Style LoRAs**: enable self-attention + feed-forward. Captions should describe the visual style in detail.
-- **ROSE optimizer**: stateless, lower memory than AdamW. LR may need to be ~2x higher than AdamW (model-dependent — experiment).
+- **Rose optimizer**: stateless, lower memory than AdamW. LR may need to be ~2x higher than AdamW (model-dependent — experiment).
 - **Divergence detection**: uses EMA loss distance from minimum. Threshold of 15% is a good default. Auto-saves checkpoint at detection, attempts LR reset, stops and rewinds if unrecoverable.
 - **Resume**: restores optimizer state, loss history, and LR schedule. The training monitor loads history from `loss_history.json` automatically.
 - **Training Monitor**: open via the link on the training node. Full-page chart with raw loss dots, EMA-smoothed line, trend line (green=decreasing, red=increasing), step timing, and divergence status. Resizes with the browser window.

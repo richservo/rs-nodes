@@ -7,22 +7,17 @@ echo
 cd "$(dirname "$0")"
 
 # Initialize LTX-2 submodule (required for LoRA training)
-echo "[1/4] Initializing LTX-2 submodule..."
+echo "[1/3] Initializing LTX-2 submodule..."
 git submodule update --init
 echo
 
 # Install Python dependencies (won't touch torch/ComfyUI packages)
-echo "[2/4] Installing Python dependencies..."
+echo "[2/3] Installing Python dependencies..."
 pip install -r requirements.txt
 echo
 
-# Install ROSE optimizer (stateless optimizer for LoRA training)
-echo "[3/4] Installing ROSE optimizer..."
-pip install git+https://github.com/MatthewK78/Rose
-echo
-
 # Pre-download InsightFace antelopev2 face detection + recognition pack (~300MB)
-echo "[4/4] Pre-downloading InsightFace antelopev2 models..."
+echo "[3/3] Pre-downloading InsightFace antelopev2 models..."
 python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" || echo "  (download will retry on first use)"
 echo
 

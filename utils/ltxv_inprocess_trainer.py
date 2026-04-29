@@ -117,7 +117,7 @@ class InProcessTrainer:
         optimizer_type: str = "adamw8bit",
         rose_stabilize: bool = True,
         rose_weight_decay: float = 1e-4,
-        rose_wd_schedule: bool = False,
+        rose_wd_schedule: bool = True,
         scheduler_type: str = "linear",
         lr_cycle_steps: int = 0,
         lr_cycle_decay: float = 1.0,
@@ -1353,12 +1353,12 @@ class InProcessTrainer:
             return torch.optim.AdamW(params, lr=self._learning_rate)
         elif opt_type == "rose":
             try:
-                from rose import Rose
-                logger.info(f"Using optimizer: ROSE (stabilize={self._rose_stabilize}, wd={self._rose_weight_decay}, wd_schedule={self._rose_wd_schedule})")
+                from rose_opt import Rose
+                logger.info(f"Using Rose optimizer: stabilize={self._rose_stabilize}, wd={self._rose_weight_decay}, wd_schedule={self._rose_wd_schedule}")
                 return Rose(params, lr=self._learning_rate, stabilize=self._rose_stabilize, weight_decay=self._rose_weight_decay, wd_schedule=self._rose_wd_schedule)
             except ImportError:
                 raise ImportError(
-                    "Rose optimizer not installed. Run: pip install git+https://github.com/MatthewK78/Rose"
+                    "Rose optimizer not installed. Run: pip install -U rose-opt"
                 )
         else:
             raise ValueError(f"Unknown optimizer_type: {self._optimizer_type!r}")
