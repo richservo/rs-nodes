@@ -896,6 +896,73 @@ class RSLTXVPrepareDataset:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, text_encoder_path):
+        # The dropdown only enumerates HF model dirs currently on disk, but
+        # when `clip` is plugged in the widget value is unused (CLIP supplies
+        # the encoder in-process). Accept any string so workflows that saved
+        # an old path -- or were built when CLIP is connected and the widget
+        # is irrelevant -- still validate. When CLIP is NOT connected, the
+        # runtime resolves the path via validate_text_encoder_path which has
+        # its own sanity checks.
+        return True
+
+    @staticmethod
+    def _normalize_loaded_entries(entries, output_dir):
+        """Resolve every entry's media_path to an absolute path in-memory so
+        the rest of the prepare flow operates on absolute paths as before.
+
+        Three cases:
+        - Relative path (post-fix layout): resolve against output_dir
+        - Absolute and exists: use as-is
+        - Absolute and missing: try basename under output_dir/clips/
+          (legacy migration -- handles moved-folder scenario where the saved
+          absolute path points at the OLD location but the clip is in the
+          new clips/ next to dataset.json)
+
+        Mutates entries in-place. Idempotent.
+        """
+        clips_dir = output_dir / "clips"
+        for e in entries:
+            mp = e.get("media_path", "")
+            if not mp:
+                continue
+            p = Path(mp)
+            if p.is_absolute():
+                if p.exists():
+                    continue
+                candidate = clips_dir / p.name
+                if candidate.exists():
+                    e["media_path"] = str(candidate)
+            else:
+                e["media_path"] = str((output_dir / p).resolve())
+
+    @staticmethod
+    def _entries_for_write(entries, output_dir):
+        """Return a copy of entries with each media_path stored relative to
+        output_dir when the clip lives under it (app-generated artifact).
+        Paths outside output_dir stay absolute (user-supplied source data).
+
+        Use forward slashes in the relative form so paths are portable
+        between Windows and POSIX. Does NOT mutate the input list -- in
+        memory, callers continue to see absolute paths.
+        """
+        output_dir_resolved = output_dir.resolve()
+        out = []
+        for e in entries:
+            e2 = dict(e)
+            mp = e2.get("media_path", "")
+            if mp:
+                p = Path(mp)
+                if p.is_absolute():
+                    try:
+                        rel = p.resolve().relative_to(output_dir_resolved)
+                        e2["media_path"] = rel.as_posix()
+                    except ValueError:
+                        pass  # outside output_dir -- keep absolute
+            out.append(e2)
+        return out
+
     def prepare(
         self,
         media_folder: str,
@@ -1042,9 +1109,57 @@ class RSLTXVPrepareDataset:
         clips_dir.mkdir(parents=True, exist_ok=True)
         latents_dir = output_dir / "latents"
         conditions_dir = output_dir / "conditions"
+        audio_latents_dir = output_dir / "audio_latents"
 
         global _FACE_PADDING
         _FACE_PADDING = face_padding
+
+        # ----------------------------------------------------------------
+        # Early-exit: if all preprocessing artifacts are already on disk
+        # AND media_folder has no NEW source videos to ingest, treat as
+        # complete and return immediately. dataset.json is only the
+        # manifest used to BUILD these artifacts; once they exist, it's
+        # not consulted again. This skips the cleanup / captioning / write
+        # paths entirely so a wiped or stale dataset.json can never cause
+        # damage on resume.
+        # ----------------------------------------------------------------
+        if clips_dir.exists() and latents_dir.exists():
+            clip_files = [p for p in clips_dir.iterdir() if p.is_file()]
+            latent_files = [p for p in latents_dir.iterdir() if p.is_file()]
+            artifacts_ok = bool(clip_files) and bool(latent_files)
+            if artifacts_ok and with_audio:
+                artifacts_ok = (
+                    audio_latents_dir.exists()
+                    and any(p.is_file() for p in audio_latents_dir.iterdir())
+                )
+            if artifacts_ok and conditioning_folder:
+                artifacts_ok = (
+                    conditions_dir.exists()
+                    and any(p.is_file() for p in conditions_dir.iterdir())
+                )
+            if artifacts_ok:
+                # Derive processed source stems from clip filenames
+                # (clips look like "video_chunk0001.mp4" etc.)
+                processed_stems = set()
+                for cp in clip_files:
+                    stem = cp.stem
+                    if "_chunk" in stem:
+                        processed_stems.add(stem.rsplit("_chunk", 1)[0])
+                    else:
+                        processed_stems.add(stem)
+                # Are all source videos in media_folder represented?
+                no_new_media = True
+                for item in self._scan_media(media_folder):
+                    if Path(item["path"]).stem not in processed_stems:
+                        no_new_media = False
+                        break
+                if no_new_media:
+                    logger.info(
+                        f"Preprocessing already complete ({len(clip_files)} clips, "
+                        f"{len(latent_files)} latents) -- skipping prepare, "
+                        f"dataset.json not touched"
+                    )
+                    return (str(output_dir), str(dataset_json_path))
 
         # Scan current media folder
         media_files = self._scan_media(media_folder)
@@ -1062,6 +1177,13 @@ class RSLTXVPrepareDataset:
                     existing_entries = json.load(f)
             except (json.JSONDecodeError, KeyError):
                 existing_entries = []
+
+        # Resolve any relative media_path to absolute (and migrate legacy
+        # absolute paths whose target moved -- try basename in clips/) so
+        # the rest of this method operates on absolute paths exactly as
+        # before. Writes go through _entries_for_write which converts back
+        # to relative on the way out.
+        self._normalize_loaded_entries(existing_entries, output_dir)
 
         # Track which source files are already in the JSON
         processed_sources = {e.get("source_file", "") for e in existing_entries}
@@ -1158,7 +1280,7 @@ class RSLTXVPrepareDataset:
         existing_entries = valid_entries
         if removed_missing > 0:
             with open(dataset_json_path, "w") as f:
-                json.dump(existing_entries, f, indent=2)
+                json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
             logger.info(f"Removed {removed_missing} missing-clip entries from dataset.json")
             # Append chunk-level deletion records to rejected.json
             if deleted_rejected:
@@ -1231,7 +1353,7 @@ class RSLTXVPrepareDataset:
                         # Silent clip — record the attempt so we don't re-load whisper.
                         entry["transcript"] = ""
             with open(dataset_json_path, "w") as f:
-                json.dump(existing_entries, f, indent=2)
+                json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
             if orphans_added > 0:
                 logger.info(f"Reconciled {orphans_added} clips into dataset.json")
 
@@ -1256,7 +1378,7 @@ class RSLTXVPrepareDataset:
                         chars_backfilled += 1
             if chars_backfilled:
                 with open(dataset_json_path, "w") as f:
-                    json.dump(existing_entries, f, indent=2)
+                    json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                 logger.info(f"Backfilled characters for {chars_backfilled} entries")
 
         # clip_check: re-scan EVERY existing clip and rewrite its
@@ -1337,7 +1459,7 @@ class RSLTXVPrepareDataset:
                     # Persist after every change so a crash mid-scan
                     # doesn't lose the work already done.
                     with open(dataset_json_path, "w") as f:
-                        json.dump(existing_entries, f, indent=2)
+                        json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                     _emit_status()
                 else:
                     logger.info(
@@ -1402,7 +1524,7 @@ class RSLTXVPrepareDataset:
                 try:
                     tmp_path = dataset_json_path.with_suffix(dataset_json_path.suffix + ".tmp")
                     with open(tmp_path, "w") as f:
-                        json.dump(existing_entries, f, indent=2)
+                        json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                     os.replace(tmp_path, dataset_json_path)
                 except OSError as e:
                     logger.warning(f"Could not write dataset.json mid-run: {e}")
@@ -1413,7 +1535,7 @@ class RSLTXVPrepareDataset:
                 try:
                     tmp_path = dataset_json_path.with_suffix(dataset_json_path.suffix + ".tmp")
                     with open(tmp_path, "w") as f:
-                        json.dump(existing_entries, f, indent=2)
+                        json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                     os.replace(tmp_path, dataset_json_path)
                 except OSError as e:
                     logger.warning(f"Could not write dataset.json: {e}")
@@ -1483,7 +1605,7 @@ class RSLTXVPrepareDataset:
                     if sweep_removed:
                         existing_entries = sweep_valid
                         with open(dataset_json_path, "w") as f:
-                            json.dump(existing_entries, f, indent=2)
+                            json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                         rej_list: list[dict] = []
                         if rejected_path.exists():
                             try:
@@ -1552,7 +1674,7 @@ class RSLTXVPrepareDataset:
                             if removed_for_balance:
                                 clips_budget = max_samples - len(existing_entries)
                                 with open(dataset_json_path, "w") as f:
-                                    json.dump(existing_entries, f, indent=2)
+                                    json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
                                 _emit_status()
                                 logger.info(
                                     f"Rebalanced: removed {removed_for_balance} clips, "
@@ -1902,7 +2024,7 @@ class RSLTXVPrepareDataset:
 
                         # Save dataset.json after each chunk
                         with open(dataset_json_path, "w") as f:
-                            json.dump(existing_entries, f, indent=2)
+                            json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
 
                     # Pass concluded normally — remove chunk_pool.json so the
                     # next pass rebuilds a fresh shuffle. (If the run crashed
@@ -2049,7 +2171,7 @@ class RSLTXVPrepareDataset:
 
                         # Save JSON after each source file so progress isn't lost
                         with open(dataset_json_path, "w") as f:
-                            json.dump(existing_entries, f, indent=2)
+                            json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
 
                         pbar.update_absolute(i + 1, len(new_media))
 
@@ -2060,7 +2182,7 @@ class RSLTXVPrepareDataset:
                     # Make sure JSON is written even if no new media
                     if not dataset_json_path.exists():
                         with open(dataset_json_path, "w") as f:
-                            json.dump(existing_entries, f, indent=2)
+                            json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
 
         # Post-extraction cleanup: remove entries for clips deleted during the run
         # and add them to rejected.json so they won't be re-extracted
@@ -2090,7 +2212,7 @@ class RSLTXVPrepareDataset:
         if post_removed:
             existing_entries = post_valid
             with open(dataset_json_path, "w") as f:
-                json.dump(existing_entries, f, indent=2)
+                json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
             # Append to rejected.json
             existing_rejected_list: list[dict] = []
             if rejected_path.exists():
@@ -2229,7 +2351,7 @@ class RSLTXVPrepareDataset:
                     entry["_caption_original"] = cap
                     entry["caption"] = f'{cap} Dialogue: "{transcript}"' if cap else f'Dialogue: "{transcript}"'
             with open(dataset_json_path, "w") as f:
-                json.dump(existing_entries, f, indent=2)
+                json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
 
         conditions_dir = output_dir / "conditions"
         latents_dir = output_dir / "latents"
@@ -2296,7 +2418,7 @@ class RSLTXVPrepareDataset:
                 if "_caption_original" in entry:
                     entry["caption"] = entry.pop("_caption_original")
             with open(dataset_json_path, "w") as f:
-                json.dump(existing_entries, f, indent=2)
+                json.dump(self._entries_for_write(existing_entries, output_dir), f, indent=2)
 
         # Final unload — drop everything prep loaded so unattended training that
         # follows in the same workflow starts with a clean VRAM slate.
