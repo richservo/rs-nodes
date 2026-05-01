@@ -13,14 +13,26 @@ Key design decisions vs the subprocess approach:
 - LoRA weights are saved in ComfyUI-compatible format (diffusion_model. prefix).
 """
 
+import faulthandler
 import gc
 import logging
+import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Callable
 
 import torch
 from torch.utils.data import DataLoader
+
+# Crash diagnostics. faulthandler dumps a C-level traceback (including native
+# frames) on segfault/abort instead of just thread state. CUDA_LAUNCH_BLOCKING
+# forces all CUDA ops synchronous, so any device error surfaces as a Python
+# exception at the actual offending line rather than later as a fatal abort.
+# Both add overhead but are essential for diagnosing the 0.20.1 layer-offload
+# crashes that don't reproduce reliably.
+faulthandler.enable(file=sys.stderr, all_threads=True)
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
 # Build a tuple of OOM-like exception types.  PyTorch 2.10+ raises
 # torch.AcceleratorError for CUDA OOMs instead of torch.cuda.OutOfMemoryError,

@@ -39,9 +39,15 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         # a custom Function (PyTorch forbids it and silently breaks the graph).
         # Save on CPU — all 48 blocks' saved tensors coexist during forward,
         # and keeping them on GPU would accumulate ~5 GB of hidden states.
+        # NOTE: dropped non_blocking=True from all .to() calls below. The
+        # async transfers use pinned (page-locked) host memory and were
+        # racing with ComfyUI 0.20.1's dynamic VRAM scheduler / dataloader
+        # workers at epoch boundaries -> Fatal Python error: Aborted at
+        # the C level. Synchronous transfers eliminate the race and the
+        # latency cost is negligible compared to the model forward.
         ctx.save_for_backward(
-            vx.detach().clone().to("cpu", non_blocking=True),
-            ax.detach().clone().to("cpu", non_blocking=True),
+            vx.detach().clone().to("cpu"),
+            ax.detach().clone().to("cpu"),
         )
         ctx.block = block
         ctx.block_kwargs = block_kwargs
@@ -49,21 +55,12 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         ctx.has_audio = has_audio
         ctx.block_idx = block_idx
 
-        block.to(device, non_blocking=True)
-        torch.cuda.synchronize(device)
+        block.to(device)
 
         with torch.no_grad():
             out_vx, out_ax = block((vx, ax), **block_kwargs)
 
-        block.to("cpu", non_blocking=True)
-        # Sync after the to-CPU move so the GPU-side parameter storage is
-        # actually freed before the next block loads. Without this, the
-        # transfer is still in flight when we return; any Python ref that
-        # grabs the GPU tensor mid-flight (e.g. ComfyUI 0.20.1's dynamic
-        # VRAM scheduler tracking model params) keeps it alive and we
-        # leak ~one block's worth of VRAM per call. Confirmed by OOM
-        # diagnostics showing alloc unchanged after empty_cache.
-        torch.cuda.synchronize(device)
+        block.to("cpu")
 
         # Always return NEW tensors (detached from block's no_grad graph).
         # The Function mechanism re-attaches grad_fn to these.
@@ -84,11 +81,10 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         if block_idx >= 0 and block_idx % 12 == 0:
             torch.cuda.empty_cache()
 
-        block.to(device, non_blocking=True)
+        block.to(device)
         # Move saved hidden states back to GPU for recomputation
-        saved_vx = saved_vx.to(device, non_blocking=True)
-        saved_ax = saved_ax.to(device, non_blocking=True)
-        torch.cuda.synchronize(device)
+        saved_vx = saved_vx.to(device)
+        saved_ax = saved_ax.to(device)
 
         # Create leaf tensors for gradient tracking.
         vx_leaf = saved_vx.detach().requires_grad_(True)
@@ -156,10 +152,9 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         grad_map = {}
         for p, g in zip(param_list, param_grads):
             if g is not None:
-                grad_map[p] = g.to("cpu", non_blocking=True)
+                grad_map[p] = g.to("cpu")
 
-        block.to("cpu", non_blocking=True)
-        torch.cuda.synchronize(device)
+        block.to("cpu")
 
         # Accumulate into .grad on CPU (AdamW reads from .grad)
         for p, g in grad_map.items():
