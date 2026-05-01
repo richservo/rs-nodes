@@ -37,7 +37,8 @@ class RSLTXVICLoRAGuider:
                 "negative":  ("CONDITIONING",),
                 "vae":       ("VAE",),
                 "control_image": ("IMAGE",),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "lora_name": (["none"] + folder_paths.get_filename_list("loras"),
+                              {"tooltip": "IC-LoRA weights file. Set to 'none' to run the IC-LoRA pipeline (control image preprocessing, guide injection, distilled LoRA, etc.) WITHOUT loading the IC-LoRA weights -- diagnostic / V2V experimentation mode."}),
             },
             "optional": {
                 "lora_strength":     ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
@@ -122,14 +123,23 @@ class RSLTXVICLoRAGuider:
         from ..utils.multimodal_guider import ICLoRAGuider
 
         # --- Load IC-LoRA and extract downscale factor ---
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        downscale_factor = self._read_downscale_factor(lora_path)
-        logger.info(f"Loading IC-LoRA: {lora_name} (downscale_factor={downscale_factor})")
-
-        lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        # 'none' runs the rest of the IC-LoRA pipeline unchanged but skips
+        # both the metadata read and the weight load -- diagnostic mode for
+        # V2V experimentation. downscale_factor=2 (matches the LTX-2.3 union
+        # IC-LoRAs) is kept so the dilation pattern is identical to a real
+        # IC-LoRA run.
+        no_iclora_weights = (not lora_name) or lora_name == "none"
+        if no_iclora_weights:
+            downscale_factor = 2
+            logger.info("IC-LoRA: lora_name='none' -- running pipeline WITHOUT weights")
+        else:
+            lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+            downscale_factor = self._read_downscale_factor(lora_path)
+            logger.info(f"Loading IC-LoRA: {lora_name} (downscale_factor={downscale_factor})")
 
         m = model.clone()
-        if lora_strength != 0:
+        if not no_iclora_weights and lora_strength != 0:
+            lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
             m, _ = comfy.sd.load_lora_for_models(m, None, lora_data, lora_strength, 0)
             logger.info(f"Applied LoRA (strength={lora_strength})")
 

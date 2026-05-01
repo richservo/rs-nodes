@@ -1968,14 +1968,20 @@ class RSLTXVGenerate:
         from comfy_extras.nodes_lt import preprocess as ltxv_preprocess
 
         ci = control_info
-        lora_path = folder_paths.get_full_path_or_raise("loras", ci["lora_name"])
-        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        if ci["lora_strength"] != 0:
-            up_model, _ = comfy.sd.load_lora_for_models(
-                up_model, None, lora, ci["lora_strength"], 0
-            )
-            logger.info(f"IC-LoRA re-applied: {ci['lora_name']} (strength={ci['lora_strength']})")
-        del lora
+        # Honor diagnostic 'none' mode set on the IC-LoRA guider node:
+        # skip weight load, keep all other rediffusion steps.
+        ic_name = ci.get("lora_name", "")
+        if ic_name and ic_name != "none":
+            lora_path = folder_paths.get_full_path_or_raise("loras", ic_name)
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            if ci["lora_strength"] != 0:
+                up_model, _ = comfy.sd.load_lora_for_models(
+                    up_model, None, lora, ci["lora_strength"], 0
+                )
+                logger.info(f"IC-LoRA re-applied: {ic_name} (strength={ci['lora_strength']})")
+            del lora
+        else:
+            logger.info("IC-LoRA rebuild: lora_name='none' -- skipping weight load")
 
         # Re-apply optional second stacked LoRA (must run on every pass to match pass 1)
         lora_name_2 = ci.get("lora_name_2", "none")
