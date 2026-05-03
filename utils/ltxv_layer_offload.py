@@ -22,6 +22,33 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Private CUDA stream for offload copies
+# ---------------------------------------------------------------------------
+# All H2D / D2H copies for layer offload run on a dedicated stream so they can
+# overlap compute on the default stream (this is what gave us 0.17-era speed).
+# Cross-stream data dependencies are enforced via cuda.Event waits.
+#
+# Why a private stream specifically:
+#  - Enables H2D of block N+1 / D2H of block N to pipeline behind compute(N).
+#  - Isolates our copies from whatever ComfyUI 0.20.1's dynamic VRAM scheduler
+#    is doing on the default stream, which previously caused C-level aborts
+#    when pinned-memory async copies on the default stream raced the scheduler.
+#  - We synchronize this stream at the boundary of the forward block loop so
+#    when control returns to ComfyUI no copies are in flight.
+
+_offload_streams: dict = {}
+
+
+def _get_offload_stream(device: torch.device) -> torch.cuda.Stream:
+    key = (device.type, device.index if device.index is not None else 0)
+    s = _offload_streams.get(key)
+    if s is None:
+        s = torch.cuda.Stream(device=device)
+        _offload_streams[key] = s
+    return s
+
+
+# ---------------------------------------------------------------------------
 # Custom autograd Function: gradient checkpoint + layer offload combined
 # ---------------------------------------------------------------------------
 
@@ -39,28 +66,48 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         # a custom Function (PyTorch forbids it and silently breaks the graph).
         # Save on CPU — all 48 blocks' saved tensors coexist during forward,
         # and keeping them on GPU would accumulate ~5 GB of hidden states.
-        # NOTE: dropped non_blocking=True from all .to() calls below. The
-        # async transfers use pinned (page-locked) host memory and were
-        # racing with ComfyUI 0.20.1's dynamic VRAM scheduler / dataloader
-        # workers at epoch boundaries -> Fatal Python error: Aborted at
-        # the C level. Synchronous transfers eliminate the race and the
-        # latency cost is negligible compared to the model forward.
-        ctx.save_for_backward(
-            vx.detach().clone().to("cpu"),
-            ax.detach().clone().to("cpu"),
-        )
+        compute_stream = torch.cuda.current_stream(device)
+        offload_stream = _get_offload_stream(device)
+
+        # Offload stream must wait for compute stream before reading vx/ax —
+        # those tensors were last written by the previous block's compute.
+        compute_done = torch.cuda.Event()
+        compute_done.record(compute_stream)
+        offload_stream.wait_event(compute_done)
+
+        with torch.cuda.stream(offload_stream):
+            # Clone on GPU first (so the in-place mutations inside the block
+            # below can't race with the in-flight D2H), then async D2H. The
+            # CPU saved copies are consumed in backward, far in the future.
+            saved_vx_cpu = vx.detach().clone().to("cpu", non_blocking=True)
+            saved_ax_cpu = ax.detach().clone().to("cpu", non_blocking=True)
+            # Async H2D of block params on the same stream.
+            block.to(device, non_blocking=True)
+            block_loaded = torch.cuda.Event()
+            block_loaded.record(offload_stream)
+
+        ctx.save_for_backward(saved_vx_cpu, saved_ax_cpu)
         ctx.block = block
         ctx.block_kwargs = block_kwargs
         ctx.device = device
         ctx.has_audio = has_audio
         ctx.block_idx = block_idx
 
-        block.to(device)
+        # Compute stream must wait until block params are fully on GPU.
+        compute_stream.wait_event(block_loaded)
 
         with torch.no_grad():
             out_vx, out_ax = block((vx, ax), **block_kwargs)
 
-        block.to("cpu")
+        # Offload stream must wait for compute to finish using block params
+        # before evicting them. Then async D2H, fire-and-forget — the next
+        # iteration's H2D queues behind it on the offload stream and is
+        # gated on its own event.
+        fwd_done = torch.cuda.Event()
+        fwd_done.record(compute_stream)
+        with torch.cuda.stream(offload_stream):
+            offload_stream.wait_event(fwd_done)
+            block.to("cpu", non_blocking=True)
 
         # Always return NEW tensors (detached from block's no_grad graph).
         # The Function mechanism re-attaches grad_fn to these.
@@ -81,10 +128,19 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         if block_idx >= 0 and block_idx % 12 == 0:
             torch.cuda.empty_cache()
 
-        block.to(device)
-        # Move saved hidden states back to GPU for recomputation
-        saved_vx = saved_vx.to(device)
-        saved_ax = saved_ax.to(device)
+        compute_stream = torch.cuda.current_stream(device)
+        offload_stream = _get_offload_stream(device)
+
+        # Async H2D of block params + saved hidden states on offload stream.
+        with torch.cuda.stream(offload_stream):
+            block.to(device, non_blocking=True)
+            saved_vx = saved_vx.to(device, non_blocking=True)
+            saved_ax = saved_ax.to(device, non_blocking=True)
+            h2d_done = torch.cuda.Event()
+            h2d_done.record(offload_stream)
+
+        # Compute stream waits until everything is on GPU before recompute.
+        compute_stream.wait_event(h2d_done)
 
         # Create leaf tensors for gradient tracking.
         vx_leaf = saved_vx.detach().requires_grad_(True)
@@ -119,11 +175,21 @@ class _OffloadCheckpointFn(torch.autograd.Function):
             lambda t: t.clone(),   # pack: fresh storage+version (no detach!)
             lambda t: t,            # unpack: return as-is
         ):
-            with torch.enable_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            # cache_enabled=False: the bf16 weight cache only helps when the
+            # same param is cast multiple times within one autocast scope.
+            # We cast each param once per backward, so the cache provides
+            # no benefit — and clearing it at __exit__ was a known crash
+            # site on ComfyUI 0.20.1.
+            with torch.enable_grad(), torch.autocast(
+                "cuda", dtype=torch.bfloat16, cache_enabled=False
+            ):
                 # Clone INSIDE enable_grad so CloneBackward links to vx_leaf
                 vx = vx_leaf.clone()
                 ax = ax_leaf.clone() if has_audio else saved_ax
                 out_vx, out_ax = block((vx, ax), **bwd_kwargs)
+            # Drain compute stream before tensors created inside autocast
+            # leave scope, so their destructors don't race in-flight kernels.
+            compute_stream.synchronize()
 
         outputs = [out_vx]
         grads = [grad_vx]
@@ -148,13 +214,27 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         ax_grad_out = input_grads[1] if has_audio else None
         param_grads = input_grads[len(inputs_list):]
 
-        # Collect param grads on GPU, then move block to CPU
-        grad_map = {}
-        for p, g in zip(param_list, param_grads):
-            if g is not None:
-                grad_map[p] = g.to("cpu")
+        # Async D2H of grads + block on offload stream. Offload waits for
+        # compute to finish autograd.grad before reading the produced grads.
+        # Block eviction queues after the grads on the same stream — fire-and-
+        # forget, the next backward's H2D will queue behind it on this stream.
+        grads_computed = torch.cuda.Event()
+        grads_computed.record(compute_stream)
 
-        block.to("cpu")
+        grad_map: dict = {}
+        with torch.cuda.stream(offload_stream):
+            offload_stream.wait_event(grads_computed)
+            for p, g in zip(param_list, param_grads):
+                if g is not None:
+                    grad_map[p] = g.to("cpu", non_blocking=True)
+            grads_landed = torch.cuda.Event()
+            grads_landed.record(offload_stream)
+            block.to("cpu", non_blocking=True)
+
+        # Host-side wait until all grad D2Hs have actually landed in CPU
+        # memory — required before we can read them with p.grad.add_() below.
+        # This does NOT wait for the block eviction queued behind it.
+        grads_landed.synchronize()
 
         # Accumulate into .grad on CPU (AdamW reads from .grad)
         for p, g in grad_map.items():
@@ -241,6 +321,14 @@ def _offloaded_process_blocks(
         vx = new_vx
         if has_audio:
             ax = new_ax
+
+    # Boundary sync: drain the offload stream before returning to the rest
+    # of ComfyUI's forward path. Inside the loop, copies pipeline behind
+    # compute on a private stream — but we never want in-flight copies to
+    # leak past this function, where ComfyUI 0.20.1's dynamic VRAM
+    # scheduler may inspect / move model params. (This is a single host
+    # wait per forward, not per block — perf-neutral.)
+    _get_offload_stream(device).synchronize()
 
     return [vx, ax]
 
