@@ -16,7 +16,6 @@ Key design decisions vs the subprocess approach:
 import faulthandler
 import gc
 import logging
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -26,13 +25,14 @@ import torch
 from torch.utils.data import DataLoader
 
 # Crash diagnostics. faulthandler dumps a C-level traceback (including native
-# frames) on segfault/abort instead of just thread state. CUDA_LAUNCH_BLOCKING
-# forces all CUDA ops synchronous, so any device error surfaces as a Python
-# exception at the actual offending line rather than later as a fatal abort.
-# Both add overhead but are essential for diagnosing the 0.20.1 layer-offload
-# crashes that don't reproduce reliably.
+# frames) on segfault/abort instead of just thread state. Zero overhead unless
+# the process actually crashes — kept on for any future C-level abort.
+#
+# CUDA_LAUNCH_BLOCKING was here as a diagnostic aid for the 0.20.1 layer-offload
+# crashes; it was never meant to ship. With it set, every CUDA op (kernel
+# launches, copies, everything) is forced synchronous on the host, ~doubling
+# step time (17.5s -> 42.5s/step measured). Removed.
 faulthandler.enable(file=sys.stderr, all_threads=True)
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
 # Build a tuple of OOM-like exception types.  PyTorch 2.10+ raises
 # torch.AcceleratorError for CUDA OOMs instead of torch.cuda.OutOfMemoryError,
