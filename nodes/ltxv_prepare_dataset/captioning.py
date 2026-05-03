@@ -1203,8 +1203,21 @@ def caption_dataset_json(
     # Make sure the requested Ollama model is installed before we
     # start the loop.  If it's not, pull it (streaming progress to
     # the log).  Without this, every clip would 404 and get rejected.
-    if caption_mode == "ollama":
+    #
+    # Skip when there's no actual captioning work — the artifact-trumps-
+    # JSON guard above may have eliminated every uncaptioned entry by
+    # finding their condition files already on disk. In that case
+    # contacting Ollama is pointless and would falsely fail the run if
+    # the user has Ollama stopped (which is reasonable when they're
+    # only filling missing encodes).
+    if caption_mode == "ollama" and actual_work > 0:
         ensure_ollama_model(ollama_url, ollama_model)
+    elif caption_mode == "ollama":
+        logger.info(
+            "All uncaptioned entries already have encoded conditions on "
+            "disk — skipping Ollama startup check (nothing to caption)."
+        )
+        return
 
     removed_count = 0
     # Persistent multi-turn conversation state for ollama captions.

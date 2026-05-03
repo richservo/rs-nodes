@@ -71,7 +71,13 @@ def ensure_text_encoder(path: str) -> str:
     if not path or path.startswith("auto") or not p.exists():
         return _auto_download_text_encoder()
 
-    # Validate it has tokenizer.model
+    # Validate it has tokenizer.model AND model weights. The previous check
+    # only verified tokenizer.model, which meant a partial / interrupted
+    # download (where config + tokenizer arrive first but the multi-GB
+    # safetensors shards never finish) passed validation, then the
+    # subprocess crashed deep in gemma_8bit._find_gemma_subpath looking for
+    # `model*.safetensors`. Catching it here gives a recoverable error
+    # path: missing weights → re-download.
     tokenizer = p / "tokenizer.model"
     if not tokenizer.exists():
         found = list(p.rglob("tokenizer.model"))
@@ -81,6 +87,14 @@ def ensure_text_encoder(path: str) -> str:
                 "Expected a full HF model directory (e.g. google/gemma-3-12b-it)"
             )
 
+    weights = list(p.glob("model*.safetensors")) + list(p.rglob("model*.safetensors"))
+    if not weights:
+        logger.warning(
+            f"Text encoder at {path} is missing model*.safetensors weights "
+            f"(likely an interrupted download). Re-downloading..."
+        )
+        return _auto_download_text_encoder()
+
     return str(p)
 
 
@@ -88,10 +102,22 @@ def _auto_download_text_encoder() -> str:
     """Download google/gemma-3-12b-it to the clip model folder."""
     dest = get_text_encoder_download_dir() / "gemma-3-12b-it"
 
-    # Already downloaded?
+    # Already downloaded? Require BOTH tokenizer.model AND at least one
+    # model*.safetensors weight shard. Without the weights check, an
+    # interrupted download (config + tokenizer arrive first, multi-GB
+    # safetensors shards never finish) is treated as complete; the
+    # subprocess then crashes deep in gemma_8bit._find_gemma_subpath.
+    # Detecting it here lets snapshot_download below resume the partial
+    # download cleanly.
     if dest.exists() and (dest / "tokenizer.model").exists():
-        logger.info(f"Text encoder already downloaded: {dest}")
-        return str(dest)
+        weights = list(dest.glob("model*.safetensors"))
+        if weights:
+            logger.info(f"Text encoder already downloaded: {dest}")
+            return str(dest)
+        logger.warning(
+            f"Text encoder at {dest} has tokenizer but no model*.safetensors "
+            f"weights — likely an interrupted download. Resuming..."
+        )
 
     logger.info(f"Downloading {_DEFAULT_TEXT_ENCODER_REPO} to {dest} (first-time setup)...")
 

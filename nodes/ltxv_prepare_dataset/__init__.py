@@ -181,7 +181,8 @@ class RSLTXVPrepareDataset:
                 "clip_check": ("BOOLEAN", {"default": False, "tooltip": "When ON, re-scan every existing clip in the dataset and rewrite its `characters` field based on current character refs. Useful when you've added a new reference character after the dataset was already partly built — existing clips that contain the new character get their characters list updated. Runs once at the start of the run; leave OFF for subsequent runs."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
-                "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
+                "vae": ("VAE", {"tooltip": "Video VAE (from CheckpointLoaderSimple). When connected, encodes video latents in-process instead of slow subprocess."}),
+                "audio_vae": ("VAE", {"tooltip": "Audio VAE (from LTXV-AV checkpoint loader). When connected, audio latents are encoded in-process; without it, with_audio=True falls back to the LTX-2 subprocess + downloaded text encoder."}),
                 "clip_vision": ("CLIP_VISION", {"tooltip": "Optional CLIP Vision model (from CLIPVisionLoader). Enables matching of non-human characters (puppets, props, objects) in character_refs_folder. Human characters use face matching regardless."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -242,6 +243,7 @@ class RSLTXVPrepareDataset:
         conditioning_folder: str = "",
         clip=None,
         vae=None,
+        audio_vae=None,
         clip_vision=None,
         target_fps: float = 0.0,
         max_samples: int = 0,
@@ -1732,6 +1734,7 @@ class RSLTXVPrepareDataset:
 
         conditions_dir = output_dir / "conditions"
         latents_dir = output_dir / "latents"
+        audio_latents_dir = output_dir / "audio_latents"
         need_subprocess = False
 
         # Phase 3a: Text encoding
@@ -1743,19 +1746,66 @@ class RSLTXVPrepareDataset:
         else:
             need_subprocess = True
 
-        # Phase 3b: VAE encoding
-        # When with_audio is set, the subprocess needs to write combined video+audio
-        # latent files.  It auto-skips files that already exist on disk, so we must
-        # NOT pre-encode video-only latents in-process — doing so would cause audio
-        # encoding to be skipped entirely.
-        if vae is not None and not with_audio:
-            encoding.encode_latents_inprocess(vae, dataset_json_path, latents_dir, existing_entries,
-                                              target_w=target_w, target_h=target_h)
+        # Phase 3b: VAE encoding (video latents).
+        # The previous design forced subprocess whenever with_audio was set
+        # because we had no in-process audio encoder, and the subprocess
+        # writes combined video+audio passes. Now that audio_vae is wired
+        # (Phase 3c below), the video VAE can run in-process even with
+        # audio enabled — they're independent files.
+        if vae is not None:
+            encoding.encode_latents_inprocess(
+                vae, dataset_json_path, latents_dir, existing_entries,
+                target_w=target_w, target_h=target_h,
+            )
         else:
             need_subprocess = True
 
-        # Reference latents (IC-LoRA) and audio still require subprocess
-        if conditioning_folder or with_audio:
+        # Phase 3c: Audio latent encoding.
+        # When audio_vae is connected, encode in-process — same on-disk
+        # format as the LTX-2 subprocess. This eliminates the subprocess
+        # invocation (and its ~25 GB Gemma3 download) when all four
+        # ComfyUI inputs (clip, vae, audio_vae, optional clip_vision)
+        # are wired.
+        if with_audio:
+            if audio_vae is not None:
+                encoding.encode_audio_latents_inprocess(
+                    audio_vae, dataset_json_path, audio_latents_dir,
+                )
+            else:
+                # Recompute missing audio_latents NOW (post-mining /
+                # post-captioning state) by stem comparison. Only invoke
+                # the subprocess if there's actual audio work to do —
+                # the subprocess loads its own Gemma + VAEs upfront
+                # regardless of remaining work, so dodging it when no
+                # audio_latent files are missing avoids a pointless
+                # multi-GB model load.
+                _audio_stems = {
+                    p.stem for p in (audio_latents_dir / "clips").glob("*.pt")
+                } if (audio_latents_dir / "clips").exists() else set()
+                _clip_stems_now = {
+                    p.stem for p in clips_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in {
+                        ".mp4", ".mov", ".webm", ".avi", ".mkv",
+                    }
+                } if clips_dir.exists() else set()
+                _missing_audio = _clip_stems_now - _audio_stems
+                if _missing_audio:
+                    logger.info(
+                        f"with_audio=True, audio_vae not connected, "
+                        f"{len(_missing_audio)} audio_latent(s) missing — "
+                        f"falling back to LTX-2 subprocess. Connect audio_vae "
+                        f"to keep audio encoding in-process and skip this."
+                    )
+                    need_subprocess = True
+                else:
+                    logger.info(
+                        "Audio latents already complete — skipping subprocess "
+                        "even though audio_vae isn't connected."
+                    )
+
+        # Reference latents (IC-LoRA conditioning_folder) still require the
+        # subprocess; there's no in-process IC-LoRA encoder yet.
+        if conditioning_folder:
             need_subprocess = True
 
         if need_subprocess:
