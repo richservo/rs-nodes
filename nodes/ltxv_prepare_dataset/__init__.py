@@ -271,83 +271,18 @@ class RSLTXVPrepareDataset:
         target_w, target_h = int(bucket_parts[0]), int(bucket_parts[1])
         target_frames = int(bucket_parts[2]) if len(bucket_parts) > 2 else 49
 
-        # Multi-character mode: load a folder of reference images.  Each file's
-        # stem becomes that character's trigger word.  Face-containing refs are
-        # matched via face embeddings; non-face refs (puppets, props, objects)
-        # fall back to CLIP vision embedding if clip_vision is connected.
-        # When populated, clip selection accepts chunks where any reference
-        # matches in at least one sample frame.
+        # NOTE: heavy reference-asset loads (character_refs / voice_refs /
+        # target_embedding / location_refs) used to live here, but they
+        # spin up InsightFace + speechbrain + clip-vision and waste GPU
+        # memory + several seconds of startup time on runs that turn out
+        # to need no work (the established-dataset / fully-consistent
+        # case). Those loads now happen AFTER the audit + reconciliation
+        # below decides we actually have something to do — see the block
+        # right after the early-exit return.
         character_refs: dict[str, dict] = {}
-        if character_refs_folder and face_detection:
-            character_refs = mining.load_character_refs(character_refs_folder, clip_vision=clip_vision)
-            if character_refs:
-                n_face = sum(1 for r in character_refs.values() if r["type"] == "face")
-                n_clip = sum(1 for r in character_refs.values() if r["type"] == "clip")
-                logger.info(
-                    f"Multi-character mode: loaded {len(character_refs)} references "
-                    f"({n_face} face, {n_clip} clip-vision) "
-                    f"— {', '.join(sorted(character_refs.keys()))}"
-                )
-
-        # Voice references: optional folder of audio clips per character (one
-        # clip per character, filename stem = trigger). When populated, the
-        # transcriber runs pyannote diarization + speaker embedding to attribute
-        # each line of dialogue to a known speaker.
         voice_refs: dict[str, np.ndarray] = {}
-        if voice_refs_folder and transcribe_speech:
-            voice_refs = mining.load_voice_refs(voice_refs_folder)
-            if voice_refs:
-                logger.info(
-                    f"Voice attribution: loaded {len(voice_refs)} voice reference(s) "
-                    f"— {', '.join(sorted(voice_refs.keys()))}"
-                )
-
-        # target_face pin: wired through the same character_refs pipeline as the
-        # folder path, using lora_trigger as the trigger name (equivalent to
-        # dropping one image in a folder named <lora_trigger>.jpg).
         target_embedding = None
-        if target_face is not None and face_detection:
-            target_embedding = mining.compute_target_embedding(target_face)
-            if target_embedding is None:
-                logger.warning("Could not extract face from target_face image, face matching disabled")
-            else:
-                trigger = (lora_trigger or "").strip().lower().replace("_", "-")
-                if not trigger:
-                    trigger = "subject"
-                    logger.warning("target_face connected without lora_trigger — defaulting trigger to 'subject'")
-                # Encode target_face tensor as base64 JPEG so Gemma can see the
-                # reference at caption time (matches _load_character_refs format).
-                import base64 as _b64
-                frame = target_face[0].cpu().numpy()
-                frame = (frame * 255).astype(np.uint8)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                if ok:
-                    image_b64 = _b64.b64encode(buf.tobytes()).decode("utf-8")
-                    character_refs[trigger] = {
-                        "type": "face",
-                        "embedding": target_embedding,
-                        "image_b64": image_b64,
-                    }
-                    logger.info(f"target_face pin registered as character reference: {trigger} (similarity threshold: {face_similarity})")
-                    # Route exclusively through character_refs — avoid double-filtering
-                    # via the legacy target_embedding codepath.
-                    target_embedding = None
-                else:
-                    logger.warning("Could not JPEG-encode target_face — falling back to legacy target_embedding filter (no Gemma cast entry)")
-
-        # Location references: labeled images of distinct sets/locations.
-        # Gemma is shown these alongside the clip frames during captioning
-        # and picks the best match (if any).  Much simpler than character
-        # refs — just name + image, no embeddings.
         location_refs: dict[str, str] = {}
-        if location_refs_folder:
-            location_refs = mining.load_location_refs(location_refs_folder)
-            if location_refs:
-                logger.info(
-                    f"Location mode: loaded {len(location_refs)} location refs "
-                    f"— {', '.join(sorted(location_refs.keys()))}"
-                )
 
         output_dir = Path(folder_paths.get_output_directory()) / "ltxv_training" / output_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -469,6 +404,88 @@ class RSLTXVPrepareDataset:
                 f"source of truth.)"
             )
             return (str(output_dir), str(dataset_json_path))
+
+        # ===== HEAVY ASSET LOADS (deferred until we know there's work) =====
+        # These were originally at the top of prepare(), but the audit +
+        # reconciliation above can decide there's nothing to do, and in
+        # that case loading face / speechbrain / clip-vision models was
+        # pure waste — both startup latency and GPU VRAM that the trainer
+        # then has to re-claim. So they happen here, only on the path
+        # that's actually going to mine / caption / encode.
+
+        # Multi-character mode: load a folder of reference images.  Each file's
+        # stem becomes that character's trigger word.  Face-containing refs are
+        # matched via face embeddings; non-face refs (puppets, props, objects)
+        # fall back to CLIP vision embedding if clip_vision is connected.
+        # When populated, clip selection accepts chunks where any reference
+        # matches in at least one sample frame.
+        if character_refs_folder and face_detection:
+            character_refs = mining.load_character_refs(character_refs_folder, clip_vision=clip_vision)
+            if character_refs:
+                n_face = sum(1 for r in character_refs.values() if r["type"] == "face")
+                n_clip = sum(1 for r in character_refs.values() if r["type"] == "clip")
+                logger.info(
+                    f"Multi-character mode: loaded {len(character_refs)} references "
+                    f"({n_face} face, {n_clip} clip-vision) "
+                    f"— {', '.join(sorted(character_refs.keys()))}"
+                )
+
+        # Voice references: optional folder of audio clips per character (one
+        # clip per character, filename stem = trigger). When populated, the
+        # transcriber runs pyannote diarization + speaker embedding to attribute
+        # each line of dialogue to a known speaker.
+        if voice_refs_folder and transcribe_speech:
+            voice_refs = mining.load_voice_refs(voice_refs_folder)
+            if voice_refs:
+                logger.info(
+                    f"Voice attribution: loaded {len(voice_refs)} voice reference(s) "
+                    f"— {', '.join(sorted(voice_refs.keys()))}"
+                )
+
+        # target_face pin: wired through the same character_refs pipeline as the
+        # folder path, using lora_trigger as the trigger name (equivalent to
+        # dropping one image in a folder named <lora_trigger>.jpg).
+        if target_face is not None and face_detection:
+            target_embedding = mining.compute_target_embedding(target_face)
+            if target_embedding is None:
+                logger.warning("Could not extract face from target_face image, face matching disabled")
+            else:
+                trigger = (lora_trigger or "").strip().lower().replace("_", "-")
+                if not trigger:
+                    trigger = "subject"
+                    logger.warning("target_face connected without lora_trigger — defaulting trigger to 'subject'")
+                # Encode target_face tensor as base64 JPEG so Gemma can see the
+                # reference at caption time (matches _load_character_refs format).
+                import base64 as _b64
+                frame = target_face[0].cpu().numpy()
+                frame = (frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if ok:
+                    image_b64 = _b64.b64encode(buf.tobytes()).decode("utf-8")
+                    character_refs[trigger] = {
+                        "type": "face",
+                        "embedding": target_embedding,
+                        "image_b64": image_b64,
+                    }
+                    logger.info(f"target_face pin registered as character reference: {trigger} (similarity threshold: {face_similarity})")
+                    # Route exclusively through character_refs — avoid double-filtering
+                    # via the legacy target_embedding codepath.
+                    target_embedding = None
+                else:
+                    logger.warning("Could not JPEG-encode target_face — falling back to legacy target_embedding filter (no Gemma cast entry)")
+
+        # Location references: labeled images of distinct sets/locations.
+        # Gemma is shown these alongside the clip frames during captioning
+        # and picks the best match (if any).  Much simpler than character
+        # refs — just name + image, no embeddings.
+        if location_refs_folder:
+            location_refs = mining.load_location_refs(location_refs_folder)
+            if location_refs:
+                logger.info(
+                    f"Location mode: loaded {len(location_refs)} location refs "
+                    f"— {', '.join(sorted(location_refs.keys()))}"
+                )
 
         # If we get here, there is real work to do. Surface what's actually
         # missing so the rest of the run is interpretable, and so the user
