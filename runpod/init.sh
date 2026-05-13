@@ -132,7 +132,7 @@ fi
 # Unset the env vars (or empty them) to disable auto-mount.
 # -----------------------------------------------------------------------------
 RS_NODES_RAW="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod"
-for f in install_rclone.sh b2_helpers.sh b2_mount.sh; do
+for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh; do
     # Always re-fetch so script updates land on the next boot without
     # waiting for a full bootstrap.sh re-run. Cheap (~1KB each).
     if curl -fsSL "$RS_NODES_RAW/$f" -o "/workspace/$f.new" 2>/dev/null; then
@@ -149,20 +149,46 @@ if ! command -v rclone >/dev/null 2>&1; then
     fi
 fi
 
-# Auto-mount B2 bucket at /workspace/b2 when an rclone config is
-# present. We check the *config file* not just env vars so the
-# mount works whether the creds came from:
-#   * B2_KEY_ID + B2_APP_KEY env vars (init.sh wrote rclone.conf above), or
-#   * b2_setup.bat / b2_setup.sh (SSH-pushed rclone.conf, no env vars)
-# Either path, next reboot auto-mounts.
+# B2 bucket visible at /workspace/b2/, by whichever method this
+# container supports:
+#   * /dev/fuse present  -> FUSE-mount via b2_mount.sh (live, real-time)
+#   * /dev/fuse missing  -> rclone copy as a local mirror (snapshot
+#                            on boot, files are real-on-disk; push
+#                            changes back via b2_helpers.sh push or
+#                            an explicit rclone copy)
 #
-# b2_mount.sh handles fuse install (apt-get fuse3) and silently
-# bails out if /dev/fuse isn't available in the container — failure
-# here doesn't block the rest of init.sh.
+# RunPod's CUDA base images typically don't expose /dev/fuse, so the
+# fallback is what most pods will use. Either way: /workspace/b2/
+# ends up with the bucket's contents and ComfyUI / rs-studio can
+# read them like any local directory.
 if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; then
-    if [ -x /workspace/b2_mount.sh ]; then
-        echo "[init] Auto-mounting B2 bucket at /workspace/b2"
+    mkdir -p /workspace/b2
+    if [ -c /dev/fuse ] && [ -x /workspace/b2_mount.sh ]; then
+        echo "[init] FUSE available — mounting B2 bucket at /workspace/b2"
         bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /' || true
+    else
+        # FUSE not available — pull the bucket as a local mirror.
+        # Requires B2_BUCKET to know which bucket to pull (one-bucket-
+        # per-pod is the studio default; we don't try to mirror all
+        # buckets the key has access to).
+        if [ -n "${B2_BUCKET:-}" ]; then
+            echo "[init] FUSE unavailable — pulling b2:$B2_BUCKET to /workspace/b2/ (background)"
+            echo "[init]   progress: tail -f /workspace/b2_sync.log"
+            echo "[init]   incremental: only changed files transfer on subsequent boots"
+            # nohup + & + disown-equivalent (closing stdin) so the
+            # background rclone keeps running after init.sh's exec
+            # tail -f /dev/null replaces this shell. --log-file
+            # gives the user a way to watch progress.
+            nohup rclone copy "b2:$B2_BUCKET" /workspace/b2/ \
+                --transfers=8 \
+                --log-file /workspace/b2_sync.log \
+                --log-level INFO \
+                </dev/null >/dev/null 2>&1 &
+        else
+            echo "[init] WARN: FUSE unavailable AND B2_BUCKET env var not set."
+            echo "[init]       Can't mount and don't know which bucket to mirror."
+            echo "[init]       Set B2_BUCKET=<bucket-name> in pod env vars."
+        fi
     fi
 fi
 
