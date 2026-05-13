@@ -20,6 +20,16 @@ set -e
 
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone/rclone.conf}"
 B2_REMOTE="${B2_REMOTE:-b2}"
+# If B2_BUCKET is set in the pod env, mount that specific bucket
+# directly so /workspace/b2/datasets/ resolves immediately. Without
+# it, /workspace/b2/ is a directory listing all accessible buckets
+# (which is an extra hop for the common single-bucket setup).
+B2_BUCKET="${B2_BUCKET:-}"
+if [ -n "$B2_BUCKET" ]; then
+    MOUNT_TARGET="${B2_REMOTE}:${B2_BUCKET}"
+else
+    MOUNT_TARGET="${B2_REMOTE}:"
+fi
 MOUNT_POINT="${B2_MOUNT_POINT:-/workspace/b2}"
 LOG_FILE="${B2_MOUNT_LOG:-/workspace/b2_mount.log}"
 PID_FILE="${B2_MOUNT_PID:-/workspace/.b2_mount.pid}"
@@ -86,7 +96,7 @@ cmd_mount() {
         return 0
     fi
 
-    echo "[b2_mount] Mounting ${B2_REMOTE}: -> $MOUNT_POINT"
+    echo "[b2_mount] Mounting $MOUNT_TARGET -> $MOUNT_POINT"
     echo "[b2_mount] log: $LOG_FILE"
 
     # --vfs-cache-mode writes  : buffer writes locally before pushing,
@@ -96,7 +106,7 @@ cmd_mount() {
     # --allow-non-empty        : skip the safety check on /workspace/b2
     # --daemon                 : background; without this the script
     #                            would block until manual unmount
-    rclone mount "${B2_REMOTE}:" "$MOUNT_POINT" \
+    rclone mount "$MOUNT_TARGET" "$MOUNT_POINT" \
         --vfs-cache-mode writes \
         --dir-cache-time 1m \
         --vfs-read-chunk-size 32M \
@@ -120,7 +130,7 @@ cmd_mount() {
     fi
 
     # Record the rclone PID so unmount knows what to kill.
-    pgrep -f "rclone mount ${B2_REMOTE}: $MOUNT_POINT" > "$PID_FILE" || true
+    pgrep -f "rclone mount $MOUNT_TARGET $MOUNT_POINT" > "$PID_FILE" || true
 
     echo "[b2_mount] Mounted. Browse with:  ls $MOUNT_POINT/"
 }
@@ -174,7 +184,7 @@ case "$cmd" in
         cat <<EOF
 Usage: bash b2_mount.sh <command>
 
-  mount     Mount ${B2_REMOTE}: at $MOUNT_POINT (idempotent)
+  mount     Mount $MOUNT_TARGET at $MOUNT_POINT (idempotent)
   unmount   Unmount $MOUNT_POINT
   status    Report whether the bucket is currently mounted
 
