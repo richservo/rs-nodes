@@ -164,6 +164,15 @@ fi
 # and fall through gracefully — failure isn't fatal, init.sh keeps
 # going to set up the selective-pull mode.
 if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 && [ -n "${B2_BUCKET:-}" ]; then
+    # Tell every rclone call below where the config file lives.
+    # rclone's default is ~/.config/rclone/rclone.conf, but we keep
+    # ours on the persistent volume at /workspace/.rclone/rclone.conf
+    # so it survives pod restarts. Without this export, rclone serve
+    # nfs / rclone lsf / rclone mount all silently fail to find the
+    # B2 credentials and die at startup ("didn't find section in
+    # config file"), which is exactly the bug your log just caught.
+    export RCLONE_CONFIG=/workspace/.rclone/rclone.conf
+
     mkdir -p /workspace/datasets /workspace/ComfyUI/output/loras /workspace/b2
 
     # Aggressive FUSE setup — try everything to make /dev/fuse appear.
