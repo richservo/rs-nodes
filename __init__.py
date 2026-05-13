@@ -30,6 +30,7 @@ from .nodes.ltxv_train_lora import RSLTXVTrainLoRA
 from .nodes.sigma_scheduler import RSSigmaScheduler
 from .nodes.video_save import RSVideoSave
 from .nodes.exr_sequence_save import RSEXRSequenceSave
+from .nodes.exr_load import RSEXRLoad
 from .nodes.logc3_decode import RSLogC3Decode
 from .nodes.prompt_relay_encode import RSPromptRelayEncode
 from .nodes.prompt_relay_timeline import RSPromptRelayTimeline
@@ -63,6 +64,7 @@ NODE_CLASS_MAPPINGS = {
     "RSSigmaScheduler": RSSigmaScheduler,
     "RSVideoSave": RSVideoSave,
     "RSEXRSequenceSave": RSEXRSequenceSave,
+    "RSEXRLoad": RSEXRLoad,
     "RSLogC3Decode": RSLogC3Decode,
     "RSPromptRelayEncode": RSPromptRelayEncode,
     "RSPromptRelayTimeline": RSPromptRelayTimeline,
@@ -95,6 +97,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSSigmaScheduler": "RS Sigma Scheduler",
     "RSVideoSave": "RS Video Save (ProRes)",
     "RSEXRSequenceSave": "RS EXR Sequence Save",
+    "RSEXRLoad": "RS EXR Load",
     "RSLogC3Decode": "RS LogC3 HDR Decode",
     "RSPromptRelayEncode": "RS Prompt Relay Encode",
     "RSPromptRelayTimeline": "RS Prompt Relay Timeline",
