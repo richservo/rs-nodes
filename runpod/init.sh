@@ -193,23 +193,42 @@ if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     # /run/sshd needs to exist for the daemon's privilege-separation
     # chroot. Minimal images sometimes don't have it.
     mkdir -p /run/sshd
+    chmod 755 /run/sshd
 
-    # Start sshd. Try the service manager first (Ubuntu base images),
-    # fall back to invoking the daemon directly. sshd backgrounds —
-    # tail -f below keeps the container's PID 1 alive.
-    if command -v service >/dev/null 2>&1; then
-        service ssh restart 2>&1 | sed 's/^/[init] sshd: /' || /usr/sbin/sshd
-    elif [ -x /usr/sbin/sshd ]; then
-        pkill -f /usr/sbin/sshd 2>/dev/null || true
-        /usr/sbin/sshd
+    # Start sshd by invoking the daemon directly — `service ssh restart`
+    # on some minimal images is a no-op (script exits 0 without
+    # actually starting anything) and the previous `cmd | sed ||
+    # fallback` form swallowed the exit code through the pipe, so a
+    # silent service failure looked like success and the /usr/sbin/sshd
+    # fallback never ran. Direct invocation is simpler and the exit
+    # code is meaningful.
+    pkill -x sshd 2>/dev/null || true
+    sleep 0.2
+    if [ -x /usr/sbin/sshd ]; then
+        SSHD_ERR=$(/usr/sbin/sshd 2>&1)
+        SSHD_RC=$?
+        if [ "$SSHD_RC" -ne 0 ] || [ -n "$SSHD_ERR" ]; then
+            echo "[init] sshd: $SSHD_ERR"
+        fi
+    else
+        echo "[init] WARN: /usr/sbin/sshd not found — install openssh-server"
     fi
 
     # Verify sshd is actually listening before declaring success.
-    sleep 1
+    # Up to 3s grace; sshd binds the listening socket synchronously
+    # but daemonization adds a tiny race.
+    for _i in 1 2 3 4 5 6; do
+        if pgrep -x sshd >/dev/null 2>&1; then break; fi
+        sleep 0.5
+    done
     if pgrep -x sshd >/dev/null 2>&1; then
         echo "[init] sshd running (interactive ssh + scp + sftp available)"
     else
-        echo "[init] WARN: sshd not running — check /var/log/auth.log"
+        echo "[init] WARN: sshd failed to start. Last error: $SSHD_ERR"
+        echo "[init]       Common causes:"
+        echo "[init]         * Host keys missing (should be generated above; check /etc/ssh/ssh_host_*)"
+        echo "[init]         * /run/sshd permissions wrong (should be 755)"
+        echo "[init]         * Port 22 already bound by something else (rare)"
     fi
 
     # Print the canonical connection info so the user can copy/paste
