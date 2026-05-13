@@ -149,11 +149,17 @@ if ! command -v rclone >/dev/null 2>&1; then
     fi
 fi
 
-# Auto-mount B2 bucket at /workspace/b2 when creds are configured.
+# Auto-mount B2 bucket at /workspace/b2 when an rclone config is
+# present. We check the *config file* not just env vars so the
+# mount works whether the creds came from:
+#   * B2_KEY_ID + B2_APP_KEY env vars (init.sh wrote rclone.conf above), or
+#   * b2_setup.bat / b2_setup.sh (SSH-pushed rclone.conf, no env vars)
+# Either path, next reboot auto-mounts.
+#
 # b2_mount.sh handles fuse install (apt-get fuse3) and silently
 # bails out if /dev/fuse isn't available in the container — failure
 # here doesn't block the rest of init.sh.
-if [ -n "${B2_KEY_ID:-}" ] && [ -n "${B2_APP_KEY:-}" ] && command -v rclone >/dev/null 2>&1; then
+if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; then
     if [ -x /workspace/b2_mount.sh ]; then
         echo "[init] Auto-mounting B2 bucket at /workspace/b2"
         bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /' || true
