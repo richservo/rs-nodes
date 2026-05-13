@@ -183,6 +183,34 @@ if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
         echo "[init] WARN: sshd not running — check /var/log/auth.log"
     fi
 
+    # Print the canonical connection info so the user can copy/paste
+    # the right SSH line into rs-studio / launch.bat / wherever.
+    # RUNPOD_* env vars are set by RunPod's container runtime. Missing
+    # values usually mean the pod template doesn't expose TCP for that
+    # port — in that case only the proxy form works for SSH (and so
+    # scp/sftp also need to go through the proxy form).
+    echo
+    echo "[init] =========================================================="
+    echo "[init]  Connection info for this pod"
+    echo "[init] =========================================================="
+    if [ -n "${RUNPOD_POD_ID:-}" ]; then
+        echo "[init]  Pod ID:        $RUNPOD_POD_ID"
+    fi
+    if [ -n "${RUNPOD_PUBLIC_IP:-}" ] && [ -n "${RUNPOD_TCP_PORT_22:-}" ]; then
+        echo "[init]  TCP SSH:       ssh root@$RUNPOD_PUBLIC_IP -p $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519"
+        echo "[init]  TCP scp/sftp:  scp -P $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519 <file> root@$RUNPOD_PUBLIC_IP:<remote>"
+    else
+        echo "[init]  TCP SSH:       NOT EXPOSED on this pod template."
+        echo "[init]                 (RUNPOD_PUBLIC_IP / RUNPOD_TCP_PORT_22 not set —"
+        echo "[init]                  enable TCP port 22 in pod settings to use scp/sftp."
+        echo "[init]                  Without it, only proxy-form SSH works and rs-studio's"
+        echo "[init]                  file panel will fail to upload.)"
+    fi
+    if [ -n "${RUNPOD_POD_ID:-}" ]; then
+        echo "[init]  Proxy SSH:     ssh ${RUNPOD_POD_ID}-${RUNPOD_POD_HOSTNAME:-$(hostname)}@ssh.runpod.io -i ~/.ssh/id_ed25519"
+    fi
+    echo "[init] =========================================================="
+    echo
     echo "[init] Maintenance mode ready. Container will stay alive until you stop it."
     # Keep PID 1 alive so RunPod doesn't auto-restart the container.
     exec tail -f /dev/null
