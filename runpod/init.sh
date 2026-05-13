@@ -141,12 +141,15 @@ for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh b2_autosyn
     fi
 done
 
-# Install rclone if not already in PATH.
-if ! command -v rclone >/dev/null 2>&1; then
-    if [ -x /workspace/install_rclone.sh ]; then
-        echo "[init] rclone missing — installing"
-        bash /workspace/install_rclone.sh || echo "[init] WARN: rclone install failed"
-    fi
+# Run install_rclone.sh on every boot — the script itself checks
+# the installed version and force-upgrades if it's older than 1.65
+# (which is required for `rclone serve nfs`). A previous version of
+# this init.sh short-circuited via `command -v rclone` and never
+# called install_rclone.sh on pods that had an ancient apt-installed
+# rclone, leaving them stuck on v1.58.1.
+if [ -x /workspace/install_rclone.sh ]; then
+    bash /workspace/install_rclone.sh 2>&1 | sed 's/^/[init] /' || \
+        echo "[init] WARN: install_rclone.sh failed"
 fi
 
 # B2 wiring — tries FUSE mount first (best UX, no disk used), falls
