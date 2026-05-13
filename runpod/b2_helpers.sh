@@ -23,6 +23,61 @@
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone/rclone.conf}"
 B2_REMOTE="${B2_REMOTE:-b2}"   # the [name] of the rclone remote stanza
 
+# ---- High-level status (one-shot diagnostic) ------------------------------
+# Shows everything that matters for "is B2 working on this pod" in
+# one go: config presence, rclone reachable, bucket top-level
+# listing, local mirror state, autosync daemon state, last log lines.
+b2_status() {
+    echo "============================================================"
+    echo "  B2 status on this pod"
+    echo "============================================================"
+    echo
+    echo "rclone.conf:  $RCLONE_CONFIG"
+    if [ -f "$RCLONE_CONFIG" ]; then
+        echo "  $(ls -la "$RCLONE_CONFIG" | awk '{print $1, $3, $4, $5, "bytes"}')"
+    else
+        echo "  MISSING — B2 not configured yet."
+        echo "  Set B2_KEY_ID + B2_APP_KEY env vars and restart the pod."
+        return 1
+    fi
+    echo
+    echo "B2_BUCKET env var: ${B2_BUCKET:-(NOT SET — needed for auto-mirror)}"
+    echo
+    echo "--- rclone connection check ---"
+    b2_check
+    echo
+    echo "--- bucket top level (b2:${B2_BUCKET:-}) ---"
+    if [ -n "${B2_BUCKET:-}" ]; then
+        rclone lsf --max-depth 1 "${B2_REMOTE}:${B2_BUCKET}" 2>&1 | head -20 || \
+            echo "(bucket empty or unreachable)"
+    else
+        rclone lsf --max-depth 1 "${B2_REMOTE}:" 2>&1 | head -20 || \
+            echo "(no buckets accessible)"
+    fi
+    echo
+    echo "--- /workspace/b2/ local mirror (top level) ---"
+    if [ -d /workspace/b2 ]; then
+        ls /workspace/b2/ 2>/dev/null | head -20
+        echo "  ($(du -sh /workspace/b2 2>/dev/null | cut -f1) total)"
+    else
+        echo "  /workspace/b2 doesn't exist"
+    fi
+    echo
+    echo "--- autosync daemon (local edits -> B2) ---"
+    if pgrep -f "b2_autosync.sh" >/dev/null 2>&1; then
+        echo "  RUNNING (PID $(pgrep -f b2_autosync.sh | head -1))"
+    else
+        echo "  not running"
+    fi
+    echo
+    echo "--- last 10 lines of b2_sync.log (initial pull) ---"
+    tail -10 /workspace/b2_sync.log 2>/dev/null || echo "  (no log yet)"
+    echo
+    echo "--- last 10 lines of b2_autosync.log (live pushes) ---"
+    tail -10 /workspace/b2_autosync.log 2>/dev/null || echo "  (no log yet)"
+    echo "============================================================"
+}
+
 # ---- Status / preflight ---------------------------------------------------
 b2_check() {
     if ! command -v rclone >/dev/null 2>&1; then
@@ -128,6 +183,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     cmd="${1:-}"
     shift || true
     case "$cmd" in
+        status) b2_status "$@" ;;
         check)  b2_check "$@" ;;
         ls)     b2_ls "$@" ;;
         lsl)    b2_lsl "$@" ;;
@@ -141,6 +197,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             cat <<'EOF'
 Usage: bash b2_helpers.sh <command> [args...]
 
+  status                           One-shot summary: config, bucket, mirror, daemon
   check                            Verify rclone + config + connectivity
   ls    [prefix]                   One-level listing
   lsl   [prefix]                   Recursive listing with sizes
