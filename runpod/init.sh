@@ -165,6 +165,35 @@ if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     echo "[init]   * pip / apt / git / everything else"
     echo "[init] Set RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap."
 
+    # Generate or restore sshd host keys BEFORE starting sshd. Without
+    # this, sshd exits immediately with "no hostkeys available --
+    # exiting" on minimal base images (e.g. the NVIDIA CUDA runtime
+    # image, which is common for CPU-fallback pods). Bootstrap.sh's
+    # Phase 0.5 would normally do this; maintenance mode skips
+    # bootstrap, so we replicate the host-key setup here.
+    #
+    # Host keys are persisted on the /workspace volume so they survive
+    # container resets — SSH clients won't see "host key changed"
+    # warnings on every reboot.
+    mkdir -p /workspace/.ssh/host_keys /etc/ssh
+    if compgen -G "/workspace/.ssh/host_keys/ssh_host_*" > /dev/null; then
+        echo "[init] Restoring sshd host keys from /workspace/.ssh/host_keys"
+        cp -f /workspace/.ssh/host_keys/ssh_host_* /etc/ssh/
+    elif compgen -G "/etc/ssh/ssh_host_*" > /dev/null; then
+        echo "[init] Persisting existing sshd host keys to /workspace/.ssh/host_keys"
+        cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+    else
+        echo "[init] Generating fresh sshd host keys (ssh-keygen -A)"
+        ssh-keygen -A
+        cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+    fi
+    chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+    chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+
+    # /run/sshd needs to exist for the daemon's privilege-separation
+    # chroot. Minimal images sometimes don't have it.
+    mkdir -p /run/sshd
+
     # Start sshd. Try the service manager first (Ubuntu base images),
     # fall back to invoking the daemon directly. sshd backgrounds —
     # tail -f below keeps the container's PID 1 alive.
