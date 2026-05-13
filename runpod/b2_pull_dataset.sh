@@ -18,7 +18,12 @@ set -e
 
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone/rclone.conf}"
 B2_REMOTE="${B2_REMOTE:-b2}"
-DATASETS_PREFIX="${B2_DATASETS_PREFIX:-datasets}"
+# Bucket-relative prefix where datasets live. Default is empty so
+# folders at the bucket ROOT work out of the box (e.g.
+# b2:my-bucket/character_alex/). If your bucket nests them under a
+# subfolder like `datasets/`, set B2_DATASETS_PREFIX=datasets in
+# pod env vars.
+DATASETS_PREFIX="${B2_DATASETS_PREFIX:-}"
 LOCAL_DATASETS="${LOCAL_DATASETS:-/workspace/datasets}"
 
 NAME="${1:-}"
@@ -29,7 +34,10 @@ if [ -z "$NAME" ]; then
     if [ -z "${B2_BUCKET:-}" ]; then
         echo "  (B2_BUCKET not set)"
     else
-        rclone lsf --max-depth 1 "${B2_REMOTE}:${B2_BUCKET}/${DATASETS_PREFIX}" 2>/dev/null || \
+        # Build the listing path: with-or-without prefix.
+        _LIST_PATH="${B2_REMOTE}:${B2_BUCKET}"
+        [ -n "$DATASETS_PREFIX" ] && _LIST_PATH="${_LIST_PATH}/${DATASETS_PREFIX}"
+        rclone lsf --max-depth 1 "$_LIST_PATH" 2>/dev/null || \
             echo "  (none, or couldn't list — check 'b2_helpers.sh status')"
     fi
     exit 1
@@ -45,7 +53,12 @@ if [ ! -f "$RCLONE_CONFIG" ]; then
     exit 1
 fi
 
-REMOTE="${B2_REMOTE}:${B2_BUCKET}/${DATASETS_PREFIX}/${NAME}"
+# Build the remote path with or without the optional prefix.
+if [ -n "$DATASETS_PREFIX" ]; then
+    REMOTE="${B2_REMOTE}:${B2_BUCKET}/${DATASETS_PREFIX}/${NAME}"
+else
+    REMOTE="${B2_REMOTE}:${B2_BUCKET}/${NAME}"
+fi
 LOCAL="${LOCAL_DATASETS}/${NAME}"
 
 mkdir -p "$LOCAL"
