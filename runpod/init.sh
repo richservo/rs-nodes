@@ -149,31 +149,71 @@ if ! command -v rclone >/dev/null 2>&1; then
     fi
 fi
 
-# B2 wiring (selective sync model — scales from 10GB to 100TB+).
+# B2 wiring — tries FUSE mount first (best UX, no disk used), falls
+# back to selective pull (works without FUSE).
 #
-# Production ML pipeline pattern: we do NOT mirror the whole bucket
-# to /workspace. Buckets grow into the TB range at feature-film
-# scale; pods only have ~500 GB-2 TB of /workspace. Instead:
+# FUSE strategy on every boot:
+#   1. apt install fuse3 + libfuse-dev (userland tooling)
+#   2. modprobe fuse (loads kernel module if container has access)
+#   3. mknod /dev/fuse c 10 229 if missing (needs CAP_MKNOD)
+#   4. If /dev/fuse exists after that, mount b2:$B2_BUCKET at /workspace/b2/
 #
-#   * Datasets — pulled per-character via `b2_pull_dataset.sh
-#     <name>` when an artist starts a training session. Only the
-#     character being trained ever lives on this pod's disk.
-#
-#   * LoRA outputs — auto-pushed to b2:bucket/loras/ as they're
-#     written. Trained outputs distribute automatically; no manual
-#     push step. Watched dir: /workspace/ComfyUI/output/loras/.
-#
-#   * Browsing — `b2_helpers.sh ls [prefix]` lists what's on B2
-#     without pulling anything. rs-studio's eventual B2 panel uses
-#     the same rclone API for a native browse UX.
-#
-# This means /workspace/b2 is NOT the bucket root. It only exists
-# as a convenience symlink / unused directory. The actual paths
-# the artist cares about are:
-#   /workspace/datasets/<character>/         (pulled per training session)
-#   /workspace/ComfyUI/output/loras/<x>/     (auto-pushed to b2:bucket/loras/)
+# RunPod's standard CUDA template typically doesn't allow CAP_MKNOD
+# from inside the container, so this will likely fail there. But
+# some templates (privileged, custom) DO allow it. We try aggressively
+# and fall through gracefully — failure isn't fatal, init.sh keeps
+# going to set up the selective-pull mode.
 if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 && [ -n "${B2_BUCKET:-}" ]; then
-    mkdir -p /workspace/datasets /workspace/ComfyUI/output/loras
+    mkdir -p /workspace/datasets /workspace/ComfyUI/output/loras /workspace/b2
+
+    # Aggressive FUSE setup — try everything to make /dev/fuse appear.
+    if [ ! -c /dev/fuse ]; then
+        echo "[init] /dev/fuse missing — attempting to create it"
+
+        # Install FUSE userland packages.
+        if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+            echo "[init]   apt install fuse3..."
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1 || \
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse libfuse2 >/dev/null 2>&1 || \
+                echo "[init]   fuse apt install failed"
+        fi
+
+        # Try to load the kernel module — usually fails inside
+        # containers but it costs nothing to try.
+        if modprobe fuse 2>/dev/null; then
+            echo "[init]   modprobe fuse: loaded"
+        fi
+
+        # The real trick: create /dev/fuse manually via mknod. Major
+        # 10, minor 229 is the FUSE character device. Needs CAP_MKNOD
+        # which RunPod containers MAY or MAY NOT have.
+        if mknod /dev/fuse c 10 229 2>/dev/null; then
+            chmod 666 /dev/fuse
+            echo "[init]   mknod /dev/fuse: SUCCESS — FUSE should now work"
+        else
+            echo "[init]   mknod /dev/fuse: blocked (no CAP_MKNOD in this container)"
+        fi
+    fi
+
+    # Try the FUSE mount if /dev/fuse is now available.
+    FUSE_MOUNTED=0
+    if [ -c /dev/fuse ] && [ -x /workspace/b2_mount.sh ]; then
+        echo "[init] /dev/fuse available — attempting FUSE mount of b2:$B2_BUCKET at /workspace/b2/"
+        if B2_BUCKET="$B2_BUCKET" B2_REMOTE="${B2_REMOTE:-b2}" \
+            bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /'; then
+            # b2_mount's "Mounted." message means success.
+            if mountpoint -q /workspace/b2 2>/dev/null || grep -q ' /workspace/b2 ' /proc/mounts 2>/dev/null; then
+                FUSE_MOUNTED=1
+                echo "[init] B2 bucket mounted at /workspace/b2/ — read-on-demand, no local disk used"
+            fi
+        fi
+    fi
+
+    if [ "$FUSE_MOUNTED" = "0" ]; then
+        echo "[init] FUSE mount not available — using selective-pull mode instead."
+        echo "[init] Use B2_DATASETS env var to declare which datasets to pull on boot."
+    fi
 
     # Install inotify-tools for autosync if missing.
     if ! command -v inotifywait >/dev/null 2>&1; then
