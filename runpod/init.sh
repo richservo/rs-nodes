@@ -258,16 +258,25 @@ if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 &&
                     NFS_MOUNTED=1
                     echo "[init] B2 mounted via NFS at /workspace/b2/ — no FUSE needed"
                 fi
-            else
-                echo "[init] NFS mount failed (kernel may lack nfs.ko client support)"
+            fi
+            if [ "$NFS_MOUNTED" = "0" ]; then
+                echo "[init] NFS mount failed. Last 10 lines of rclone_nfs.log:"
+                tail -10 /workspace/rclone_nfs.log 2>/dev/null | sed 's/^/[init]   /' || \
+                    echo "[init]   (no rclone_nfs.log — rclone died before logging)"
+                pkill -f "rclone serve nfs" 2>/dev/null || true
             fi
         fi
     fi
 
     if [ "$FUSE_MOUNTED" = "0" ] && [ "$NFS_MOUNTED" = "0" ]; then
         echo "[init] Neither FUSE nor NFS mount worked on this container."
-        echo "[init] Using selective-pull mode: set B2_DATASETS=<name1>,<name2>"
-        echo "[init] in pod env vars to auto-pull specific datasets on boot."
+        echo "[init] Falling back to selective-pull mode."
+        echo ""
+        echo "[init] Top-level folders in b2:$B2_BUCKET (use these as B2_DATASETS values):"
+        rclone lsf --dirs-only --max-depth 1 "b2:$B2_BUCKET" 2>&1 | sed 's/^/[init]   /' | head -30 || \
+            echo "[init]   (listing failed — check rclone.conf / B2 creds)"
+        echo ""
+        echo "[init] Set B2_DATASETS=<folder1>,<folder2> in pod env vars + restart."
     fi
 
     # Install inotify-tools for autosync if missing.
