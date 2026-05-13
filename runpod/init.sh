@@ -238,40 +238,79 @@ if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 &&
             pkill -f "rclone serve nfs" 2>/dev/null || true
             sleep 0.5
 
-            # Start rclone NFS server in background. --vfs-cache-mode
-            # writes lets writes buffer locally before pushing to B2.
-            # No --addr binding: defaults to 127.0.0.1:random — we
-            # parse the actual port from rclone's stderr.
-            echo "[init]   starting rclone serve nfs..."
-            nohup rclone serve nfs "b2:$B2_BUCKET" \
-                --addr 127.0.0.1:2049 \
-                --vfs-cache-mode writes \
-                --log-file /workspace/rclone_nfs.log \
-                --log-level INFO \
-                </dev/null >/dev/null 2>&1 &
+            # rclone version sanity check — `serve nfs` requires 1.65+
+            RCLONE_VER=$(rclone version 2>/dev/null | head -1 | awk '{print $2}')
+            echo "[init]   rclone version: ${RCLONE_VER:-unknown}"
 
-            # Wait for the NFS server to bind.
-            for _i in 1 2 3 4 5 6; do
+            # Pre-create the rclone NFS log so the tail at the end has
+            # SOMETHING to read even if rclone dies before opening it.
+            : > /workspace/rclone_nfs.log
+            : > /workspace/rclone_nfs_stderr.log
+
+            # Run rclone serve nfs as foreground-but-backgrounded. Key
+            # things being explicit about this time:
+            #   * --config <path>  — don't rely on env-var inheritance
+            #     through nohup (which IS supposed to work but let's
+            #     remove any doubt)
+            #   * --vfs-cache-mode full — NFS server semantics need
+            #     the full vfs cache; the `writes` mode was wrong
+            #   * --cache-dir on /workspace — /tmp may be tiny on some
+            #     containers
+            #   * --log-level DEBUG — see EVERYTHING
+            #   * Redirect both stdout AND stderr to a separate file
+            #     (rclone's startup-phase output goes to stderr before
+            #     --log-file takes effect — that's why we got nothing
+            #     last time)
+            echo "[init]   starting rclone serve nfs (DEBUG, full cache)..."
+            mkdir -p /workspace/.rclone-cache
+            nohup rclone \
+                --config /workspace/.rclone/rclone.conf \
+                --log-file /workspace/rclone_nfs.log \
+                --log-level DEBUG \
+                serve nfs "b2:$B2_BUCKET" \
+                --addr 127.0.0.1:2049 \
+                --vfs-cache-mode full \
+                --cache-dir /workspace/.rclone-cache \
+                </dev/null >/workspace/rclone_nfs_stderr.log 2>&1 &
+            RCLONE_NFS_PID=$!
+            echo "[init]   rclone serve nfs PID: $RCLONE_NFS_PID"
+
+            # Wait for the NFS server to bind. Give it more time —
+            # rclone's vfs cache init can take a few seconds.
+            for _i in $(seq 1 20); do
                 if ss -ltn 2>/dev/null | grep -q ':2049' || \
                    netstat -ltn 2>/dev/null | grep -q ':2049'; then
+                    echo "[init]   port 2049 bound (after ${_i}x0.5s)"
+                    break
+                fi
+                # If rclone has already exited, no point waiting.
+                if ! kill -0 "$RCLONE_NFS_PID" 2>/dev/null; then
+                    echo "[init]   rclone serve nfs exited prematurely"
                     break
                 fi
                 sleep 0.5
             done
 
-            # Mount it. Kernel NFS client + soft + short timeout so a
-            # hang on the rclone side doesn't lock the pod's I/O.
-            if mount -t nfs -o vers=3,nolock,soft,timeo=300,proto=tcp \
-                localhost:/ /workspace/b2 2>&1 | sed 's/^/[init] mount.nfs: /'; then
-                if mountpoint -q /workspace/b2 2>/dev/null; then
-                    NFS_MOUNTED=1
-                    echo "[init] B2 mounted via NFS at /workspace/b2/ — no FUSE needed"
+            # Mount it. Explicit port + mountport + nordirplus so
+            # mount.nfs doesn't try to talk to portmapper (port 111)
+            # — that was why the previous attempt took 2 minutes to
+            # fail. With these flags it tries 2049 directly.
+            if kill -0 "$RCLONE_NFS_PID" 2>/dev/null; then
+                if mount -t nfs -o "nfsvers=3,nolock,soft,timeo=100,proto=tcp,port=2049,mountport=2049,nordirplus" \
+                    localhost:/ /workspace/b2 2>&1 | sed 's/^/[init] mount.nfs: /'; then
+                    if mountpoint -q /workspace/b2 2>/dev/null; then
+                        NFS_MOUNTED=1
+                        echo "[init] B2 mounted via NFS at /workspace/b2/ — no FUSE needed"
+                    fi
                 fi
             fi
+
             if [ "$NFS_MOUNTED" = "0" ]; then
-                echo "[init] NFS mount failed. Last 10 lines of rclone_nfs.log:"
-                tail -10 /workspace/rclone_nfs.log 2>/dev/null | sed 's/^/[init]   /' || \
-                    echo "[init]   (no rclone_nfs.log — rclone died before logging)"
+                echo "[init] NFS mount failed. Diagnostic output follows:"
+                echo "[init] --- rclone serve nfs stdout/stderr (--log-file misses startup): ---"
+                tail -30 /workspace/rclone_nfs_stderr.log 2>/dev/null | sed 's/^/[init]   /' || true
+                echo "[init] --- rclone serve nfs structured log: ---"
+                tail -30 /workspace/rclone_nfs.log 2>/dev/null | sed 's/^/[init]   /' || true
                 pkill -f "rclone serve nfs" 2>/dev/null || true
             fi
         fi
