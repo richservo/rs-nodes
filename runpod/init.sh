@@ -91,22 +91,96 @@ echo "[init] authorized_keys has $(wc -l < /root/.ssh/authorized_keys) key(s)"
 # Instead: make sure sshd is alive (so they can SSH in to do the
 # maintenance they came for) and idle. Override with RS_FORCE_BOOTSTRAP=1
 # if you really want to run the normal flow on a CPU pod anyway.
+# -----------------------------------------------------------------------------
+# B2 credentials from env vars -> /workspace/.rclone/rclone.conf
+#
+# Declarative: set B2_KEY_ID and B2_APP_KEY in pod env vars (RunPod
+# console) and init.sh writes a valid rclone.conf on EVERY boot.
+# Same pattern as PUBLIC_KEY_* env vars. No manual paste, no
+# b2_setup.bat round-trip required.
+#
+# Bucket name is not put in rclone.conf (rclone remote stanzas don't
+# need it — bucket lands in the path: `b2:<bucket>/datasets/...`).
+# B2_BUCKET env var is read by b2_helpers.sh as a convenience default.
+# -----------------------------------------------------------------------------
+if [ -n "${B2_KEY_ID:-}" ] && [ -n "${B2_APP_KEY:-}" ]; then
+    mkdir -p /workspace/.rclone
+    chmod 700 /workspace/.rclone
+    cat > /workspace/.rclone/rclone.conf <<EOF
+[b2]
+type = b2
+account = $B2_KEY_ID
+key = $B2_APP_KEY
+hard_delete = false
+EOF
+    chmod 600 /workspace/.rclone/rclone.conf
+    echo "[init] Wrote /workspace/.rclone/rclone.conf from B2_KEY_ID / B2_APP_KEY env vars"
+fi
+
+# -----------------------------------------------------------------------------
+# sshd sftp subsystem — ALWAYS-ON, both maintenance + normal modes.
+#
+# Some minimal base images strip the sftp-server subsystem from
+# sshd_config — breaks scp / sftp / rs-studio's file panel while
+# interactive ssh still works. Patch in the Subsystem line and
+# install the binary if missing, so file transfer is always
+# available on any pod running this init.sh.
+# -----------------------------------------------------------------------------
+SSHD_CONFIG=/etc/ssh/sshd_config
+if [ -f "$SSHD_CONFIG" ]; then
+    if ! grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp' "$SSHD_CONFIG"; then
+        SFTP_SERVER=""
+        for p in /usr/lib/openssh/sftp-server \
+                 /usr/libexec/openssh/sftp-server \
+                 /usr/lib/sftp-server \
+                 /usr/libexec/sftp-server; do
+            if [ -x "$p" ]; then SFTP_SERVER="$p"; break; fi
+        done
+        if [ -z "$SFTP_SERVER" ] && command -v apt-get >/dev/null 2>&1; then
+            echo "[init] Installing openssh-sftp-server (for sftp/scp)..."
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-sftp-server >/dev/null 2>&1 || true
+            for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server; do
+                if [ -x "$p" ]; then SFTP_SERVER="$p"; break; fi
+            done
+        fi
+        if [ -n "$SFTP_SERVER" ]; then
+            echo "[init] Enabling sftp subsystem in sshd_config: $SFTP_SERVER"
+            echo "Subsystem sftp $SFTP_SERVER" >> "$SSHD_CONFIG"
+        else
+            echo "[init] WARN: sftp-server binary unavailable — file transfer won't work."
+        fi
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# GPU check / maintenance mode
+# -----------------------------------------------------------------------------
 if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     echo "[init] No GPU detected — entering MAINTENANCE MODE."
-    echo "[init]   * authorized_keys already populated from PUBLIC_KEY* env vars"
-    echo "[init]   * sshd starting"
-    echo "[init]   * container will idle so you can SSH in"
-    echo "[init]   * SET RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap"
+    echo "[init] Full pod access except ComfyUI / CUDA-dependent work:"
+    echo "[init]   * SSH (interactive + scp + sftp)"
+    echo "[init]   * Network volume read/write"
+    echo "[init]   * rclone / B2 sync (if B2_KEY_ID + B2_APP_KEY env vars set)"
+    echo "[init]   * pip / apt / git / everything else"
+    echo "[init] Set RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap."
 
-    # Start sshd. Try the service manager first (works on Ubuntu base
-    # images), fall back to invoking the daemon directly. -D would
-    # keep it foreground but we want sshd backgrounded so this
-    # script's tail -f at the end is the PID 1 keep-alive.
+    # Start sshd. Try the service manager first (Ubuntu base images),
+    # fall back to invoking the daemon directly. sshd backgrounds —
+    # tail -f below keeps the container's PID 1 alive.
     if command -v service >/dev/null 2>&1; then
         service ssh restart 2>&1 | sed 's/^/[init] sshd: /' || /usr/sbin/sshd
     elif [ -x /usr/sbin/sshd ]; then
         pkill -f /usr/sbin/sshd 2>/dev/null || true
         /usr/sbin/sshd
+    fi
+
+    # Verify sshd is actually listening before declaring success.
+    sleep 1
+    if pgrep -x sshd >/dev/null 2>&1; then
+        echo "[init] sshd running (interactive ssh + scp + sftp available)"
+    else
+        echo "[init] WARN: sshd not running — check /var/log/auth.log"
     fi
 
     echo "[init] Maintenance mode ready. Container will stay alive until you stop it."
