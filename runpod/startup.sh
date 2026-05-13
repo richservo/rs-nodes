@@ -125,11 +125,15 @@ if ! command -v rclone >/dev/null 2>&1; then
         bash "$RS_NODES_DIR/runpod/install_rclone.sh" || log "WARN: rclone install failed (B2 sync will be unavailable)"
     fi
 fi
-# Always mirror the latest b2_helpers.sh from the repo so updates land
-# without a full re-bootstrap. Cheap (~1KB copy).
+# Always mirror the latest b2_helpers.sh + b2_mount.sh from the repo
+# so updates land without a full re-bootstrap. Cheap (~1KB copies).
 if [ -f "$RS_NODES_DIR/runpod/b2_helpers.sh" ]; then
     cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
     chmod +x /workspace/b2_helpers.sh
+fi
+if [ -f "$RS_NODES_DIR/runpod/b2_mount.sh" ]; then
+    cp -f "$RS_NODES_DIR/runpod/b2_mount.sh" /workspace/b2_mount.sh
+    chmod +x /workspace/b2_mount.sh
 fi
 mkdir -p /workspace/.rclone
 chmod 700 /workspace/.rclone

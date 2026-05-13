@@ -280,10 +280,11 @@ fi
 banner "Phase 2.5/7  rclone install (for B2 / S3 sync)"
 bash "$RS_NODES_DIR/runpod/install_rclone.sh"
 cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
-chmod +x /workspace/b2_helpers.sh
+cp -f "$RS_NODES_DIR/runpod/b2_mount.sh" /workspace/b2_mount.sh 2>/dev/null || true
+chmod +x /workspace/b2_helpers.sh /workspace/b2_mount.sh 2>/dev/null || true
 mkdir -p /workspace/.rclone
 chmod 700 /workspace/.rclone
-log "rclone available; b2_helpers.sh at /workspace/b2_helpers.sh"
+log "rclone available; b2_helpers.sh + b2_mount.sh at /workspace/"
 
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
