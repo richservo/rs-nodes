@@ -116,6 +116,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# rclone + B2 helpers — install on demand for pods that bootstrapped
+# before the feature existed. No-op when rclone is already present.
+# -----------------------------------------------------------------------------
+if ! command -v rclone >/dev/null 2>&1; then
+    log "rclone missing — installing"
+    if [ -x "$RS_NODES_DIR/runpod/install_rclone.sh" ]; then
+        bash "$RS_NODES_DIR/runpod/install_rclone.sh" || log "WARN: rclone install failed (B2 sync will be unavailable)"
+    fi
+fi
+# Always mirror the latest b2_helpers.sh from the repo so updates land
+# without a full re-bootstrap. Cheap (~1KB copy).
+if [ -f "$RS_NODES_DIR/runpod/b2_helpers.sh" ]; then
+    cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
+    chmod +x /workspace/b2_helpers.sh
+fi
+mkdir -p /workspace/.rclone
+chmod 700 /workspace/.rclone
+
+# -----------------------------------------------------------------------------
 # 1+2. ComfyUI + rs-nodes — clone if missing, pull on every boot.
 #      Capture pre/post HEADs so we can detect whether anything actually
 #      changed. If nothing changed, the express path below skips every

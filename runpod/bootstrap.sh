@@ -272,6 +272,20 @@ if [ -n "$PROV_HASH" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Phase 2.5 — rclone (for B2 / S3 dataset+LoRA sync)
+# Idempotent: install_rclone.sh is a no-op if the binary is already
+# in PATH. Mirror b2_helpers.sh to /workspace so rs-studio can shell
+# out to /workspace/b2_helpers.sh without a path lookup.
+# -----------------------------------------------------------------------------
+banner "Phase 2.5/7  rclone install (for B2 / S3 sync)"
+bash "$RS_NODES_DIR/runpod/install_rclone.sh"
+cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
+chmod +x /workspace/b2_helpers.sh
+mkdir -p /workspace/.rclone
+chmod 700 /workspace/.rclone
+log "rclone available; b2_helpers.sh at /workspace/b2_helpers.sh"
+
+# -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
 # -----------------------------------------------------------------------------
 banner "Phase 3/7  Custom node packs ($RS_NODE_PACKS)"
