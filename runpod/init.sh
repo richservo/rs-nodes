@@ -83,6 +83,37 @@ chmod 600 /workspace/.ssh/authorized_keys
 
 echo "[init] authorized_keys has $(wc -l < /root/.ssh/authorized_keys) key(s)"
 
+# GPU detection — if there's no usable GPU, almost certainly a CPU
+# pod the user spun up for maintenance (updating /workspace/.venv,
+# editing files, doing pip work) because GPU availability was tight.
+# Bootstrap, the framework-installed check, and ComfyUI launch all
+# depend on CUDA and would boot-loop the container on a CPU pod.
+# Instead: make sure sshd is alive (so they can SSH in to do the
+# maintenance they came for) and idle. Override with RS_FORCE_BOOTSTRAP=1
+# if you really want to run the normal flow on a CPU pod anyway.
+if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
+    echo "[init] No GPU detected — entering MAINTENANCE MODE."
+    echo "[init]   * authorized_keys already populated from PUBLIC_KEY* env vars"
+    echo "[init]   * sshd starting"
+    echo "[init]   * container will idle so you can SSH in"
+    echo "[init]   * SET RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap"
+
+    # Start sshd. Try the service manager first (works on Ubuntu base
+    # images), fall back to invoking the daemon directly. -D would
+    # keep it foreground but we want sshd backgrounded so this
+    # script's tail -f at the end is the PID 1 keep-alive.
+    if command -v service >/dev/null 2>&1; then
+        service ssh restart 2>&1 | sed 's/^/[init] sshd: /' || /usr/sbin/sshd
+    elif [ -x /usr/sbin/sshd ]; then
+        pkill -f /usr/sbin/sshd 2>/dev/null || true
+        /usr/sbin/sshd
+    fi
+
+    echo "[init] Maintenance mode ready. Container will stay alive until you stop it."
+    # Keep PID 1 alive so RunPod doesn't auto-restart the container.
+    exec tail -f /dev/null
+fi
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #
