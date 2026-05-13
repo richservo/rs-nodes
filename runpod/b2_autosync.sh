@@ -16,7 +16,15 @@ set -e
 
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone/rclone.conf}"
 B2_REMOTE="${B2_REMOTE:-b2}"
-WATCH_DIR="${B2_AUTOSYNC_WATCH:-/workspace/b2}"
+# At feature-film scale we don't auto-sync everything under
+# /workspace — only the LoRA outputs (small, valuable, the thing
+# you actually want to distribute). Datasets are pulled explicitly
+# per-character via b2_pull_dataset.sh and don't push back.
+WATCH_DIR="${B2_AUTOSYNC_WATCH:-/workspace/ComfyUI/output/loras}"
+# B2_AUTOSYNC_PREFIX is the path UNDER the bucket. So a file at
+# $WATCH_DIR/character_x/foo.safetensors pushes to
+# b2:$B2_BUCKET/$B2_AUTOSYNC_PREFIX/character_x/foo.safetensors
+B2_AUTOSYNC_PREFIX="${B2_AUTOSYNC_PREFIX:-loras}"
 LOG_FILE="${B2_AUTOSYNC_LOG:-/workspace/b2_autosync.log}"
 
 # --- preflight -----------------------------------------------------------
@@ -41,7 +49,7 @@ mkdir -p "$WATCH_DIR"
 
 echo "$(date -Is) b2_autosync starting" >> "$LOG_FILE"
 echo "  watch:  $WATCH_DIR" >> "$LOG_FILE"
-echo "  target: $B2_REMOTE:$B2_BUCKET" >> "$LOG_FILE"
+echo "  target: $B2_REMOTE:$B2_BUCKET/$B2_AUTOSYNC_PREFIX" >> "$LOG_FILE"
 
 # --- the loop ------------------------------------------------------------
 # -m   monitor mode (don't exit on first event)
@@ -61,13 +69,15 @@ while read -r filepath; do
     esac
 
     # Convert the local path to the B2-relative path under the bucket.
+    # rel is the path under the watch dir; we prepend the configured
+    # bucket-prefix so it lands at b2:bucket/<prefix>/<rel>.
     rel="${filepath#$WATCH_DIR/}"
+    target="$B2_REMOTE:$B2_BUCKET/$B2_AUTOSYNC_PREFIX/$rel"
 
     # Push. rclone copyto is idempotent (md5 check skips no-op
-    # transfers) so wasted events during the initial pull cost
-    # only a metadata HEAD per file.
-    if rclone copyto "$filepath" "$B2_REMOTE:$B2_BUCKET/$rel" 2>>"$LOG_FILE"; then
-        echo "$(date -Is) pushed: $rel" >> "$LOG_FILE"
+    # transfers), so duplicate events are cheap (just a HEAD).
+    if rclone copyto "$filepath" "$target" 2>>"$LOG_FILE"; then
+        echo "$(date -Is) pushed: $rel -> $B2_AUTOSYNC_PREFIX/$rel" >> "$LOG_FILE"
     else
         echo "$(date -Is) push FAILED: $rel" >> "$LOG_FILE"
     fi

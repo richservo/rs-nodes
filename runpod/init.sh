@@ -132,7 +132,7 @@ fi
 # Unset the env vars (or empty them) to disable auto-mount.
 # -----------------------------------------------------------------------------
 RS_NODES_RAW="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod"
-for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh b2_autosync.sh; do
+for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh b2_autosync.sh b2_pull_dataset.sh; do
     # Always re-fetch so script updates land on the next boot without
     # waiting for a full bootstrap.sh re-run. Cheap (~1KB each).
     if curl -fsSL "$RS_NODES_RAW/$f" -o "/workspace/$f.new" 2>/dev/null; then
@@ -149,66 +149,64 @@ if ! command -v rclone >/dev/null 2>&1; then
     fi
 fi
 
-# B2 bucket visible at /workspace/b2/, by whichever method this
-# container supports:
-#   * /dev/fuse present  -> FUSE-mount via b2_mount.sh (live, real-time)
-#   * /dev/fuse missing  -> rclone copy as a local mirror (snapshot
-#                            on boot, files are real-on-disk; push
-#                            changes back via b2_helpers.sh push or
-#                            an explicit rclone copy)
+# B2 wiring (selective sync model — scales from 10GB to 100TB+).
 #
-# RunPod's CUDA base images typically don't expose /dev/fuse, so the
-# fallback is what most pods will use. Either way: /workspace/b2/
-# ends up with the bucket's contents and ComfyUI / rs-studio can
-# read them like any local directory.
-if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; then
-    mkdir -p /workspace/b2
-    if [ -c /dev/fuse ] && [ -x /workspace/b2_mount.sh ]; then
-        echo "[init] FUSE available — mounting B2 bucket at /workspace/b2"
-        bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /' || true
-    else
-        # FUSE not available — pull the bucket as a local mirror,
-        # then start a background watcher that auto-pushes any local
-        # edits back. Requires B2_BUCKET to know which bucket to use.
-        if [ -n "${B2_BUCKET:-}" ]; then
-            echo "[init] FUSE unavailable — pulling b2:$B2_BUCKET to /workspace/b2/ (background)"
-            echo "[init]   progress: tail -f /workspace/b2_sync.log"
-            echo "[init]   incremental: only changed files transfer on subsequent boots"
-            # nohup + & + closing stdin so the background rclone
-            # outlives init.sh's exec to tail -f /dev/null.
-            nohup rclone copy "b2:$B2_BUCKET" /workspace/b2/ \
-                --transfers=8 \
-                --log-file /workspace/b2_sync.log \
-                --log-level INFO \
-                </dev/null >/dev/null 2>&1 &
+# Production ML pipeline pattern: we do NOT mirror the whole bucket
+# to /workspace. Buckets grow into the TB range at feature-film
+# scale; pods only have ~500 GB-2 TB of /workspace. Instead:
+#
+#   * Datasets — pulled per-character via `b2_pull_dataset.sh
+#     <name>` when an artist starts a training session. Only the
+#     character being trained ever lives on this pod's disk.
+#
+#   * LoRA outputs — auto-pushed to b2:bucket/loras/ as they're
+#     written. Trained outputs distribute automatically; no manual
+#     push step. Watched dir: /workspace/ComfyUI/output/loras/.
+#
+#   * Browsing — `b2_helpers.sh ls [prefix]` lists what's on B2
+#     without pulling anything. rs-studio's eventual B2 panel uses
+#     the same rclone API for a native browse UX.
+#
+# This means /workspace/b2 is NOT the bucket root. It only exists
+# as a convenience symlink / unused directory. The actual paths
+# the artist cares about are:
+#   /workspace/datasets/<character>/         (pulled per training session)
+#   /workspace/ComfyUI/output/loras/<x>/     (auto-pushed to b2:bucket/loras/)
+if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 && [ -n "${B2_BUCKET:-}" ]; then
+    mkdir -p /workspace/datasets /workspace/ComfyUI/output/loras
 
-            # Install inotify-tools if missing (needed for autosync).
-            if ! command -v inotifywait >/dev/null 2>&1; then
-                if command -v apt-get >/dev/null 2>&1; then
-                    echo "[init] Installing inotify-tools for B2 autosync..."
-                    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-                    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq inotify-tools >/dev/null 2>&1 || \
-                        echo "[init] WARN: inotify-tools install failed — autosync disabled."
-                fi
-            fi
-
-            # Start the watcher daemon. Kill any prior instance first
-            # so re-running init.sh doesn't stack multiple watchers.
-            if command -v inotifywait >/dev/null 2>&1 && [ -x /workspace/b2_autosync.sh ]; then
-                pkill -f "b2_autosync.sh" 2>/dev/null || true
-                # Pass B2_BUCKET through to the child (the daemon
-                # reads it from env).
-                echo "[init] Starting B2 autosync daemon (local edits -> B2)"
-                echo "[init]   log: /workspace/b2_autosync.log"
-                B2_BUCKET="$B2_BUCKET" B2_REMOTE="${B2_REMOTE:-b2}" \
-                    nohup bash /workspace/b2_autosync.sh </dev/null >/dev/null 2>&1 &
-            fi
-        else
-            echo "[init] WARN: FUSE unavailable AND B2_BUCKET env var not set."
-            echo "[init]       Can't mount and don't know which bucket to mirror."
-            echo "[init]       Set B2_BUCKET=<bucket-name> in pod env vars."
+    # Install inotify-tools for autosync if missing.
+    if ! command -v inotifywait >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            echo "[init] Installing inotify-tools for B2 autosync..."
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq inotify-tools >/dev/null 2>&1 || \
+                echo "[init] WARN: inotify-tools install failed — autosync disabled."
         fi
     fi
+
+    # Start the LoRA-output autosync daemon. Watches
+    # /workspace/ComfyUI/output/loras/, mirrors any new file to
+    # b2:$B2_BUCKET/loras/<rel>. Kill any prior instance so
+    # re-running init.sh doesn't stack daemons.
+    if command -v inotifywait >/dev/null 2>&1 && [ -x /workspace/b2_autosync.sh ]; then
+        pkill -f "b2_autosync.sh" 2>/dev/null || true
+        echo "[init] Starting B2 LoRA-output autosync daemon"
+        echo "[init]   watch:  /workspace/ComfyUI/output/loras/"
+        echo "[init]   target: b2:$B2_BUCKET/loras/"
+        echo "[init]   log:    /workspace/b2_autosync.log"
+        B2_BUCKET="$B2_BUCKET" \
+        B2_REMOTE="${B2_REMOTE:-b2}" \
+        B2_AUTOSYNC_WATCH=/workspace/ComfyUI/output/loras \
+        B2_AUTOSYNC_PREFIX=loras \
+            nohup bash /workspace/b2_autosync.sh </dev/null >/dev/null 2>&1 &
+    fi
+
+    echo "[init] B2 configured. Pull a dataset for training with:"
+    echo "[init]   bash /workspace/b2_pull_dataset.sh <character-name>"
+elif [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; then
+    echo "[init] B2 rclone.conf present but B2_BUCKET env var not set."
+    echo "[init] Set B2_BUCKET=<bucket-name> in pod env vars to enable autosync."
 fi
 
 # -----------------------------------------------------------------------------
