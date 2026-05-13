@@ -118,6 +118,49 @@ EOF
 fi
 
 # -----------------------------------------------------------------------------
+# B2 helper scripts + rclone install + auto-mount (declarative).
+#
+# Bootstrap.sh's Phase 2.5 mirrors these scripts to /workspace and
+# installs rclone — but maintenance mode skips bootstrap. So init.sh
+# does it directly here, on every boot, in both maintenance AND
+# normal modes. Idempotent (curls only when missing, install_rclone
+# no-ops when already present).
+#
+# Result: if B2_KEY_ID + B2_APP_KEY env vars are set on the pod, the
+# bucket auto-mounts at /workspace/b2/ on every boot. No terminal,
+# no manual `bash b2_mount.sh mount`, no user action required.
+# Unset the env vars (or empty them) to disable auto-mount.
+# -----------------------------------------------------------------------------
+RS_NODES_RAW="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod"
+for f in install_rclone.sh b2_helpers.sh b2_mount.sh; do
+    # Always re-fetch so script updates land on the next boot without
+    # waiting for a full bootstrap.sh re-run. Cheap (~1KB each).
+    if curl -fsSL "$RS_NODES_RAW/$f" -o "/workspace/$f.new" 2>/dev/null; then
+        mv -f "/workspace/$f.new" "/workspace/$f"
+        chmod +x "/workspace/$f"
+    fi
+done
+
+# Install rclone if not already in PATH.
+if ! command -v rclone >/dev/null 2>&1; then
+    if [ -x /workspace/install_rclone.sh ]; then
+        echo "[init] rclone missing — installing"
+        bash /workspace/install_rclone.sh || echo "[init] WARN: rclone install failed"
+    fi
+fi
+
+# Auto-mount B2 bucket at /workspace/b2 when creds are configured.
+# b2_mount.sh handles fuse install (apt-get fuse3) and silently
+# bails out if /dev/fuse isn't available in the container — failure
+# here doesn't block the rest of init.sh.
+if [ -n "${B2_KEY_ID:-}" ] && [ -n "${B2_APP_KEY:-}" ] && command -v rclone >/dev/null 2>&1; then
+    if [ -x /workspace/b2_mount.sh ]; then
+        echo "[init] Auto-mounting B2 bucket at /workspace/b2"
+        bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /' || true
+    fi
+fi
+
+# -----------------------------------------------------------------------------
 # sshd sftp subsystem — ALWAYS-ON, both maintenance + normal modes.
 #
 # Some minimal base images strip the sftp-server subsystem from
