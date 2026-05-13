@@ -210,9 +210,64 @@ if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 &&
         fi
     fi
 
+    # NFS fallback if FUSE didn't take. NFS uses the kernel's NFS
+    # client (not FUSE) so it sometimes works where FUSE is blocked.
+    # rclone serves the bucket over NFSv3 on localhost:2049; we then
+    # mount it locally via the kernel's mount syscall.
+    NFS_MOUNTED=0
     if [ "$FUSE_MOUNTED" = "0" ]; then
-        echo "[init] FUSE mount not available — using selective-pull mode instead."
-        echo "[init] Use B2_DATASETS env var to declare which datasets to pull on boot."
+        echo "[init] Trying NFS fallback (different kernel subsystem than FUSE)..."
+
+        # Install NFS userland (mount.nfs binary).
+        if ! command -v mount.nfs >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common >/dev/null 2>&1 || \
+                echo "[init]   nfs-common install failed"
+        fi
+
+        if command -v mount.nfs >/dev/null 2>&1; then
+            # Kill any stale rclone serve nfs from a previous boot.
+            pkill -f "rclone serve nfs" 2>/dev/null || true
+            sleep 0.5
+
+            # Start rclone NFS server in background. --vfs-cache-mode
+            # writes lets writes buffer locally before pushing to B2.
+            # No --addr binding: defaults to 127.0.0.1:random — we
+            # parse the actual port from rclone's stderr.
+            echo "[init]   starting rclone serve nfs..."
+            nohup rclone serve nfs "b2:$B2_BUCKET" \
+                --addr 127.0.0.1:2049 \
+                --vfs-cache-mode writes \
+                --log-file /workspace/rclone_nfs.log \
+                --log-level INFO \
+                </dev/null >/dev/null 2>&1 &
+
+            # Wait for the NFS server to bind.
+            for _i in 1 2 3 4 5 6; do
+                if ss -ltn 2>/dev/null | grep -q ':2049' || \
+                   netstat -ltn 2>/dev/null | grep -q ':2049'; then
+                    break
+                fi
+                sleep 0.5
+            done
+
+            # Mount it. Kernel NFS client + soft + short timeout so a
+            # hang on the rclone side doesn't lock the pod's I/O.
+            if mount -t nfs -o vers=3,nolock,soft,timeo=300,proto=tcp \
+                localhost:/ /workspace/b2 2>&1 | sed 's/^/[init] mount.nfs: /'; then
+                if mountpoint -q /workspace/b2 2>/dev/null; then
+                    NFS_MOUNTED=1
+                    echo "[init] B2 mounted via NFS at /workspace/b2/ — no FUSE needed"
+                fi
+            else
+                echo "[init] NFS mount failed (kernel may lack nfs.ko client support)"
+            fi
+        fi
+    fi
+
+    if [ "$FUSE_MOUNTED" = "0" ] && [ "$NFS_MOUNTED" = "0" ]; then
+        echo "[init] Neither FUSE nor NFS mount worked on this container."
+        echo "[init] Using selective-pull mode: set B2_DATASETS=<name1>,<name2>"
+        echo "[init] in pod env vars to auto-pull specific datasets on boot."
     fi
 
     # Install inotify-tools for autosync if missing.
