@@ -38,7 +38,13 @@ _FACE_MATCH_THRESHOLD = 0.40  # Cosine similarity threshold for face matching (l
 _FACE_DET_MIN_CONFIDENCE = 0.5
 _FACE_UNKNOWN_MIN_CONFIDENCE = 0.85
 
-_last_analysis_frame_id: int | None = None
+# Cache the actual frame (strong ref), not id(frame): CPython recycles
+# object ids immediately once an array is freed, so a freshly-decoded
+# video frame can land at the same heap slot a reference image just
+# vacated, hit a stale cache, and return faces whose bboxes don't exist
+# in the new frame — observed as "no face detected" until the address
+# happens to differ.
+_last_analysis_frame: "np.ndarray | None" = None
 _last_analysis_faces: list = []
 
 
@@ -86,13 +92,13 @@ def analyze_frame(frame: np.ndarray) -> list:
     """Run InsightFace on frame; memoize by id(frame) so repeat calls are
     free. Drops low-confidence detections (cactus/tiki/poster/cartoon
     patterns) so they don't pollute hit counts or unknown-face counts."""
-    global _last_analysis_frame_id, _last_analysis_faces
+    global _last_analysis_frame, _last_analysis_faces
     app = get_face_app()
     if app is None:
-        _last_analysis_frame_id = id(frame)
+        _last_analysis_frame = frame
         _last_analysis_faces = []
         return []
-    if id(frame) == _last_analysis_frame_id:
+    if frame is _last_analysis_frame:
         return _last_analysis_faces
     raw = app.get(frame)
     # Filter by detector confidence — non-human face-like patterns
@@ -101,7 +107,7 @@ def analyze_frame(frame: np.ndarray) -> list:
         f for f in raw
         if float(getattr(f, "det_score", 1.0)) >= _FACE_DET_MIN_CONFIDENCE
     ]
-    _last_analysis_frame_id = id(frame)
+    _last_analysis_frame = frame
     _last_analysis_faces = faces
     return faces
 
@@ -289,7 +295,7 @@ def unload_face_models() -> list[str]:
     Safe to call even if nothing was loaded.
     """
     global _face_app, _face_app_checked
-    global _last_analysis_frame_id, _last_analysis_faces
+    global _last_analysis_frame, _last_analysis_faces
 
     freed: list[str] = []
     if _face_app is not None:
@@ -302,7 +308,7 @@ def unload_face_models() -> list[str]:
         freed.append("InsightFace")
 
     # Drop frame memoization (holds a reference to the most recent frame)
-    _last_analysis_frame_id = None
+    _last_analysis_frame = None
     _last_analysis_faces = []
 
     return freed

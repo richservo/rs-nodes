@@ -1269,9 +1269,15 @@ def caption_dataset_json(
             )
 
             if prep is None:
-                # MISMATCH — reject this entry
+                # MISMATCH — reject this entry and purge on-disk artifacts
+                # (clip + latents/conditions/audio_latents) so the failed
+                # match can't be silently re-introduced on a later run
+                # via the artifact-trumps-JSON guard.
                 logger.info(f"  LLM QC: MISMATCH — removing {vf.name}")
-                reject_entry(i, entries, dataset_json_path, "llm_mismatch")
+                reject_entry(
+                    i, entries, dataset_json_path,
+                    "llm_mismatch", purge_artifacts=True,
+                )
                 removed_count += 1
                 continue
 

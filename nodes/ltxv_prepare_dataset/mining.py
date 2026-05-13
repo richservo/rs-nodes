@@ -88,7 +88,6 @@ def filter_dominant_chars(char_position_counts: dict) -> set:
     threshold = max_count * _CHAR_DOMINANCE_RATIO
     return {c for c, n in char_position_counts.items() if n >= threshold}
 
-
 def scan_media(folder: Path) -> list[dict]:
     """Scan folder for video and image files."""
     files = []

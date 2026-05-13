@@ -179,6 +179,9 @@ class RSLTXVPrepareDataset:
                 "char_positions_required": (["10%", "25%", "50%", "75%", "100%"], {"default": "75%", "tooltip": "Fraction of sample positions that must contain ANY named character. Scales with sample_count (e.g. 75% of 4 = 3, 75% of 8 = 6). Any mix of named characters across positions counts — they don't need to be the same character."}),
                 "allow_unknown_faces_in": (["0%", "10%", "25%", "50%", "75%", "100%"], {"default": "25%", "tooltip": "Fraction of sample positions allowed to contain unknown (non-reference) faces. Scales with sample_count (e.g. 25% of 4 = 1 position, 25% of 8 = 2). 0% = reject any extras at all, 100% = allow extras anywhere. 25% (default) tolerates one detection blip in a 4-sample chunk."}),
                 "clip_check": ("BOOLEAN", {"default": False, "tooltip": "When ON, re-scan every existing clip in the dataset and rewrite its `characters` field based on current character refs. Useful when you've added a new reference character after the dataset was already partly built — existing clips that contain the new character get their characters list updated. Runs once at the start of the run; leave OFF for subsequent runs."}),
+                "skip_phase_1_mine": ("BOOLEAN", {"default": False, "tooltip": "Skip Phase 1 (clip mining / face detection / extraction). Phase 0 reconciliation still runs against on-disk clips, then jumps straight to captioning/encoding using whatever's already in <output>/clips/. Use when clips are pre-made and only captions+encodes are missing."}),
+                "skip_phase_2_caption": ("BOOLEAN", {"default": False, "tooltip": "Skip Phase 2 (Ollama captioning + LLM QC). Entries without captions stay uncaptioned. Use when you'll caption manually or have already written captions into dataset.json."}),
+                "skip_phase_3_encode": ("BOOLEAN", {"default": False, "tooltip": "Skip Phase 3 (text / video / audio latent encoding + subprocess fallback). Use to stop after mining+captioning, e.g. when encoding will run later on a different machine."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
                 "vae": ("VAE", {"tooltip": "Video VAE (from CheckpointLoaderSimple). When connected, encodes video latents in-process instead of slow subprocess."}),
@@ -247,6 +250,9 @@ class RSLTXVPrepareDataset:
         clip_vision=None,
         target_fps: float = 0.0,
         max_samples: int = 0,
+        skip_phase_1_mine: bool = False,
+        skip_phase_2_caption: bool = False,
+        skip_phase_3_encode: bool = False,
         unique_id=None,
     ):
         validate_submodule()
@@ -927,8 +933,17 @@ class RSLTXVPrepareDataset:
         # nearly complete. Encoded artifacts are the source of truth;
         # don't mine to satisfy a JSON-derived quota when the artifacts
         # already exist.
-        if (max_samples > 0 and len(existing_entries) >= max_samples) or skip_mining:
-            if skip_mining:
+        if (
+            (max_samples > 0 and len(existing_entries) >= max_samples)
+            or skip_mining
+            or skip_phase_1_mine
+        ):
+            if skip_phase_1_mine:
+                logger.info(
+                    "Skipping Phase 1 (mining) — skip_phase_1_mine=True. "
+                    "Will use clips already present in clips/ as-is."
+                )
+            elif skip_mining:
                 logger.info(
                     "Skipping mining: no new source media. Will only fix "
                     "missing encodes on existing clips (if any). "
@@ -1665,67 +1680,83 @@ class RSLTXVPrepareDataset:
         character_refs = None  # noqa: F841
         location_refs = None  # noqa: F841
         clip_vision = None  # noqa: F841
-        try:
-            import comfy.model_management as mm
-            mm.unload_all_models()
-            if hasattr(mm, "cleanup_models"):
-                try:
-                    mm.cleanup_models(keep_clone_weights_loaded=False)
-                except TypeError:
-                    mm.cleanup_models()
-            if hasattr(mm, "current_loaded_models"):
-                try:
-                    mm.current_loaded_models.clear()
-                except Exception:
-                    pass
-            mm.soft_empty_cache()
-            gc.collect()
-            mm.free_memory(1e18, mm.get_torch_device())
-            logger.info("Cleared ComfyUI VRAM before Ollama captioning phase")
-        except Exception as e:
-            logger.warning(f"Could not fully free VRAM before captioning: {e}")
 
-        captioning.caption_dataset_json(
-            dataset_json_path, clip_paths, caption_mode, lora_trigger,
-            ollama_url=ollama_url, ollama_model=ollama_model,
-            target_face_b64=target_face_b64, caption_style=caption_style,
-            cast_names=cast_names, cast_refs=cast_refs,
-            location_refs=location_refs_list,
-            skip_id_pass=skip_id_pass,
-        )
+        if skip_phase_2_caption:
+            logger.info(
+                "Skipping Phase 2 (Ollama captioning) — skip_phase_2_caption=True. "
+                "Entries with empty captions remain uncaptioned."
+            )
+        else:
+            try:
+                import comfy.model_management as mm
+                mm.unload_all_models()
+                if hasattr(mm, "cleanup_models"):
+                    try:
+                        mm.cleanup_models(keep_clone_weights_loaded=False)
+                    except TypeError:
+                        mm.cleanup_models()
+                if hasattr(mm, "current_loaded_models"):
+                    try:
+                        mm.current_loaded_models.clear()
+                    except Exception:
+                        pass
+                mm.soft_empty_cache()
+                gc.collect()
+                mm.free_memory(1e18, mm.get_torch_device())
+                logger.info("Cleared ComfyUI VRAM before Ollama captioning phase")
+            except Exception as e:
+                logger.warning(f"Could not fully free VRAM before captioning: {e}")
 
-        # Post-captioning quota check. If clips got rejected (MISMATCH face
-        # QC, or length-overshoot caption rejection) and the chunk pool
-        # still has unused candidates, the dataset is now under quota.
-        # Automatic re-mining is non-trivial because mining state is
-        # interleaved with character-mode setup throughout prepare(); for
-        # now we surface a clear warning so the user knows to re-run
-        # prepare_dataset, which will resume from the persisted chunk_pool
-        # and fill the gap. See Reference/dataset-self-heal-spec.md for
-        # the deferred auto-remine plan.
-        try:
-            with open(dataset_json_path) as _qf:
-                _post_cap_entries = json.load(_qf)
-        except (OSError, json.JSONDecodeError):
-            _post_cap_entries = []
-        _pool_remaining = pool_state.get("remaining", 0)
-        if max_samples > 0 and len(_post_cap_entries) < max_samples:
-            shortfall = max_samples - len(_post_cap_entries)
-            if _pool_remaining > 0:
-                logger.warning(
-                    f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
-                    f"samples (short by {shortfall}). chunk_pool has "
-                    f"{_pool_remaining} clips remaining — re-run prepare_dataset "
-                    f"to mine replacements for the rejected clips."
-                )
-            else:
-                logger.warning(
-                    f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
-                    f"samples (short by {shortfall}). chunk_pool is empty — "
-                    f"add more source media to fill the remaining slots."
-                )
+            captioning.caption_dataset_json(
+                dataset_json_path, clip_paths, caption_mode, lora_trigger,
+                ollama_url=ollama_url, ollama_model=ollama_model,
+                target_face_b64=target_face_b64, caption_style=caption_style,
+                cast_names=cast_names, cast_refs=cast_refs,
+                location_refs=location_refs_list,
+                skip_id_pass=skip_id_pass,
+            )
+
+            # Post-captioning quota check. If clips got rejected (MISMATCH face
+            # QC, or length-overshoot caption rejection) and the chunk pool
+            # still has unused candidates, the dataset is now under quota.
+            # Automatic re-mining is non-trivial because mining state is
+            # interleaved with character-mode setup throughout prepare(); for
+            # now we surface a clear warning so the user knows to re-run
+            # prepare_dataset, which will resume from the persisted chunk_pool
+            # and fill the gap. See Reference/dataset-self-heal-spec.md for
+            # the deferred auto-remine plan.
+            try:
+                with open(dataset_json_path) as _qf:
+                    _post_cap_entries = json.load(_qf)
+            except (OSError, json.JSONDecodeError):
+                _post_cap_entries = []
+            _pool_remaining = pool_state.get("remaining", 0)
+            if max_samples > 0 and len(_post_cap_entries) < max_samples:
+                shortfall = max_samples - len(_post_cap_entries)
+                if _pool_remaining > 0:
+                    logger.warning(
+                        f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
+                        f"samples (short by {shortfall}). chunk_pool has "
+                        f"{_pool_remaining} clips remaining — re-run prepare_dataset "
+                        f"to mine replacements for the rejected clips."
+                    )
+                else:
+                    logger.warning(
+                        f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
+                        f"samples (short by {shortfall}). chunk_pool is empty — "
+                        f"add more source media to fill the remaining slots."
+                    )
 
         # ===== PHASE 3: ENCODE CONDITIONS AND LATENTS =====
+        if skip_phase_3_encode:
+            logger.info(
+                "Skipping Phase 3 (text/video/audio latent encoding) — "
+                "skip_phase_3_encode=True. Clips and dataset.json are ready; "
+                "encode separately when needed."
+            )
+            _unload_all_prepper_models()
+            return (str(output_dir), str(dataset_json_path))
+
         # Reload entries from JSON — captioning may have rejected some clips,
         # and existing_entries in memory still has the pre-rejection list.
         with open(dataset_json_path) as f:

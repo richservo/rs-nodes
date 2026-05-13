@@ -282,6 +282,9 @@ class InProcessTrainer:
             logger.info("Setting up layer offloading (blocks stream CPU↔GPU one at a time)...")
             self._transformer.train()
             setup_layer_offloading(self._transformer, device)
+            print(f"DEBUG: ep params={sum(1 for _ in self._embeddings_processor.parameters())}, "
+                f"on_meta={sum(1 for p in self._embeddings_processor.parameters() if str(p.device)=='meta')}, "
+                f"first_meta_name={next((n for n,p in self._embeddings_processor.named_parameters() if str(p.device)=='meta'), None)}")
             self._embeddings_processor.to(device)
             self._embeddings_processor.eval()
         else:
@@ -1253,6 +1256,16 @@ class InProcessTrainer:
             x[0] = x[0].requires_grad_(True)
         else:
             x = x.requires_grad_(True)
+
+        # Cast latent inputs to bf16. fp8-marlin GEMM kernels (used when
+        # `quantization` is set) only accept bfloat16/float16 activations
+        # and otherwise raise "fp8_marlin_gemm only supports bfloat16 and
+        # float16". Targets stay in their original dtype so the loss is
+        # computed at higher precision.
+        if isinstance(x, list):
+            x = [t.to(dtype=torch.bfloat16) for t in x]
+        else:
+            x = x.to(dtype=torch.bfloat16)
 
         # ---- 3. Forward through ComfyUI model ----
         # inference_mode is already exited at the top level (ltxv_train_lora.py).
