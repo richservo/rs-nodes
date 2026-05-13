@@ -132,7 +132,7 @@ fi
 # Unset the env vars (or empty them) to disable auto-mount.
 # -----------------------------------------------------------------------------
 RS_NODES_RAW="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod"
-for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh; do
+for f in install_rclone.sh b2_helpers.sh b2_mount.sh b2_push_local.sh b2_autosync.sh; do
     # Always re-fetch so script updates land on the next boot without
     # waiting for a full bootstrap.sh re-run. Cheap (~1KB each).
     if curl -fsSL "$RS_NODES_RAW/$f" -o "/workspace/$f.new" 2>/dev/null; then
@@ -167,23 +167,42 @@ if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; t
         echo "[init] FUSE available — mounting B2 bucket at /workspace/b2"
         bash /workspace/b2_mount.sh mount 2>&1 | sed 's/^/[init] b2_mount: /' || true
     else
-        # FUSE not available — pull the bucket as a local mirror.
-        # Requires B2_BUCKET to know which bucket to pull (one-bucket-
-        # per-pod is the studio default; we don't try to mirror all
-        # buckets the key has access to).
+        # FUSE not available — pull the bucket as a local mirror,
+        # then start a background watcher that auto-pushes any local
+        # edits back. Requires B2_BUCKET to know which bucket to use.
         if [ -n "${B2_BUCKET:-}" ]; then
             echo "[init] FUSE unavailable — pulling b2:$B2_BUCKET to /workspace/b2/ (background)"
             echo "[init]   progress: tail -f /workspace/b2_sync.log"
             echo "[init]   incremental: only changed files transfer on subsequent boots"
-            # nohup + & + disown-equivalent (closing stdin) so the
-            # background rclone keeps running after init.sh's exec
-            # tail -f /dev/null replaces this shell. --log-file
-            # gives the user a way to watch progress.
+            # nohup + & + closing stdin so the background rclone
+            # outlives init.sh's exec to tail -f /dev/null.
             nohup rclone copy "b2:$B2_BUCKET" /workspace/b2/ \
                 --transfers=8 \
                 --log-file /workspace/b2_sync.log \
                 --log-level INFO \
                 </dev/null >/dev/null 2>&1 &
+
+            # Install inotify-tools if missing (needed for autosync).
+            if ! command -v inotifywait >/dev/null 2>&1; then
+                if command -v apt-get >/dev/null 2>&1; then
+                    echo "[init] Installing inotify-tools for B2 autosync..."
+                    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq inotify-tools >/dev/null 2>&1 || \
+                        echo "[init] WARN: inotify-tools install failed — autosync disabled."
+                fi
+            fi
+
+            # Start the watcher daemon. Kill any prior instance first
+            # so re-running init.sh doesn't stack multiple watchers.
+            if command -v inotifywait >/dev/null 2>&1 && [ -x /workspace/b2_autosync.sh ]; then
+                pkill -f "b2_autosync.sh" 2>/dev/null || true
+                # Pass B2_BUCKET through to the child (the daemon
+                # reads it from env).
+                echo "[init] Starting B2 autosync daemon (local edits -> B2)"
+                echo "[init]   log: /workspace/b2_autosync.log"
+                B2_BUCKET="$B2_BUCKET" B2_REMOTE="${B2_REMOTE:-b2}" \
+                    nohup bash /workspace/b2_autosync.sh </dev/null >/dev/null 2>&1 &
+            fi
         else
             echo "[init] WARN: FUSE unavailable AND B2_BUCKET env var not set."
             echo "[init]       Can't mount and don't know which bucket to mirror."
