@@ -202,8 +202,32 @@ if [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1 &&
             nohup bash /workspace/b2_autosync.sh </dev/null >/dev/null 2>&1 &
     fi
 
-    echo "[init] B2 configured. Pull a dataset for training with:"
-    echo "[init]   bash /workspace/b2_pull_dataset.sh <character-name>"
+    # Auto-pull datasets declared in B2_DATASETS env var. Comma-
+    # separated list of dataset names. Each name resolves to
+    # b2:$B2_BUCKET/datasets/<name>/ -> /workspace/datasets/<name>/.
+    # Backgrounded so the pull doesn't block ComfyUI boot; rclone
+    # copy is incremental so re-runs after the initial pull are fast.
+    #
+    # User flow: set B2_DATASETS=character_alex,character_jane in
+    # pod env vars. On boot, datasets land in /workspace/datasets/.
+    # To switch datasets: change the env var, stop+start the pod.
+    if [ -n "${B2_DATASETS:-}" ] && [ -x /workspace/b2_pull_dataset.sh ]; then
+        echo "[init] B2_DATASETS=$B2_DATASETS — pulling each in background"
+        # Split on commas, iterate
+        IFS=',' read -ra _ds_list <<< "$B2_DATASETS"
+        for ds in "${_ds_list[@]}"; do
+            # trim leading/trailing whitespace
+            ds="$(echo "$ds" | xargs)"
+            [ -z "$ds" ] && continue
+            echo "[init]   pulling: $ds  (log: /workspace/b2_pull_${ds}.log)"
+            B2_BUCKET="$B2_BUCKET" B2_REMOTE="${B2_REMOTE:-b2}" \
+                nohup bash /workspace/b2_pull_dataset.sh "$ds" \
+                </dev/null >>"/workspace/b2_pull_${ds}.log" 2>&1 &
+        done
+    else
+        echo "[init] B2 configured. To auto-pull datasets on boot,"
+        echo "[init] set B2_DATASETS=character_a,character_b in pod env vars."
+    fi
 elif [ -s /workspace/.rclone/rclone.conf ] && command -v rclone >/dev/null 2>&1; then
     echo "[init] B2 rclone.conf present but B2_BUCKET env var not set."
     echo "[init] Set B2_BUCKET=<bucket-name> in pod env vars to enable autosync."
