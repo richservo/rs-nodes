@@ -89,13 +89,80 @@ def _read_exr_to_numpy(path: str) -> np.ndarray:
     """
     try:
         import OpenEXR
-        import Imath
     except ImportError as e:
         raise RuntimeError(
             "RSEXRLoad requires the OpenEXR Python lib. Install it in your "
-            "ComfyUI venv:  pip install OpenEXR Imath\n"
+            "ComfyUI venv:  pip install OpenEXR\n"
             f"(Underlying error: {e})"
         ) from e
+
+    # Prefer OpenEXR 3.x's File API — it handles tiled, multipart,
+    # deep, and scanline transparently. The old InputFile API is
+    # scanline-only; opening a tiled file with it raises a generic
+    # "Unable to open" OSError that's misleading. Latlong / environment
+    # bakes are typically tiled, which is why the user hit this.
+    if hasattr(OpenEXR, "File"):
+        return _read_exr_via_file_api(path)
+    return _read_exr_via_inputfile_api(path)
+
+
+def _read_exr_via_file_api(path: str) -> np.ndarray:
+    """OpenEXR 3.x File API path. Tile/multipart/scanline-agnostic."""
+    import OpenEXR
+
+    with OpenEXR.File(path) as exr:
+        parts = exr.parts()
+        if not parts:
+            raise RuntimeError(f"EXR has no image parts: {path}")
+        # First part is the main image for single-part files. For
+        # multi-part files we'd pick by name; rs-nodes treats this as
+        # a basic RGB(A) loader so the main part is what we want.
+        channels = parts[0].channels()
+        ch_names = list(channels.keys())
+
+        def _pix(name: str) -> np.ndarray | None:
+            ch = channels.get(name)
+            if ch is None:
+                return None
+            arr = ch.pixels
+            # .pixels is a numpy array, typically float32 already; cast
+            # defensively in case the file stores HALF and the binding
+            # passes that through.
+            return arr.astype(np.float32, copy=False)
+
+        r = _pix("R")
+        g = _pix("G")
+        b = _pix("B")
+        a = _pix("A")
+
+        if r is None and g is None and b is None:
+            y = _pix("Y")
+            if y is None:
+                y = _pix("Z")
+            if y is None:
+                raise RuntimeError(
+                    f"EXR has no R/G/B/Y/Z channels (only: {ch_names}). "
+                    f"Path: {path}"
+                )
+            r = g = b = y
+
+        ref = r if r is not None else (g if g is not None else b)
+        zeros = np.zeros(ref.shape, dtype=np.float32)
+        r = r if r is not None else zeros
+        g = g if g is not None else zeros
+        b = b if b is not None else zeros
+
+        if a is not None:
+            return np.stack([r, g, b, a], axis=-1)
+        return np.stack([r, g, b], axis=-1)
+
+
+def _read_exr_via_inputfile_api(path: str) -> np.ndarray:
+    """Old InputFile API — scanline-only. Used only when OpenEXR
+    package is too old to have the File class. Kept for compat with
+    pre-3.0 installations."""
+    import OpenEXR
+    import Imath
 
     f = OpenEXR.InputFile(path)
     try:
@@ -113,9 +180,6 @@ def _read_exr_to_numpy(path: str) -> np.ndarray:
             raw = f.channel(name, pt)
             return np.frombuffer(raw, dtype=np.float32).reshape(h, w)
 
-        # Standard RGB(A) layout. If the file is single-channel
-        # ("Y" / "luminance") expand it across RGB so downstream
-        # IMAGE-typed nodes accept it.
         r = _ch("R")
         g = _ch("G")
         b = _ch("B")
@@ -130,7 +194,6 @@ def _read_exr_to_numpy(path: str) -> np.ndarray:
                 )
             r = g = b = y
 
-        # Fill in any missing channel with zeros (rare; mostly defensive).
         z = np.zeros((h, w), dtype=np.float32)
         r = r if r is not None else z
         g = g if g is not None else z
