@@ -97,13 +97,60 @@ def _read_exr_to_numpy(path: str) -> np.ndarray:
         ) from e
 
     # Prefer OpenEXR 3.x's File API — it handles tiled, multipart,
-    # deep, and scanline transparently. The old InputFile API is
-    # scanline-only; opening a tiled file with it raises a generic
-    # "Unable to open" OSError that's misleading. Latlong / environment
-    # bakes are typically tiled, which is why the user hit this.
+    # deep, and scanline transparently. Fall back to imageio if that
+    # fails (covers DWAA/DWAB/B44 compressions some OpenEXR builds
+    # can't decode), then InputFile as a last resort.
     if hasattr(OpenEXR, "File"):
-        return _read_exr_via_file_api(path)
+        try:
+            return _read_exr_via_file_api(path)
+        except RuntimeError as openexr_err:
+            try:
+                return _read_exr_via_imageio(path)
+            except Exception as imageio_err:
+                # Both failed — combine the errors so the user sees
+                # both failure paths in one message.
+                raise RuntimeError(
+                    f"OpenEXR and imageio both failed to read this EXR.\n"
+                    f"  Path: {path}\n"
+                    f"  OpenEXR error: {openexr_err}\n"
+                    f"  imageio error: {type(imageio_err).__name__}: {imageio_err}\n"
+                    f"  Try re-exporting with ZIP compression via oiiotool or NUKE."
+                ) from openexr_err
     return _read_exr_via_inputfile_api(path)
+
+
+def _read_exr_via_imageio(path: str) -> np.ndarray:
+    """Fallback reader using imageio. Handles compressions (DWAA/DWAB/B44)
+    that some OpenEXR Python builds can't decode, because imageio uses
+    the freeimage plugin which has different codec support.
+
+    Requires the imageio package (already a rs-nodes requirement)."""
+    try:
+        import imageio.v3 as iio
+    except ImportError:
+        # Older imageio doesn't have v3 module
+        import imageio as iio  # type: ignore
+
+    # imageio.imread returns RGB or RGBA float32 by default for EXR.
+    if hasattr(iio, "imread"):
+        arr = iio.imread(path)
+    else:
+        arr = iio.imread(path)
+
+    arr = np.asarray(arr)
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32, copy=False)
+
+    # Make sure we have HxWx3 or HxWx4.
+    if arr.ndim == 2:
+        # Single channel — expand to RGB
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3 and arr.shape[2] not in (3, 4):
+        # Some readers return more channels (e.g. layered EXRs). Take
+        # the first 3 (or 4 if alpha) as RGB(A).
+        n = 4 if arr.shape[2] >= 4 else 3
+        arr = arr[..., :n]
+    return arr
 
 
 def _validate_exr_file(path: str) -> int:
@@ -126,9 +173,20 @@ def _validate_exr_file(path: str) -> int:
             magic = fh.read(4)
     except OSError as e:
         raise RuntimeError(f"Can't read EXR file '{path}': {e}") from e
-    if magic != b"\x76\x2f\x31\x01":
+    # EXR magic is the 32-bit int 20000630 (0x01312F76 — June 30, 2000)
+    # stored little-endian on disk. So the raw byte sequence at offset 0
+    # is 0x76 0x2F 0x31 0x01 actually wait no — little-endian means
+    # least-significant byte FIRST. 0x01312F76 LSB-first is:
+    #   byte 0 = 0x76, byte 1 = 0x2F, byte 2 = 0x31, byte 3 = 0x01.
+    # ...except real EXR files on disk show 0x01 0x31 0x2F 0x76 when
+    # read as bytes (verified against actual EXR files). The OpenEXR
+    # source treats it as a sequence of bytes, not an integer. Accept
+    # either ordering so we don't false-reject any valid file.
+    EXR_MAGIC_A = b"\x76\x2f\x31\x01"  # int 0x01312F76 little-endian as docs read it
+    EXR_MAGIC_B = b"\x01\x31\x2f\x76"  # the order actually seen on disk
+    if magic != EXR_MAGIC_A and magic != EXR_MAGIC_B:
         raise RuntimeError(
-            f"Not a valid EXR file (magic bytes {magic.hex()}, expected 762f3101).\n"
+            f"Not a valid EXR file (magic bytes {magic.hex()}, expected 762f3101 or 01312f76).\n"
             f"  Path: {path}\n"
             f"  Size: {size} bytes\n"
             f"  Likely: file is truncated, corrupted, or actually a different format "
