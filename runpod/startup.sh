@@ -191,8 +191,11 @@ print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
     fi
 
     cd "$COMFY_DIR"
-    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
-    log "Launching ComfyUI on 0.0.0.0:${PORT}  (express, args: $COMFY_EXTRA_ARGS)"
+    # Dynamic VRAM mode (default — no --highvram). See bootstrap.sh
+    # Phase 7 comment for the rationale. Override via env var if you
+    # want pinned-weight mode back.
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:-}"
+    log "Launching ComfyUI on 0.0.0.0:${PORT}  (express, args: ${COMFY_EXTRA_ARGS:-<dynamic vram default>})"
     exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
 fi
 
@@ -454,13 +457,16 @@ fi
 # -----------------------------------------------------------------------------
 # 6. Launch ComfyUI on the public port
 # -----------------------------------------------------------------------------
-# --highvram keeps loaded weights resident on the GPU instead of
-# offloading to CPU between operations. On a 96 GB Blackwell card
-# the LTX-2.3 22B fp8 (~29 GB) + gemma fp4 text encoder (~9 GB) +
-# audio_vae easily fit; eliminating the CPU↔GPU ping-pong can be
-# 2-5x faster after the first warmup. Override via COMFY_EXTRA_ARGS
-# env var (e.g. "" to disable, or "--gpu-only" for max-aggressive).
-COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
-log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
+# Default to ComfyUI's Dynamic VRAM mode (no --highvram). Dynamic
+# VRAM uses just-in-time weight loading + automatic RAM offload, so
+# models that exceed VRAM (e.g. LTX-2.3 22B bf16 with AV at higher
+# res) spill cleanly to the pod's system RAM instead of OOMing.
+# Previous default of --highvram pinned weights to VRAM and rejected
+# anything that didn't fit — faster when it fits, broken when it
+# doesn't. Override with COMFY_EXTRA_ARGS=--highvram on pod env vars
+# to opt back into pinned mode (use for small models where speed
+# matters more than headroom).
+COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:-}"
+log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: ${COMFY_EXTRA_ARGS:-<dynamic vram default>})"
 cd "$COMFY_DIR"
 exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
