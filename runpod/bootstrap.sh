@@ -484,19 +484,10 @@ log "Bootstrap complete marker written: $WORKSPACE/.bootstrap_done"
 # Phase 7 — Launch ComfyUI
 # -----------------------------------------------------------------------------
 if [ "$RS_LAUNCH_COMFY" = "1" ]; then
-    # Default to ComfyUI's Dynamic VRAM mode (no --highvram flag).
-    # Dynamic VRAM (stable in ComfyUI since early 2026) uses just-
-    # in-time allocation: weights live in RAM, faulted into VRAM on
-    # demand. Lets the active model exceed VRAM by spilling to
-    # system RAM on a 96GB-VRAM + 200GB-RAM Blackwell pod — that's
-    # the regime LTX-2.3 at 1280x704 bf16 needs. --highvram pins
-    # everything in VRAM and OOMs the moment a large model
-    # activates a layer past the limit.
-    #
-    # Override with COMFY_EXTRA_ARGS=--highvram on the pod env vars
-    # to opt back into pinned mode (faster but rejects oversized
-    # models).
-    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:-}"
+    # --highvram keeps weights GPU-resident; huge speedup on a 96 GB
+    # Blackwell card vs the default lazy offload. Override via
+    # COMFY_EXTRA_ARGS env var.
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
     banner "Phase 7/7  Launching ComfyUI on 0.0.0.0:${PORT} (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
     cd "$COMFY_DIR"
     exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS
