@@ -106,11 +106,61 @@ def _read_exr_to_numpy(path: str) -> np.ndarray:
     return _read_exr_via_inputfile_api(path)
 
 
+def _validate_exr_file(path: str) -> int:
+    """Return file size in bytes. Raise RuntimeError with a clear message
+    if the file is missing / empty / not actually an EXR.
+
+    EXR magic number is 0x76 0x2f 0x31 0x01 (4 bytes at offset 0).
+    Catching common breakages here means the OpenEXR error becomes
+    informative instead of the generic "Unable to open for read"."""
+    if not os.path.isfile(path):
+        raise RuntimeError(f"EXR file not found: {path}")
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise RuntimeError(f"Can't stat EXR file '{path}': {e}") from e
+    if size == 0:
+        raise RuntimeError(f"EXR file is empty (0 bytes): {path}")
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except OSError as e:
+        raise RuntimeError(f"Can't read EXR file '{path}': {e}") from e
+    if magic != b"\x76\x2f\x31\x01":
+        raise RuntimeError(
+            f"Not a valid EXR file (magic bytes {magic.hex()}, expected 762f3101).\n"
+            f"  Path: {path}\n"
+            f"  Size: {size} bytes\n"
+            f"  Likely: file is truncated, corrupted, or actually a different format "
+            f"(JPEG/PNG/HDR/etc) renamed to .exr. Re-export from the source."
+        )
+    return size
+
+
 def _read_exr_via_file_api(path: str) -> np.ndarray:
     """OpenEXR 3.x File API path. Tile/multipart/scanline-agnostic."""
     import OpenEXR
 
-    with OpenEXR.File(path) as exr:
+    size = _validate_exr_file(path)
+
+    try:
+        exr = OpenEXR.File(path)
+    except Exception as e:
+        raise RuntimeError(
+            f"OpenEXR could not open the file despite valid magic bytes.\n"
+            f"  Path: {path}\n"
+            f"  Size: {size} bytes\n"
+            f"  Underlying error: {type(e).__name__}: {e}\n"
+            f"  Likely causes (in order):\n"
+            f"    * Compression the linked OpenEXR build doesn't support "
+            f"(DWAA/DWAB/B44 sometimes need specific build flags)\n"
+            f"    * File was partially written (truncation past the header)\n"
+            f"    * Non-standard EXR variant (deep, multi-part with chunk layout the lib refuses)\n"
+            f"  Try: re-export with ZIP or ZIPS compression (most compatible),\n"
+            f"       OR convert via:  oiiotool input.exr -o --compression=zip output.exr"
+        ) from e
+
+    with exr:
         parts = exr.parts()
         if not parts:
             raise RuntimeError(f"EXR has no image parts: {path}")
