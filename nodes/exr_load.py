@@ -237,11 +237,23 @@ def _read_exr_via_file_api(path: str) -> np.ndarray:
             ch = channels.get(name)
             if ch is None:
                 return None
-            arr = ch.pixels
             # .pixels is a numpy array, typically float32 already; cast
             # defensively in case the file stores HALF and the binding
             # passes that through.
-            return arr.astype(np.float32, copy=False)
+            arr = np.asarray(ch.pixels).astype(np.float32, copy=False)
+            # Some OpenEXR Python bindings (notably the Linux 3.x wheel
+            # used on RunPod) return ch.pixels with a leading singleton
+            # dim like [1, H, W] instead of plain [H, W]. Squeeze any
+            # singletons so the downstream np.stack(..., axis=-1)
+            # reliably produces [H, W, 3] and RSEXRLoad emits a 4D
+            # [N, H, W, C] tensor that downstream IMAGE nodes expect.
+            arr = np.squeeze(arr)
+            if arr.ndim != 2:
+                raise RuntimeError(
+                    f"EXR channel {name!r} has unexpected shape "
+                    f"{arr.shape} after squeezing singletons; expected 2D."
+                )
+            return arr
 
         r = _pix("R")
         g = _pix("G")
