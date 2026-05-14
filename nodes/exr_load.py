@@ -219,13 +219,18 @@ def _read_exr_via_file_api(path: str) -> np.ndarray:
         ) from e
 
     with exr:
-        parts = exr.parts()
+        # OpenEXR Python 3.x has shifted `parts` and `channels` between
+        # method and property forms across releases (and Linux wheels
+        # often differ from Windows wheels). Accept either shape.
+        parts_attr = exr.parts
+        parts = parts_attr() if callable(parts_attr) else parts_attr
         if not parts:
             raise RuntimeError(f"EXR has no image parts: {path}")
         # First part is the main image for single-part files. For
         # multi-part files we'd pick by name; rs-nodes treats this as
         # a basic RGB(A) loader so the main part is what we want.
-        channels = parts[0].channels()
+        channels_attr = parts[0].channels
+        channels = channels_attr() if callable(channels_attr) else channels_attr
         ch_names = list(channels.keys())
 
         def _pix(name: str) -> np.ndarray | None:
