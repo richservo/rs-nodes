@@ -1484,19 +1484,6 @@ class RSLTXVGenerate:
                     is_iclora = False  # Disable IC-LoRA skip for this pass
                     _iclora_needs_normal_upscale = False
 
-                    # Import comfy_extras aliases locally for this block. The same
-                    # aliases are imported earlier in the half-res rediffusion path
-                    # (line ~1099), but if rediffusion didn't run, those names are
-                    # not bound and Python marks them as locals function-wide via
-                    # the `import ... as NAME` syntax → UnboundLocalError when this
-                    # block references them. Re-importing here makes pass 3
-                    # standalone-safe regardless of whether pass 2 fired.
-                    from comfy_extras.nodes_lt import (
-                        LTXVAddGuide as UpGuide,
-                        get_noise_mask as up_get_noise_mask,
-                        get_keyframe_idxs as up_get_keyframe_idxs,
-                    )
-
                     # --- Spatial upscale ---
                     logger.info("IC-LoRA pass 3: spatial 2x upscale + normal re-diffusion")
                     # Aggressive VRAM cleanup — unload diffusion model from pass 2
