@@ -1405,8 +1405,16 @@ class RSLTXVGenerate:
                         # is frozen (denoise_mask=0) and audio gets re-refined (denoise_mask=1).
                         # The audio attends the FINAL clean video during refinement, which is
                         # better cross-modal coupling than the main pass provides.
+                        #
+                        # SKIP polish entirely when audio came from the user as a source input
+                        # (audio_is_input). Source audio is meant to pass through the generate
+                        # node unchanged — it's used for cross-modal conditioning during the
+                        # main sampling tower, then output as-is. Polishing source audio
+                        # rewrites it with denoise_mask=1 (full regeneration), which destroys
+                        # the user's actual audio. Polish is for GENERATED audio only.
                         _curve_used = self._resolve_upscale_sigma_curve(upscale_sigma_curve, upscale_lora)
                         if (audio_latent_out is not None
+                                and not audio_is_input
                                 and _curve_used == "scaled"
                                 and upscale_steps > 0 and upscale_denoise > 0):
                             logger.info("Audio polish pass: shifted sigmas on audio, video frozen")
