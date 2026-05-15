@@ -28,10 +28,11 @@ from aiohttp import web
 import server
 import nodes
 
-# Always log when widget walking is happening for diagnostic
-# purposes during the v3-IO debugging push. Once we've stabilised
-# we can gate this behind RS_UITOAPI_DEBUG=1 again.
-_DEBUG = True
+# Per-node widget-walk diagnostics are noisy (one multi-kB line per
+# node per submission). Gate behind RS_UITOAPI_DEBUG=1 so day-to-day
+# runs stay quiet; flip the env var when actively debugging the
+# UI→API conversion.
+_DEBUG = os.environ.get("RS_UITOAPI_DEBUG", "0") == "1"
 
 # Bumped whenever the conversion logic changes — printed on import so
 # the operator can confirm which version Comfy actually loaded.
@@ -330,45 +331,65 @@ def _convert_node(node, link_by_dest, warnings):
         )
 
     # ----- 3. Walk widget_order against widgets_values -----
-    # Widgets promoted to inputs (link != None) still occupy a slot
-    # in widgets_values, so the cursor advances either way. The
-    # frontend writes the widget's current value into that slot even
-    # though the actual runtime value comes from the link.
+    # Two shapes to handle:
     #
-    # ComfyUI v3-IO custom nodes (RSLTXVGenerate etc.) serialize
-    # extra '' padding slots between real widget values — observed
-    # 9 extras in a 54-entry array for a 45-widget node. To stay
-    # aligned we type-check each slot: when the expected widget type
-    # is numeric / boolean / combo, an empty string is treated as
-    # padding and skipped.
+    # 1) LIST (legacy + most nodes): widgets_values is a positional
+    #    array. Widgets promoted to inputs (link != None) still
+    #    occupy a slot — the frontend writes the widget's current
+    #    value there even though the runtime value comes from the
+    #    link — so the cursor advances either way.
     #
-    # Also handles ComfyUI's auto-injected control_after_generate
-    # widget that gets inserted into widgets_values after every
-    # seed / noise_seed INT widget but is NOT tagged in inputs[].
-    cursor = 0
-    for name, is_promoted, declared_type in widget_order:
-        # Skip over any padding slots that can't be this widget's value.
-        while cursor < len(widgets_values) and not _value_matches_type(
-            widgets_values[cursor], declared_type
-        ):
-            cursor += 1
-        if cursor < len(widgets_values):
-            if not is_promoted:
-                api_inputs[name] = widgets_values[cursor]
-            cursor += 1
-        elif not is_promoted:
-            warnings.append(
-                f"node {node_id} ({node_type}): widget '{name}' "
-                f"requested cursor {cursor} but widgets_values has "
-                f"only {len(widgets_values)} entries"
-            )
-        # Auto-injected control_after_generate sits after every seed /
-        # noise_seed widget in widgets_values regardless of whether
-        # it's tagged in inputs[]. Always skip the slot — the value is
-        # a frontend-only "fixed / increment / decrement / randomize"
-        # control that the runner doesn't need.
-        if _has_auto_control_after_generate(name):
-            cursor += 1
+    #    ComfyUI v3-IO custom nodes (RSLTXVGenerate etc.) serialize
+    #    extra '' padding slots between real widget values —
+    #    observed 9 extras in a 54-entry array for a 45-widget
+    #    node. To stay aligned we type-check each slot: when the
+    #    expected widget type is numeric / boolean / combo, an
+    #    empty string is treated as padding and skipped.
+    #
+    #    Also handles ComfyUI's auto-injected control_after_generate
+    #    widget that gets inserted after every seed / noise_seed INT
+    #    widget but is NOT tagged in inputs[].
+    #
+    # 2) DICT (newer VHS releases — VHS_LoadVideo and friends):
+    #    widgets_values is keyed by widget name. Cursor walking
+    #    doesn't apply; we just look each name up directly.
+    if isinstance(widgets_values, dict):
+        for name, is_promoted, _declared_type in widget_order:
+            if is_promoted:
+                continue
+            if name in widgets_values:
+                api_inputs[name] = widgets_values[name]
+            else:
+                warnings.append(
+                    f"node {node_id} ({node_type}): widget '{name}' "
+                    f"missing from dict-shaped widgets_values "
+                    f"(keys: {sorted(widgets_values.keys())})"
+                )
+    else:
+        cursor = 0
+        for name, is_promoted, declared_type in widget_order:
+            # Skip over any padding slots that can't be this widget's value.
+            while cursor < len(widgets_values) and not _value_matches_type(
+                widgets_values[cursor], declared_type
+            ):
+                cursor += 1
+            if cursor < len(widgets_values):
+                if not is_promoted:
+                    api_inputs[name] = widgets_values[cursor]
+                cursor += 1
+            elif not is_promoted:
+                warnings.append(
+                    f"node {node_id} ({node_type}): widget '{name}' "
+                    f"requested cursor {cursor} but widgets_values has "
+                    f"only {len(widgets_values)} entries"
+                )
+            # Auto-injected control_after_generate sits after every seed /
+            # noise_seed widget in widgets_values regardless of whether
+            # it's tagged in inputs[]. Always skip the slot — the value is
+            # a frontend-only "fixed / increment / decrement / randomize"
+            # control that the runner doesn't need.
+            if _has_auto_control_after_generate(name):
+                cursor += 1
 
     return str(node_id), {
         "class_type": node_type,
