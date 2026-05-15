@@ -1413,6 +1413,14 @@ class RSLTXVGenerate:
                         # rewrites it with denoise_mask=1 (full regeneration), which destroys
                         # the user's actual audio. Polish is for GENERATED audio only.
                         _curve_used = self._resolve_upscale_sigma_curve(upscale_sigma_curve, upscale_lora)
+                        # Diagnostic: log every value the polish gate consults so we
+                        # can see WHY it does or doesn't enter on a given run.
+                        logger.info(
+                            f"Audio polish gate: audio_latent_out={audio_latent_out is not None}, "
+                            f"audio_is_input={audio_is_input}, "
+                            f"curve_used={_curve_used!r}, "
+                            f"upscale_steps={upscale_steps}, upscale_denoise={upscale_denoise}"
+                        )
                         if (audio_latent_out is not None
                                 and not audio_is_input
                                 and _curve_used == "scaled"
@@ -1430,9 +1438,22 @@ class RSLTXVGenerate:
                                 torch.zeros_like(polish_video),
                                 torch.randn_like(polish_audio),
                             ))
+                            # Noise mask shape must be [B, 1, T, ...] not [B, C, T, ...].
+                            # zeros_like/ones_like would create channel-dim=128 masks
+                            # (same shape as the latent), which then mismatches the
+                            # channel-dim=1 guide mask that _encode_and_inject_guide
+                            # concatenates with during torch.cat along the temporal
+                            # axis — exact bug seen with IC-LoRA + polish. Mirror the
+                            # shape pattern from the main sampling pass (lines ~660).
                             polish_mask = comfy.nested_tensor.NestedTensor((
-                                torch.zeros_like(polish_video),
-                                torch.ones_like(polish_audio),
+                                torch.zeros(
+                                    polish_video.shape[0], 1, polish_video.shape[2], 1, 1,
+                                    device=polish_video.device, dtype=polish_video.dtype,
+                                ),
+                                torch.ones(
+                                    polish_audio.shape[0], 1, *polish_audio.shape[2:],
+                                    device=polish_audio.device, dtype=polish_audio.dtype,
+                                ),
                             ))
 
                             polish_cb = latent_preview.prepare_callback(
