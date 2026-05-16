@@ -40,58 +40,6 @@ mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
 # -----------------------------------------------------------------------------
-# 0.0. CUDA driver compatibility gate — FAIL FAST on bad pods.
-#
-# RunPod sometimes schedules pods onto hosts with older NVIDIA drivers
-# (e.g. driver supports max CUDA 12.8) even when the GPU itself is
-# Blackwell. Our torch is cu130 (CUDA 13.x) — built specifically for
-# Blackwell sm_120 perf. cu128 would crawl on the same hardware, so
-# "just downgrade torch" is NOT an acceptable fallback when paying for
-# RTX PRO 6000 / B200 / H200 capacity.
-#
-# Instead: detect the host's max-supported CUDA version on boot. If
-# below CUDA 13, dump a giant banner, exit immediately, and let the
-# user terminate the pod and grab a different host before they're
-# billed for several minutes of doomed boot.
-#
-# The driver-supported CUDA version is reported by `nvidia-smi` in the
-# header line: "CUDA Version: 13.0". Parse the major digits.
-# -----------------------------------------------------------------------------
-if command -v nvidia-smi >/dev/null 2>&1; then
-    _drv_cuda=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
-    _drv_cuda="${_drv_cuda:-0}"
-    if [ "$_drv_cuda" -lt 13 ] 2>/dev/null; then
-        cat <<EOF >&2
-
-############################################################################
-##                                                                        ##
-##   FATAL: This pod's NVIDIA driver supports CUDA ${_drv_cuda}.x at most.            ##
-##          Torch cu130 requires a host driver supporting CUDA 13.x       ##
-##          (typically driver >= 555).                                    ##
-##                                                                        ##
-##   --> TERMINATE THIS POD AND DEPLOY ON A DIFFERENT HOST <--            ##
-##                                                                        ##
-##   Look for templates that advertise CUDA 13.x. RunPod's Blackwell      ##
-##   (B200, RTX PRO 6000) hosts SHOULD have CUDA 13 drivers — if you      ##
-##   land on a 12.x driver host with that hardware, it's a RunPod         ##
-##   scheduling weirdness, not user error. Just kill it and redeploy.     ##
-##                                                                        ##
-##   Falling back to cu128 is NOT done here intentionally — it would      ##
-##   cripple Blackwell perf and silently waste your GPU spend.            ##
-##                                                                        ##
-##   nvidia-smi reports: CUDA Version ${_drv_cuda}.x                                  ##
-##                                                                        ##
-############################################################################
-EOF
-        log "FATAL: driver supports CUDA ${_drv_cuda}.x, need >= 13. Aborting startup."
-        exit 1
-    fi
-    log "CUDA driver check: host supports CUDA ${_drv_cuda}.x (>= 13 required for torch cu130 / Blackwell) — OK"
-else
-    log "WARN: nvidia-smi not found; cannot verify CUDA driver version. Continuing."
-fi
-
-# -----------------------------------------------------------------------------
 # 0. DNS guard — some RunPod regions (observed: EU-CZ-1) ship containers
 #    with an empty /etc/resolv.conf, so even `git clone github.com` fails.
 #    /etc/resolv.conf lives on the container disk, not the volume, so this
