@@ -422,14 +422,64 @@ else
     log "  libgl1 + libglib2.0-0 already present"
 fi
 
-# 4b. Python packages. pip skips already-satisfied packages in ~1s.
-log "  installing insightface + onnxruntime-gpu..."
+# 4b. Python packages — onnxruntime-gpu MUST install cleanly with the
+# CUDA EP available. The default `pip install onnxruntime-gpu` ships
+# the CUDA 12.x wheel by default (as of late 2024), but if the CPU
+# `onnxruntime` was previously installed (sometimes pulled in
+# transitively by other packages), it shadows the GPU build and the
+# CUDA provider silently disappears. So:
+#   1. Force-remove any existing onnxruntime (CPU or GPU) to start
+#      from a clean slate. -y so we don't prompt; || true so the
+#      first-boot case (neither installed) doesn't fail the script.
+#   2. Install onnxruntime-gpu fresh.
+#   3. Probe providers. If CUDAExecutionProvider is missing, retry
+#      with the Azure CUDA-12 index URL (the canonical CUDA-12-only
+#      wheel source — covers the case where PyPI's default wheel was
+#      built against a CUDA version the host doesn't match).
+
+# Step 1: clean slate.
+log "  removing any existing onnxruntime installs (clean reinstall)..."
+pip uninstall -y onnxruntime onnxruntime-gpu 2>&1 | tail -3 || true
+
+# Step 2: install GPU wheel + insightface.
+log "  installing insightface + onnxruntime-gpu (default PyPI wheel)..."
 pip install --no-cache-dir insightface onnxruntime-gpu || \
     log "  WARN: insightface/onnxruntime-gpu install failed"
 
+# Step 3: verify CUDA EP. If missing, retry from the CUDA-12 index.
+if ! python -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()" 2>/dev/null; then
+    log "  CUDAExecutionProvider missing after default install — retrying from CUDA-12 index..."
+    pip uninstall -y onnxruntime-gpu 2>&1 | tail -3 || true
+    pip install --no-cache-dir onnxruntime-gpu \
+        --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ || \
+        log "  WARN: onnxruntime-gpu CUDA-12 index install failed"
+
+    if ! python -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()" 2>/dev/null; then
+        log "  WARN: CUDAExecutionProvider STILL missing after CUDA-12 retry."
+        log "        Face detection will fall back to CPU (slow but functional)."
+        log "        Run: python -c \"import onnxruntime; print(onnxruntime.get_available_providers())\""
+        log "        to diagnose. Likely cause: torch CUDA version vs onnxruntime CUDA build mismatch."
+    else
+        log "  CUDAExecutionProvider now available (CUDA-12 wheel)."
+    fi
+else
+    log "  CUDAExecutionProvider available (default wheel)."
+fi
+
 # 4c. Prefetch the antelopev2 face model bundle (~280 MB). Uses
-# CPUExecutionProvider so the prefetch works even before CUDA is
-# warmed up. Actual node usage will pick the GPU provider at runtime.
+# CPUExecutionProvider for the prefetch since the GPU session has a
+# warmup cost we don't need here. Actual node usage picks GPU at
+# runtime. If a prior prefetch left a partial/corrupt download in
+# ~/.insightface/, blow it away first so re-runs heal.
+INSIGHTFACE_HOME="${INSIGHTFACE_HOME:-$HOME/.insightface}"
+if [ -d "$INSIGHTFACE_HOME/models/antelopev2" ]; then
+    # Validate by counting expected .onnx files — antelopev2 ships 5.
+    _onnx_count=$(find "$INSIGHTFACE_HOME/models/antelopev2" -name "*.onnx" 2>/dev/null | wc -l)
+    if [ "$_onnx_count" -lt 5 ]; then
+        log "  partial antelopev2 install ($_onnx_count/5 onnx files) — wiping for re-download"
+        rm -rf "$INSIGHTFACE_HOME/models/antelopev2"
+    fi
+fi
 log "  prefetching antelopev2 face models..."
 python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" 2>&1 | tail -5 || \
     log "  WARN: InsightFace prefetch failed (will retry on first use)"
