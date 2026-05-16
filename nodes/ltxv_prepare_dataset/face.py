@@ -68,6 +68,24 @@ def get_face_app():
         )
         return None
 
+    # Probe onnxruntime providers before touching FaceAnalysis. If the GPU
+    # provider is missing (most common cause of "empty error"), we want a
+    # clear log line saying so rather than letting it bomb opaquely inside
+    # InsightFace's session init.
+    try:
+        import onnxruntime as ort
+        _ort_providers = ort.get_available_providers()
+        logger.info(f"onnxruntime providers: {_ort_providers} (version {ort.__version__})")
+        if "CUDAExecutionProvider" not in _ort_providers:
+            logger.warning(
+                "CUDAExecutionProvider NOT in onnxruntime providers — face detection "
+                "will run on CPU only (slow). Install onnxruntime-gpu matching your "
+                "CUDA version: pip install onnxruntime-gpu"
+            )
+    except ImportError:
+        logger.warning("onnxruntime not installed — pip install onnxruntime-gpu")
+        return None
+
     try:
         app = FaceAnalysis(
             name="antelopev2",
@@ -78,7 +96,15 @@ def get_face_app():
         logger.info("Loaded InsightFace (antelopev2) — SCRFD detect + ArcFace embed")
         return app
     except Exception as e:
-        logger.warning(f"Failed to load InsightFace: {e}")
+        # Don't swallow the exception silently — many failure modes
+        # surface as exceptions with empty str() (onnxruntime session
+        # init failures, missing model files, CUDA provider mismatch).
+        # Log type + repr + full traceback so the actual cause is visible.
+        import traceback
+        logger.warning(
+            f"Failed to load InsightFace: {type(e).__name__}: {e!r}\n"
+            f"{traceback.format_exc()}"
+        )
         return None
 
 
