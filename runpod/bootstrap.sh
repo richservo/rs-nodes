@@ -201,9 +201,47 @@ fi
 #      version compatible with the pinned hub.
 
 # 1. Framework
-log "Upgrading PyTorch to cu130 wheels..."
-pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
-    torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
+# Auto-detect the host's CUDA driver version and pick the matching
+# torch wheel. cu130 needs CUDA 13+ driver (typically 555+). cu128
+# works on CUDA 12.x drivers and is the fallback for older hosts.
+# This way the pod ALWAYS gets a working torch regardless of which
+# RunPod host the scheduler hands us — Blackwell perf is better on
+# cu130 but cu128 is dramatically better than "doesn't run at all".
+TORCH_VARIANT="cu130"  # default
+if command -v nvidia-smi >/dev/null 2>&1; then
+    _smi_header=$(nvidia-smi 2>/dev/null | grep -E 'CUDA Version' | head -1 || echo "")
+    log "nvidia-smi header: $_smi_header"
+    _drv_cuda=$(echo "$_smi_header" | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
+    if [ -n "$_drv_cuda" ]; then
+        if [ "$_drv_cuda" -lt 13 ] 2>/dev/null; then
+            TORCH_VARIANT="cu128"
+            log "Host driver supports CUDA ${_drv_cuda}.x (< 13). Falling back to torch cu128."
+            log "  Note: Blackwell perf will be lower than cu130, but pod will run."
+        else
+            log "Host driver supports CUDA ${_drv_cuda}.x. Using torch cu130 (full Blackwell perf)."
+        fi
+    else
+        log "Could not parse driver CUDA version. Defaulting to torch cu130; will fall back if init fails."
+    fi
+fi
+
+log "Installing PyTorch ${TORCH_VARIANT} wheels..."
+pip install --upgrade --no-cache-dir --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
+    torch torchvision torchaudio || log "WARN: ${TORCH_VARIANT} upgrade failed"
+
+# Sanity check: if we defaulted to cu130 but torch can't actually
+# init CUDA (driver mismatch we didn't catch above), fall back to
+# cu128 in-place. This catches the "parse-failed" edge case where
+# we couldn't detect the driver version up front.
+if [ "$TORCH_VARIANT" = "cu130" ]; then
+    if ! python -c "import torch; assert torch.cuda.is_available(), 'CUDA init failed'" 2>/dev/null; then
+        log "cu130 torch failed to initialize CUDA on this host — reinstalling cu128..."
+        pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+            torch torchvision torchaudio || log "WARN: cu128 fallback also failed"
+        TORCH_VARIANT="cu128"
+    fi
+fi
+log "Final torch wheel: ${TORCH_VARIANT}"
 
 log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
 pip install --no-cache-dir \
