@@ -13,6 +13,7 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import sys
 import time as _t
 from pathlib import Path
@@ -23,6 +24,100 @@ import torch
 
 import comfy.utils
 import folder_paths
+
+
+def _probe_video_dims(path: str) -> tuple[float, int]:
+    """Return (fps, frame_count) for a video file, or (0.0, 0) if unreadable.
+
+    Tries OpenCV first (fast — reads container metadata). Falls back to
+    ffprobe when OpenCV fails to open the file OR reports 0 frames —
+    common with h264-in-mov containers where the moov atom is positioned
+    at the END of the file (Premiere, FCP, Resolve exports). OpenCV's
+    MP4 demuxer gives up rather than seeking backward to find the index;
+    ffprobe parses the full container and gets the real count.
+
+    Logs which path succeeded so a "0 chunks across N videos" run can be
+    diagnosed immediately from the log instead of guessing.
+    """
+    cap = cv2.VideoCapture(str(path))
+    if cap.isOpened():
+        cv2_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        cv2_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if cv2_n > 0:
+            return (cv2_fps if cv2_fps > 0 else 25.0), cv2_n
+        # cv2 opened but got 0 frames — fall through to ffprobe.
+    else:
+        cap.release()
+
+    # ffprobe fallback. Uses -show_streams JSON so we can parse named
+    # fields rather than guess at output ordering. 30s timeout per file
+    # is plenty even for very long videos (ffprobe doesn't decode here,
+    # just reads metadata).
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_streams",
+                "-of", "json",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            logger.warning(
+                f"ffprobe could not read {Path(path).name}: "
+                f"rc={out.returncode}, stderr={out.stderr.strip()[:200]}"
+            )
+            return 0.0, 0
+        data = json.loads(out.stdout)
+        streams = data.get("streams") or []
+        if not streams:
+            logger.warning(f"ffprobe found no video stream in {Path(path).name}")
+            return 0.0, 0
+        s = streams[0]
+        # r_frame_rate is a rational like "30000/1001"; "0/0" means unknown.
+        fps_raw = s.get("r_frame_rate", "0/1")
+        try:
+            num, den = fps_raw.split("/")
+            fps = float(num) / float(den) if float(den) > 0 else 0.0
+        except (ValueError, ZeroDivisionError):
+            fps = 0.0
+        # nb_frames can be missing or "N/A" — fall back to duration * fps.
+        try:
+            n = int(s.get("nb_frames") or 0)
+        except (ValueError, TypeError):
+            n = 0
+        if n <= 0:
+            try:
+                dur = float(s.get("duration") or 0)
+                if dur > 0 and fps > 0:
+                    n = int(dur * fps)
+            except (ValueError, TypeError):
+                pass
+        if n > 0:
+            logger.info(
+                f"ffprobe rescued {Path(path).name}: cv2 returned 0 frames, "
+                f"ffprobe reports {n} @ {fps:.2f} fps"
+            )
+            return (fps if fps > 0 else 25.0), n
+        logger.warning(
+            f"Neither cv2 nor ffprobe could count frames in {Path(path).name}"
+        )
+        return 0.0, 0
+    except FileNotFoundError:
+        logger.warning(
+            "ffprobe not found on PATH — cv2 failed on this file and "
+            "fallback unavailable. Install ffmpeg-tools."
+        )
+        return 0.0, 0
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timed out on {Path(path).name}")
+        return 0.0, 0
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"ffprobe fallback failed for {Path(path).name}: {e}")
+        return 0.0, 0
 
 from ...utils.ltxv_train_env import (
     free_vram,
@@ -1159,15 +1254,18 @@ class RSLTXVPrepareDataset:
 
                     if not chunk_pool:
                         _skipped_known = 0
+                        _unreadable = 0
                         for item in incomplete:
-                            cap = cv2.VideoCapture(str(item["path"]))
-                            if not cap.isOpened():
-                                continue
-                            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                            vid_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                            cap.release()
+                            # _probe_video_dims tries cv2 first, then falls
+                            # back to ffprobe — heals h264-in-mov files where
+                            # the moov atom sits at the end of the file
+                            # (common Premiere/FCP/Resolve export).
+                            vid_fps, vid_total = _probe_video_dims(str(item["path"]))
                             if vid_total <= 0:
+                                _unreadable += 1
                                 continue
+                            if vid_fps <= 0:
+                                vid_fps = 25.0
 
                             skip_s = int(round(skip_start_seconds * vid_fps))
                             skip_e = int(round(skip_end_seconds * vid_fps))
@@ -1200,9 +1298,10 @@ class RSLTXVPrepareDataset:
 
                         random.shuffle(chunk_pool)
                         _extra = f", {_skipped_known} already in dataset.json" if _skipped_known else ""
+                        _unread = f", {_unreadable} UNREADABLE (cv2+ffprobe both failed)" if _unreadable else ""
                         logger.info(
                             f"Chunk pool: {len(chunk_pool)} available chunks across "
-                            f"{len(incomplete)} videos{_extra}"
+                            f"{len(incomplete)} videos{_extra}{_unread}"
                         )
 
                     # Publish the pool's initial size so the live panel can
