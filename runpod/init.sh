@@ -18,55 +18,6 @@
 
 set -e
 
-# -----------------------------------------------------------------------------
-# CUDA driver compatibility gate — FIRST CHECK, before any expensive work.
-#
-# We previously had this check only in startup.sh, but on first boot
-# bootstrap.sh runs first — and if bootstrap dies mid-flight (which it
-# can for many reasons unrelated to drivers), the user never sees the
-# driver-check message and ends up watching a 10+ minute bootstrap loop
-# without knowing the underlying host is unusable.
-#
-# Run it here so a doomed pod fails within ~3 seconds of container boot,
-# regardless of bootstrap state. Override with RS_SKIP_CUDA_CHECK=1 if
-# you specifically want to use cu128 fallback (rare; explained in the
-# banner).
-# -----------------------------------------------------------------------------
-if [ "${RS_SKIP_CUDA_CHECK:-0}" != "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
-    _drv_cuda=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
-    _drv_cuda="${_drv_cuda:-0}"
-    if [ "$_drv_cuda" -lt 13 ] 2>/dev/null; then
-        cat <<EOF >&2
-
-############################################################################
-##                                                                        ##
-##   FATAL: This pod's NVIDIA driver supports CUDA ${_drv_cuda}.x at most.            ##
-##          Torch cu130 requires a host driver supporting CUDA 13.x       ##
-##          (typically driver >= 555).                                    ##
-##                                                                        ##
-##   --> TERMINATE THIS POD AND DEPLOY ON A DIFFERENT HOST <--            ##
-##                                                                        ##
-##   Container-image CUDA version != host driver CUDA version.            ##
-##   Even templates named "CUDA13" can land on hosts with 12.x drivers.   ##
-##   Verify each new pod with: nvidia-smi | head -3                       ##
-##                                                                        ##
-##   Override for cu128 fallback (slower on Blackwell, NOT recommended):  ##
-##     set RS_SKIP_CUDA_CHECK=1 in pod env vars and re-deploy             ##
-##                                                                        ##
-##   nvidia-smi reports: CUDA Version ${_drv_cuda}.x                                  ##
-##                                                                        ##
-############################################################################
-EOF
-        echo "[init] FATAL: driver supports CUDA ${_drv_cuda}.x, need >= 13. Aborting init." >&2
-        # Keep container alive briefly so the user can SSH in if they want
-        # to inspect, but mostly so this banner stays visible in the pod
-        # log instead of disappearing into a fast-restart loop.
-        sleep 60
-        exit 1
-    fi
-    echo "[init] CUDA driver check: host supports CUDA ${_drv_cuda}.x (>= 13 required) — OK"
-fi
-
 WORKSPACE=/workspace
 BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/bootstrap.sh"
 DONE_MARKER="$WORKSPACE/.bootstrap_done"
