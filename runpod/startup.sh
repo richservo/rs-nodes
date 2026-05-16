@@ -382,14 +382,57 @@ if [ "$FAST_PATH" != "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Optional InsightFace pre-download (gated by env var so the dispatch
-#    path that doesn't need it doesn't pay the bandwidth)
+# 4. InsightFace stack (used by face-aware ComfyUI nodes — IPAdapter
+#    FaceID, ReActor, several SAM3 face workflows, etc.)
+#
+#    Three parts, all idempotent — re-running this section costs ~2s
+#    when everything is already in place:
+#      (a) libgl1 / libglib2.0-0    system libs OpenCV pulls in;
+#                                   without them `import cv2` (which
+#                                   insightface does eagerly) explodes.
+#      (b) insightface + onnxruntime-gpu  the Python packages.
+#                                   Default `onnxruntime` is CPU only;
+#                                   we explicitly install the GPU build
+#                                   so face models can run on CUDA. The
+#                                   `-gpu` wheel must match the CUDA
+#                                   major version of torch — the pip
+#                                   resolver picks the right one because
+#                                   we're on torch cu130 by this point.
+#      (c) Prefetch antelopev2      pre-downloads ~280 MB of face
+#                                   models to ~/.insightface so the
+#                                   first node load doesn't stall on a
+#                                   silent CDN fetch. Failing here is
+#                                   non-fatal — node will retry on use.
+#
+#    Was previously gated behind RS_PREFETCH_INSIGHTFACE=1, but skipping
+#    the install left every pod broken until manually fixed. Always run.
 # -----------------------------------------------------------------------------
-if [ "${RS_PREFETCH_INSIGHTFACE:-0}" = "1" ]; then
-    log "Pre-downloading InsightFace antelopev2..."
-    python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" || \
-        log "WARN: InsightFace prefetch failed (will retry on first use)"
+log "Section 4: InsightFace stack"
+
+# 4a. System libs (apt). libgl1 is the libGL.so.1 OpenCV needs;
+# libglib2.0-0 provides libgthread which some cv2 builds also pull in.
+# Skip if both are already present — fast (<200ms) when no-op.
+if ! ldconfig -p | grep -q 'libGL.so.1' || ! ldconfig -p | grep -q 'libgthread-2.0'; then
+    log "  installing libgl1 libglib2.0-0..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        libgl1 libglib2.0-0 >/dev/null 2>&1 || \
+        log "  WARN: apt install of libgl1/libglib2.0-0 failed"
+else
+    log "  libgl1 + libglib2.0-0 already present"
 fi
+
+# 4b. Python packages. pip skips already-satisfied packages in ~1s.
+log "  installing insightface + onnxruntime-gpu..."
+pip install --no-cache-dir insightface onnxruntime-gpu || \
+    log "  WARN: insightface/onnxruntime-gpu install failed"
+
+# 4c. Prefetch the antelopev2 face model bundle (~280 MB). Uses
+# CPUExecutionProvider so the prefetch works even before CUDA is
+# warmed up. Actual node usage will pick the GPU provider at runtime.
+log "  prefetching antelopev2 face models..."
+python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" 2>&1 | tail -5 || \
+    log "  WARN: InsightFace prefetch failed (will retry on first use)"
 
 # -----------------------------------------------------------------------------
 # 5. Ollama install + serve (default ON — RSPromptFormatter requires it,
