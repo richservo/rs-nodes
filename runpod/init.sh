@@ -33,9 +33,21 @@ set -e
 # banner).
 # -----------------------------------------------------------------------------
 if [ "${RS_SKIP_CUDA_CHECK:-0}" != "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
-    _drv_cuda=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
-    _drv_cuda="${_drv_cuda:-0}"
-    if [ "$_drv_cuda" -lt 13 ] 2>/dev/null; then
+    # Log the relevant nvidia-smi line for diagnostics — if the parser
+    # is wrong (regex misses a format variant, output is N/A, GPU not
+    # yet ready, etc.) we want to see exactly what was being parsed
+    # rather than fail silently with a default of 0.
+    _smi_header=$(nvidia-smi 2>/dev/null | grep -E 'CUDA Version' | head -1 || echo "(none)")
+    echo "[init] nvidia-smi header: $_smi_header"
+    _drv_cuda=$(echo "$_smi_header" | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
+    echo "[init] Parsed driver CUDA major version: ${_drv_cuda:-(parse failed)}"
+    # ONLY fail if we successfully parsed a number AND it's < 13.
+    # Empty/N/A/unparseable output: skip the check entirely with a
+    # warning — let torch's actual init produce the real error if the
+    # driver is genuinely too old. This avoids false-positive failures
+    # when nvidia-smi output format varies between driver versions or
+    # the GPU isn't fully ready at init time.
+    if [ -n "$_drv_cuda" ] && [ "$_drv_cuda" -lt 13 ] 2>/dev/null; then
         cat <<EOF >&2
 
 ############################################################################
@@ -64,7 +76,11 @@ EOF
         sleep 60
         exit 1
     fi
-    echo "[init] CUDA driver check: host supports CUDA ${_drv_cuda}.x (>= 13 required) — OK"
+    if [ -n "$_drv_cuda" ]; then
+        echo "[init] CUDA driver check: host supports CUDA ${_drv_cuda}.x (>= 13 required) — OK"
+    else
+        echo "[init] CUDA driver check: could not parse nvidia-smi output (skipping; torch will produce a real error if the driver is genuinely too old)"
+    fi
 fi
 
 WORKSPACE=/workspace
