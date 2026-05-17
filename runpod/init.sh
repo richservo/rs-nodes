@@ -258,6 +258,21 @@ fi
 # us provisioning actually finished, so it's safe to take the fast
 # path.
 if [ -f "$DONE_MARKER" ] && [ -x "$WORKSPACE/startup.sh" ]; then
+    # Always pull the latest startup.sh from GitHub on every boot so
+    # script-level bug fixes ship without waiting for a pod cycle. Cost
+    # is one tiny HTTPS round-trip — negligible. If the fetch fails for
+    # any reason (network, GitHub down) we keep the existing cached copy
+    # rather than blocking startup entirely.
+    STARTUP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/startup.sh"
+    echo "[init] Pulling latest startup.sh from GitHub..."
+    if curl -fsSL "$STARTUP_URL" -o "$WORKSPACE/startup.sh.new" 2>/dev/null; then
+        mv -f "$WORKSPACE/startup.sh.new" "$WORKSPACE/startup.sh"
+        chmod +x "$WORKSPACE/startup.sh"
+        echo "[init] startup.sh updated from GitHub"
+    else
+        echo "[init] WARN: could not fetch latest startup.sh — using cached version"
+        rm -f "$WORKSPACE/startup.sh.new" 2>/dev/null || true
+    fi
     echo "[init] $DONE_MARKER present — running startup.sh (fast path)"
     exec bash "$WORKSPACE/startup.sh"
 fi
