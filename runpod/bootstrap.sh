@@ -525,7 +525,7 @@ if [ "$RS_LAUNCH_COMFY" = "1" ]; then
     # --highvram keeps weights GPU-resident; huge speedup on a 96 GB
     # Blackwell card vs the default lazy offload. Override via
     # COMFY_EXTRA_ARGS env var.
-    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS---highvram}"
     banner "Phase 7/7  Launching ComfyUI on 0.0.0.0:${PORT} (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
     cd "$COMFY_DIR"
     exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS
