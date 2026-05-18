@@ -91,15 +91,31 @@ echo "[init] authorized_keys has $(wc -l < /root/.ssh/authorized_keys) key(s)"
 # Instead: make sure sshd is alive (so they can SSH in to do the
 # maintenance they came for) and idle. Override with RS_FORCE_BOOTSTRAP=1
 # if you really want to run the normal flow on a CPU pod anyway.
-
 # -----------------------------------------------------------------------------
-# B2 sync handled by RunPod Cloud Sync (web UI)
+# B2 credentials from env vars -> /workspace/.rclone/rclone.conf
 #
-# RunPod console -> pod -> Cloud Sync -> Backblaze B2 covers all
-# bucket <-> /workspace transfers. The auto-mount / auto-pull /
-# inotify-autosync infrastructure that used to live here has been
-# removed in favor of that built-in feature.
+# Declarative: set B2_KEY_ID and B2_APP_KEY in pod env vars (RunPod
+# console) and init.sh writes a valid rclone.conf on EVERY boot.
+# Same pattern as PUBLIC_KEY_* env vars. No manual paste, no
+# b2_setup.bat round-trip required.
+#
+# Bucket name is not put in rclone.conf (rclone remote stanzas don't
+# need it — bucket lands in the path: `b2:<bucket>/datasets/...`).
+# B2_BUCKET env var is read by b2_helpers.sh as a convenience default.
 # -----------------------------------------------------------------------------
+if [ -n "${B2_KEY_ID:-}" ] && [ -n "${B2_APP_KEY:-}" ]; then
+    mkdir -p /workspace/.rclone
+    chmod 700 /workspace/.rclone
+    cat > /workspace/.rclone/rclone.conf <<EOF
+[b2]
+type = b2
+account = $B2_KEY_ID
+key = $B2_APP_KEY
+hard_delete = false
+EOF
+    chmod 600 /workspace/.rclone/rclone.conf
+    echo "[init] Wrote /workspace/.rclone/rclone.conf from B2_KEY_ID / B2_APP_KEY env vars"
+fi
 
 # -----------------------------------------------------------------------------
 # sshd sftp subsystem — ALWAYS-ON, both maintenance + normal modes.
@@ -140,13 +156,7 @@ fi
 # -----------------------------------------------------------------------------
 # GPU check / maintenance mode
 # -----------------------------------------------------------------------------
-if [ "${RS_MAINTENANCE_MODE:-0}" = "1" ] || [ -f /workspace/.maintenance_mode ]; then
-    echo "[init] RS_MAINTENANCE_MODE=1 or /workspace/.maintenance_mode exists — entering MAINTENANCE MODE."
-    echo "[init] Pod will stay alive without launching bootstrap/startup/ComfyUI."
-    echo "[init] SSH access works normally. Fix the underlying issue, then either:"
-    echo "[init]   * Unset RS_MAINTENANCE_MODE in pod env vars + restart pod, OR"
-    echo "[init]   * rm /workspace/.maintenance_mode + restart pod"
-elif [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
+if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     echo "[init] No GPU detected — entering MAINTENANCE MODE."
     echo "[init] Full pod access except ComfyUI / CUDA-dependent work:"
     echo "[init]   * SSH (interactive + scp + sftp)"
@@ -264,21 +274,6 @@ fi
 # us provisioning actually finished, so it's safe to take the fast
 # path.
 if [ -f "$DONE_MARKER" ] && [ -x "$WORKSPACE/startup.sh" ]; then
-    # Always pull the latest startup.sh from GitHub on every boot so
-    # script-level bug fixes ship without waiting for a pod cycle. Cost
-    # is one tiny HTTPS round-trip — negligible. If the fetch fails for
-    # any reason (network, GitHub down) we keep the existing cached copy
-    # rather than blocking startup entirely.
-    STARTUP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/startup.sh"
-    echo "[init] Pulling latest startup.sh from GitHub..."
-    if curl -fsSL "$STARTUP_URL" -o "$WORKSPACE/startup.sh.new" 2>/dev/null; then
-        mv -f "$WORKSPACE/startup.sh.new" "$WORKSPACE/startup.sh"
-        chmod +x "$WORKSPACE/startup.sh"
-        echo "[init] startup.sh updated from GitHub"
-    else
-        echo "[init] WARN: could not fetch latest startup.sh — using cached version"
-        rm -f "$WORKSPACE/startup.sh.new" 2>/dev/null || true
-    fi
     echo "[init] $DONE_MARKER present — running startup.sh (fast path)"
     exec bash "$WORKSPACE/startup.sh"
 fi

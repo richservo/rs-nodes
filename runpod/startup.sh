@@ -35,31 +35,6 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { printf '[startup] %s\n' "$*"; }
 
-# Idempotent: start ollama in a fully-detached session if it's not
-# already running. Safe to call every time startup.sh runs.
-#
-# Why setsid + nohup + </dev/null: ollama serve must survive both
-# (a) the parent shell exiting normally and (b) the parent shell being
-# killed (e.g. user kills ComfyUI to trigger a respring). nohup alone
-# only catches SIGHUP — process-group signals from a parent death can
-# still reach the child. setsid creates a brand-new session, so ollama
-# is in its own process group with no controlling terminal. </dev/null
-# closes stdin in case anything blocks on reading from it.
-ensure_ollama_running() {
-    [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] || return 0
-    command -v ollama >/dev/null 2>&1 || return 0
-    if pgrep -f "ollama serve" >/dev/null 2>&1; then
-        return 0  # already running
-    fi
-    export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
-    export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
-    mkdir -p "$OLLAMA_MODELS"
-    log "Ollama not running — starting fully-detached..."
-    setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
-        ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
-    disown 2>/dev/null || true
-}
-
 log "rs-nodes pod startup beginning at $(date -Is)"
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
@@ -141,6 +116,29 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# rclone + B2 helpers — install on demand for pods that bootstrapped
+# before the feature existed. No-op when rclone is already present.
+# -----------------------------------------------------------------------------
+if ! command -v rclone >/dev/null 2>&1; then
+    log "rclone missing — installing"
+    if [ -x "$RS_NODES_DIR/runpod/install_rclone.sh" ]; then
+        bash "$RS_NODES_DIR/runpod/install_rclone.sh" || log "WARN: rclone install failed (B2 sync will be unavailable)"
+    fi
+fi
+# Always mirror the latest b2_helpers.sh + b2_mount.sh from the repo
+# so updates land without a full re-bootstrap. Cheap (~1KB copies).
+if [ -f "$RS_NODES_DIR/runpod/b2_helpers.sh" ]; then
+    cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
+    chmod +x /workspace/b2_helpers.sh
+fi
+if [ -f "$RS_NODES_DIR/runpod/b2_mount.sh" ]; then
+    cp -f "$RS_NODES_DIR/runpod/b2_mount.sh" /workspace/b2_mount.sh
+    chmod +x /workspace/b2_mount.sh
+fi
+mkdir -p /workspace/.rclone
+chmod 700 /workspace/.rclone
+
+# -----------------------------------------------------------------------------
 # 1+2. ComfyUI + rs-nodes — clone if missing, pull on every boot.
 #      Capture pre/post HEADs so we can detect whether anything actually
 #      changed. If nothing changed, the express path below skips every
@@ -180,66 +178,6 @@ if [ -d "$RS_NODES_DIR/runpod" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Torch / host-driver alignment — runs on EVERY boot regardless of
-# fast-path / express-path. Catches RunPod scheduler roulette where
-# /workspace was provisioned on one host's driver but the current pod
-# landed on a different host:
-#
-#   cu130 torch on a CUDA 12.x driver  → torch.cuda.is_available() fails
-#   cu128 torch on a CUDA 13.x driver  → works but loses Blackwell perf
-#
-# Bidirectional heal:
-#   * Driver >= CUDA 13 AND torch is cu128 → UPGRADE to cu130 (Blackwell perf)
-#   * Driver <  CUDA 13 AND torch is cu130 → DOWNGRADE to cu128 (so it runs)
-#   * Driver matches torch → no-op
-#
-# cu130 is the preferred install; cu128 is fallback only. We always
-# heal toward the optimal wheel for whichever host we landed on.
-# -----------------------------------------------------------------------------
-if [ -f "$VENV/bin/python" ]; then
-    # Use torch.cuda.is_available() as the SIGNAL — it succeeds or fails
-    # based on actual driver/torch compatibility, no nvidia-smi parsing
-    # required. If it fails, try alternative wheels in order until one
-    # works. This is dumb but robust.
-    log "Torch/driver heal — checking torch.cuda.is_available()..."
-    if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-        _t=$("$VENV/bin/python" -c "import torch; print(torch.version.cuda)" 2>/dev/null)
-        log "Torch/driver heal — OK (torch built for CUDA $_t, CUDA init succeeded)"
-    else
-        log "Torch/driver heal — torch CUDA init FAILED on this host"
-        log "Torch/driver heal — current torch: $("$VENV/bin/python" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo unknown)"
-
-        # Try cu128 first — has the broadest driver compatibility (works
-        # on any CUDA 12.x+ driver). Covers the most common failure mode:
-        # cu130 torch on CUDA 12.x host.
-        log "Torch/driver heal — attempting cu128 reinstall..."
-        "$VENV/bin/pip" install --upgrade --no-cache-dir \
-            --index-url "https://download.pytorch.org/whl/cu128" \
-            torch torchvision torchaudio 2>&1 | tail -5 || true
-
-        if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-            log "Torch/driver heal — SUCCESS with cu128 (driver supports CUDA 12.x)"
-        else
-            # cu128 didn't help. Try cu130 — covers the case where torch was
-            # somehow stuck at an older wheel (cu121, cu124) and the host
-            # actually has CUDA 13.
-            log "Torch/driver heal — cu128 didn't help, trying cu130..."
-            "$VENV/bin/pip" install --upgrade --no-cache-dir \
-                --index-url "https://download.pytorch.org/whl/cu130" \
-                torch torchvision torchaudio 2>&1 | tail -5 || true
-
-            if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-                log "Torch/driver heal — SUCCESS with cu130 (driver supports CUDA 13.x — full Blackwell perf)"
-            else
-                log "Torch/driver heal — WARN: neither cu128 nor cu130 fixed it"
-                log "Torch/driver heal — full error:"
-                "$VENV/bin/python" -c "import torch; torch.cuda.is_available()" 2>&1 | tail -10 || true
-            fi
-        fi
-    fi
-fi
-
-# -----------------------------------------------------------------------------
 # Express path — git tells us the truth about "did anything change?"
 # If neither ComfyUI nor rs-nodes moved AND all setup markers are
 # present, there is literally nothing to do except launch ComfyUI.
@@ -267,18 +205,16 @@ print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
 " 2>/dev/null || echo "")
     [ -n "$NV_LIB_PATHS" ] && export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    # Ensure ollama is running (fully detached so it survives comfy
-    # process death — e.g. user killing main.py to respring).
-    ensure_ollama_running
+    # Spawn ollama in background (best effort)
+    if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] && command -v ollama >/dev/null 2>&1; then
+        export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+        export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+        nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+            ollama serve >/workspace/ollama.log 2>&1 &
+    fi
 
     cd "$COMFY_DIR"
-    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
-# Sentinel: COMFY_EXTRA_ARGS=NONE / none means "no flags at all" for
-# UIs that don't accept empty values. Translate to empty string so the
-# exec line below adds no args.
-if [ "$COMFY_EXTRA_ARGS" = "NONE" ] || [ "$COMFY_EXTRA_ARGS" = "none" ]; then
-    COMFY_EXTRA_ARGS=""
-fi
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
     log "Launching ComfyUI on 0.0.0.0:${PORT}  (express, args: $COMFY_EXTRA_ARGS)"
     exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
 fi
@@ -469,107 +405,14 @@ if [ "$FAST_PATH" != "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 4. InsightFace stack (used by face-aware ComfyUI nodes — IPAdapter
-#    FaceID, ReActor, several SAM3 face workflows, etc.)
-#
-#    Three parts, all idempotent — re-running this section costs ~2s
-#    when everything is already in place:
-#      (a) libgl1 / libglib2.0-0    system libs OpenCV pulls in;
-#                                   without them `import cv2` (which
-#                                   insightface does eagerly) explodes.
-#      (b) insightface + onnxruntime-gpu  the Python packages.
-#                                   Default `onnxruntime` is CPU only;
-#                                   we explicitly install the GPU build
-#                                   so face models can run on CUDA. The
-#                                   `-gpu` wheel must match the CUDA
-#                                   major version of torch — the pip
-#                                   resolver picks the right one because
-#                                   we're on torch cu130 by this point.
-#      (c) Prefetch antelopev2      pre-downloads ~280 MB of face
-#                                   models to ~/.insightface so the
-#                                   first node load doesn't stall on a
-#                                   silent CDN fetch. Failing here is
-#                                   non-fatal — node will retry on use.
-#
-#    Was previously gated behind RS_PREFETCH_INSIGHTFACE=1, but skipping
-#    the install left every pod broken until manually fixed. Always run.
+# 4. Optional InsightFace pre-download (gated by env var so the dispatch
+#    path that doesn't need it doesn't pay the bandwidth)
 # -----------------------------------------------------------------------------
-log "Section 4: InsightFace stack"
-
-# 4a. System libs (apt). libgl1 is the libGL.so.1 OpenCV needs;
-# libglib2.0-0 provides libgthread which some cv2 builds also pull in.
-# Skip if both are already present — fast (<200ms) when no-op.
-if ! ldconfig -p | grep -q 'libGL.so.1' || ! ldconfig -p | grep -q 'libgthread-2.0'; then
-    log "  installing libgl1 libglib2.0-0..."
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        libgl1 libglib2.0-0 >/dev/null 2>&1 || \
-        log "  WARN: apt install of libgl1/libglib2.0-0 failed"
-else
-    log "  libgl1 + libglib2.0-0 already present"
+if [ "${RS_PREFETCH_INSIGHTFACE:-0}" = "1" ]; then
+    log "Pre-downloading InsightFace antelopev2..."
+    python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" || \
+        log "WARN: InsightFace prefetch failed (will retry on first use)"
 fi
-
-# 4b. Python packages — onnxruntime-gpu MUST install cleanly with the
-# CUDA EP available. The default `pip install onnxruntime-gpu` ships
-# the CUDA 12.x wheel by default (as of late 2024), but if the CPU
-# `onnxruntime` was previously installed (sometimes pulled in
-# transitively by other packages), it shadows the GPU build and the
-# CUDA provider silently disappears. So:
-#   1. Force-remove any existing onnxruntime (CPU or GPU) to start
-#      from a clean slate. -y so we don't prompt; || true so the
-#      first-boot case (neither installed) doesn't fail the script.
-#   2. Install onnxruntime-gpu fresh.
-#   3. Probe providers. If CUDAExecutionProvider is missing, retry
-#      with the Azure CUDA-12 index URL (the canonical CUDA-12-only
-#      wheel source — covers the case where PyPI's default wheel was
-#      built against a CUDA version the host doesn't match).
-
-# Step 1: clean slate.
-log "  removing any existing onnxruntime installs (clean reinstall)..."
-pip uninstall -y onnxruntime onnxruntime-gpu 2>&1 | tail -3 || true
-
-# Step 2: install GPU wheel + insightface.
-log "  installing insightface + onnxruntime-gpu (default PyPI wheel)..."
-pip install --no-cache-dir insightface onnxruntime-gpu || \
-    log "  WARN: insightface/onnxruntime-gpu install failed"
-
-# Step 3: verify CUDA EP. If missing, retry from the CUDA-12 index.
-if ! python -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()" 2>/dev/null; then
-    log "  CUDAExecutionProvider missing after default install — retrying from CUDA-12 index..."
-    pip uninstall -y onnxruntime-gpu 2>&1 | tail -3 || true
-    pip install --no-cache-dir onnxruntime-gpu \
-        --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ || \
-        log "  WARN: onnxruntime-gpu CUDA-12 index install failed"
-
-    if ! python -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers()" 2>/dev/null; then
-        log "  WARN: CUDAExecutionProvider STILL missing after CUDA-12 retry."
-        log "        Face detection will fall back to CPU (slow but functional)."
-        log "        Run: python -c \"import onnxruntime; print(onnxruntime.get_available_providers())\""
-        log "        to diagnose. Likely cause: torch CUDA version vs onnxruntime CUDA build mismatch."
-    else
-        log "  CUDAExecutionProvider now available (CUDA-12 wheel)."
-    fi
-else
-    log "  CUDAExecutionProvider available (default wheel)."
-fi
-
-# 4c. Prefetch the antelopev2 face model bundle (~280 MB). Uses
-# CPUExecutionProvider for the prefetch since the GPU session has a
-# warmup cost we don't need here. Actual node usage picks GPU at
-# runtime. If a prior prefetch left a partial/corrupt download in
-# ~/.insightface/, blow it away first so re-runs heal.
-INSIGHTFACE_HOME="${INSIGHTFACE_HOME:-$HOME/.insightface}"
-if [ -d "$INSIGHTFACE_HOME/models/antelopev2" ]; then
-    # Validate by counting expected .onnx files — antelopev2 ships 5.
-    _onnx_count=$(find "$INSIGHTFACE_HOME/models/antelopev2" -name "*.onnx" 2>/dev/null | wc -l)
-    if [ "$_onnx_count" -lt 5 ]; then
-        log "  partial antelopev2 install ($_onnx_count/5 onnx files) — wiping for re-download"
-        rm -rf "$INSIGHTFACE_HOME/models/antelopev2"
-    fi
-fi
-log "  prefetching antelopev2 face models..."
-python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='antelopev2', providers=['CPUExecutionProvider'])" 2>&1 | tail -5 || \
-    log "  WARN: InsightFace prefetch failed (will retry on first use)"
 
 # -----------------------------------------------------------------------------
 # 5. Ollama install + serve (default ON — RSPromptFormatter requires it,
@@ -586,8 +429,9 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
     mkdir -p "$OLLAMA_MODELS"
-    log "Starting Ollama (idempotent, fully detached)..."
-    ensure_ollama_running
+    log "Starting Ollama in the background..."
+    nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+        ollama serve >/workspace/ollama.log 2>&1 &
 
     # Ollama models marker — only do first-time wait+pull if the marker
     # is missing AND the models aren't already on disk. Auto-detects
@@ -639,13 +483,7 @@ fi
 # audio_vae easily fit; eliminating the CPU↔GPU ping-pong can be
 # 2-5x faster after the first warmup. Override via COMFY_EXTRA_ARGS
 # env var (e.g. "" to disable, or "--gpu-only" for max-aggressive).
-COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
-# Sentinel: COMFY_EXTRA_ARGS=NONE / none means "no flags at all" for
-# UIs that don't accept empty values. Translate to empty string so the
-# exec line below adds no args.
-if [ "$COMFY_EXTRA_ARGS" = "NONE" ] || [ "$COMFY_EXTRA_ARGS" = "none" ]; then
-    COMFY_EXTRA_ARGS=""
-fi
+COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
 log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
 cd "$COMFY_DIR"
 exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
