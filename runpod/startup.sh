@@ -214,7 +214,10 @@ print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
     fi
 
     cd "$COMFY_DIR"
-    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
+    if [ "$COMFY_EXTRA_ARGS" = "NONE" ] || [ "$COMFY_EXTRA_ARGS" = "none" ]; then
+        COMFY_EXTRA_ARGS=""
+    fi
     log "Launching ComfyUI on 0.0.0.0:${PORT}  (express, args: $COMFY_EXTRA_ARGS)"
     exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
 fi
@@ -483,7 +486,10 @@ fi
 # audio_vae easily fit; eliminating the CPU↔GPU ping-pong can be
 # 2-5x faster after the first warmup. Override via COMFY_EXTRA_ARGS
 # env var (e.g. "" to disable, or "--gpu-only" for max-aggressive).
-COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
+COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
+if [ "$COMFY_EXTRA_ARGS" = "NONE" ] || [ "$COMFY_EXTRA_ARGS" = "none" ]; then
+    COMFY_EXTRA_ARGS=""
+fi
 log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
 cd "$COMFY_DIR"
 exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
