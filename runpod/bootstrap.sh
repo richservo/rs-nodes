@@ -318,25 +318,9 @@ if [ -n "$PROV_HASH" ]; then
     log "Wrote provision hash: $PROVISION_MARKER"
 fi
 
-# -----------------------------------------------------------------------------
-# Phase 2.5 — rclone (for B2 / S3 dataset+LoRA sync)
-# Idempotent: install_rclone.sh is a no-op if the binary is already
-# in PATH. Mirror b2_helpers.sh to /workspace so rs-studio can shell
-# out to /workspace/b2_helpers.sh without a path lookup.
-# -----------------------------------------------------------------------------
-banner "Phase 2.5/7  rclone install (for B2 / S3 sync)"
-# install_rclone.sh failing must NOT kill bootstrap — rclone is a
-# convenience for B2 sync, not required for ComfyUI. Without the
-# `|| log "..."` here, set -e was killing bootstrap mid-flight and
-# Phase 3+ never ran, producing an endless boot loop.
-bash "$RS_NODES_DIR/runpod/install_rclone.sh" || \
-    log "WARN: rclone install failed — B2 sync will be unavailable but ComfyUI will still run"
-cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh 2>/dev/null || true
-cp -f "$RS_NODES_DIR/runpod/b2_mount.sh" /workspace/b2_mount.sh 2>/dev/null || true
-chmod +x /workspace/b2_helpers.sh /workspace/b2_mount.sh 2>/dev/null || true
-mkdir -p /workspace/.rclone
-chmod 700 /workspace/.rclone
-log "Phase 2.5 complete (rclone status above)"
+# Phase 2.5 (rclone install) removed — user doesn't use it, the
+# install was broken, and it was killing bootstrap with set -e on
+# failure. B2 sync is handled by RunPod's built-in Cloud Sync.
 
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
