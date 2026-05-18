@@ -220,18 +220,36 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
 fi
 
+# Detect what's currently installed and only reinstall if it's the
+# wrong variant. pip's --upgrade flag refuses to downgrade — if cu130
+# is already installed (from a previous bootstrap iteration that
+# crashed before completing), `pip install --upgrade cu128 torch`
+# says "already satisfied" and leaves cu130 in place.
+# Fix: explicitly uninstall when variant doesn't match, then install
+# the right one.
+_installed=$(python -c "import torch; print(torch.version.cuda or '')" 2>/dev/null | tr -d '.')
+_wanted="${TORCH_VARIANT#cu}"
+if [ -n "$_installed" ] && [ "$_installed" != "$_wanted" ]; then
+    log "Currently installed torch is cu${_installed} — uninstalling before fresh ${TORCH_VARIANT} install"
+    pip uninstall -y torch torchvision torchaudio 2>&1 | tail -3 || true
+fi
+
 log "Installing PyTorch ${TORCH_VARIANT} wheels..."
-pip install --upgrade --no-cache-dir --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
+pip install --no-cache-dir --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
     torch torchvision torchaudio || log "WARN: ${TORCH_VARIANT} install failed"
 
-# Fallback: if we installed cu130 but torch can't actually init CUDA
-# (parse failed earlier and we guessed wrong), retry with cu128.
-if [ "$TORCH_VARIANT" = "cu130" ]; then
-    if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-        log "cu130 torch can't init CUDA — falling back to cu128"
-        pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-            torch torchvision torchaudio || log "WARN: cu128 fallback install failed"
+# Verify torch can actually init CUDA. If it can't, we may have guessed
+# the wrong wheel — try the other one.
+if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    if [ "$TORCH_VARIANT" = "cu130" ]; then
+        _other="cu128"
+    else
+        _other="cu130"
     fi
+    log "${TORCH_VARIANT} can't init CUDA — falling back to ${_other}"
+    pip uninstall -y torch torchvision torchaudio 2>&1 | tail -3 || true
+    pip install --no-cache-dir --index-url "https://download.pytorch.org/whl/${_other}" \
+        torch torchvision torchaudio || log "WARN: ${_other} fallback install failed"
 fi
 
 log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
