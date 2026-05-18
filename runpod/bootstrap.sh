@@ -201,9 +201,38 @@ fi
 #      version compatible with the pinned hub.
 
 # 1. Framework
-log "Upgrading PyTorch to cu130 wheels..."
-pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
-    torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
+# Pick the right torch wheel for the host's CUDA driver. RunPod fleets
+# have shifted to mostly CUDA 12.x driver hosts; installing cu130
+# unconditionally would bootloop with "driver too old" on those.
+# Detect once at bootstrap time and pick wisely. Restart never touches
+# torch (startup.sh doesn't reinstall), so whichever wheel lands here
+# stays.
+TORCH_VARIANT="cu130"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    _drv=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    if [ -n "$_drv" ] && [ "$_drv" -lt 13 ] 2>/dev/null; then
+        TORCH_VARIANT="cu128"
+        log "Host driver supports CUDA ${_drv}.x (< 13) — installing torch cu128"
+    elif [ -n "$_drv" ]; then
+        log "Host driver supports CUDA ${_drv}.x — installing torch cu130 (full Blackwell perf)"
+    else
+        log "nvidia-smi parse returned empty — defaulting to torch cu130"
+    fi
+fi
+
+log "Installing PyTorch ${TORCH_VARIANT} wheels..."
+pip install --upgrade --no-cache-dir --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
+    torch torchvision torchaudio || log "WARN: ${TORCH_VARIANT} install failed"
+
+# Fallback: if we installed cu130 but torch can't actually init CUDA
+# (parse failed earlier and we guessed wrong), retry with cu128.
+if [ "$TORCH_VARIANT" = "cu130" ]; then
+    if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+        log "cu130 torch can't init CUDA — falling back to cu128"
+        pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+            torch torchvision torchaudio || log "WARN: cu128 fallback install failed"
+    fi
+fi
 
 log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
 pip install --no-cache-dir \
