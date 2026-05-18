@@ -325,13 +325,18 @@ fi
 # out to /workspace/b2_helpers.sh without a path lookup.
 # -----------------------------------------------------------------------------
 banner "Phase 2.5/7  rclone install (for B2 / S3 sync)"
-bash "$RS_NODES_DIR/runpod/install_rclone.sh"
-cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh
+# install_rclone.sh failing must NOT kill bootstrap — rclone is a
+# convenience for B2 sync, not required for ComfyUI. Without the
+# `|| log "..."` here, set -e was killing bootstrap mid-flight and
+# Phase 3+ never ran, producing an endless boot loop.
+bash "$RS_NODES_DIR/runpod/install_rclone.sh" || \
+    log "WARN: rclone install failed — B2 sync will be unavailable but ComfyUI will still run"
+cp -f "$RS_NODES_DIR/runpod/b2_helpers.sh" /workspace/b2_helpers.sh 2>/dev/null || true
 cp -f "$RS_NODES_DIR/runpod/b2_mount.sh" /workspace/b2_mount.sh 2>/dev/null || true
 chmod +x /workspace/b2_helpers.sh /workspace/b2_mount.sh 2>/dev/null || true
 mkdir -p /workspace/.rclone
 chmod 700 /workspace/.rclone
-log "rclone available; b2_helpers.sh + b2_mount.sh at /workspace/"
+log "Phase 2.5 complete (rclone status above)"
 
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
