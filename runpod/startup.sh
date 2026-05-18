@@ -197,55 +197,44 @@ fi
 # heal toward the optimal wheel for whichever host we landed on.
 # -----------------------------------------------------------------------------
 if [ -f "$VENV/bin/python" ]; then
-    # Parse host driver's CUDA version
-    _smi_header=$(nvidia-smi 2>/dev/null | grep -E 'CUDA Version' | head -1 || echo "")
-    log "Torch/driver heal — nvidia-smi header: ${_smi_header:-(empty)}"
-    _drv_cuda=$(echo "$_smi_header" | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
-    # Installed torch version
-    _torch_cuda=$("$VENV/bin/python" -c "import torch; print(torch.version.cuda or '')" 2>/dev/null | tr -d '.')
-    log "Torch/driver heal — parsed driver_cuda=${_drv_cuda:-(parse_failed)} torch_cuda=${_torch_cuda:-(unknown)}"
+    # Use torch.cuda.is_available() as the SIGNAL — it succeeds or fails
+    # based on actual driver/torch compatibility, no nvidia-smi parsing
+    # required. If it fails, try alternative wheels in order until one
+    # works. This is dumb but robust.
+    log "Torch/driver heal — checking torch.cuda.is_available()..."
+    if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+        _t=$("$VENV/bin/python" -c "import torch; print(torch.version.cuda)" 2>/dev/null)
+        log "Torch/driver heal — OK (torch built for CUDA $_t, CUDA init succeeded)"
+    else
+        log "Torch/driver heal — torch CUDA init FAILED on this host"
+        log "Torch/driver heal — current torch: $("$VENV/bin/python" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo unknown)"
 
-    # Fallback: if nvidia-smi parse failed but torch CUDA init fails,
-    # assume the driver is too old for cu130 (most common cause) and
-    # try cu128. Better than silently doing nothing.
-    if [ -z "$_drv_cuda" ] && [ "$_torch_cuda" = "130" ]; then
-        if ! "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-            log "Torch/driver heal — driver_cuda parse failed AND torch cu130 can't init CUDA → assuming driver < 13, will reinstall cu128"
-            _drv_cuda="12"
-        fi
-    fi
-
-    _want_torch=""
-    if [ -n "$_drv_cuda" ]; then
-        if [ "$_drv_cuda" -ge 13 ] 2>/dev/null; then
-            _want_torch="130"
-        else
-            _want_torch="128"
-        fi
-    fi
-
-    if [ -n "$_want_torch" ] && [ -n "$_torch_cuda" ] && [ "$_torch_cuda" != "$_want_torch" ]; then
-        # Mismatch: heal in the appropriate direction.
-        if [ "$_want_torch" = "130" ]; then
-            log "Host supports CUDA ${_drv_cuda}.x but torch is cu${_torch_cuda} — upgrading to cu130 for full Blackwell perf..."
-        else
-            log "Host driver maxes at CUDA ${_drv_cuda}.x but torch is cu${_torch_cuda} — downgrading to cu128 so it actually runs..."
-        fi
+        # Try cu128 first — has the broadest driver compatibility (works
+        # on any CUDA 12.x+ driver). Covers the most common failure mode:
+        # cu130 torch on CUDA 12.x host.
+        log "Torch/driver heal — attempting cu128 reinstall..."
         "$VENV/bin/pip" install --upgrade --no-cache-dir \
-            --index-url "https://download.pytorch.org/whl/cu${_want_torch}" \
-            torch torchvision torchaudio || \
-            log "  WARN: cu${_want_torch} install failed"
+            --index-url "https://download.pytorch.org/whl/cu128" \
+            torch torchvision torchaudio 2>&1 | tail -5 || true
+
         if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-            log "  Torch CUDA confirmed working (cu${_want_torch} on CUDA ${_drv_cuda}.x driver)"
+            log "Torch/driver heal — SUCCESS with cu128 (driver supports CUDA 12.x)"
         else
-            log "  WARN: torch still can't init CUDA after cu${_want_torch} install"
-        fi
-    elif [ -n "$_drv_cuda" ] && [ -n "$_torch_cuda" ]; then
-        # Matched. Quick sanity check that torch actually initializes.
-        if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-            log "Torch cu${_torch_cuda} aligned with CUDA ${_drv_cuda}.x driver — OK"
-        else
-            log "WARN: torch cu${_torch_cuda} matches driver CUDA ${_drv_cuda}.x but CUDA init still failed (other root cause)"
+            # cu128 didn't help. Try cu130 — covers the case where torch was
+            # somehow stuck at an older wheel (cu121, cu124) and the host
+            # actually has CUDA 13.
+            log "Torch/driver heal — cu128 didn't help, trying cu130..."
+            "$VENV/bin/pip" install --upgrade --no-cache-dir \
+                --index-url "https://download.pytorch.org/whl/cu130" \
+                torch torchvision torchaudio 2>&1 | tail -5 || true
+
+            if "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+                log "Torch/driver heal — SUCCESS with cu130 (driver supports CUDA 13.x — full Blackwell perf)"
+            else
+                log "Torch/driver heal — WARN: neither cu128 nor cu130 fixed it"
+                log "Torch/driver heal — full error:"
+                "$VENV/bin/python" -c "import torch; torch.cuda.is_available()" 2>&1 | tail -10 || true
+            fi
         fi
     fi
 fi
