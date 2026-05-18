@@ -199,9 +199,21 @@ fi
 if [ -f "$VENV/bin/python" ]; then
     # Parse host driver's CUDA version
     _smi_header=$(nvidia-smi 2>/dev/null | grep -E 'CUDA Version' | head -1 || echo "")
+    log "Torch/driver heal — nvidia-smi header: ${_smi_header:-(empty)}"
     _drv_cuda=$(echo "$_smi_header" | grep -oE 'CUDA Version:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$')
     # Installed torch version
     _torch_cuda=$("$VENV/bin/python" -c "import torch; print(torch.version.cuda or '')" 2>/dev/null | tr -d '.')
+    log "Torch/driver heal — parsed driver_cuda=${_drv_cuda:-(parse_failed)} torch_cuda=${_torch_cuda:-(unknown)}"
+
+    # Fallback: if nvidia-smi parse failed but torch CUDA init fails,
+    # assume the driver is too old for cu130 (most common cause) and
+    # try cu128. Better than silently doing nothing.
+    if [ -z "$_drv_cuda" ] && [ "$_torch_cuda" = "130" ]; then
+        if ! "$VENV/bin/python" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+            log "Torch/driver heal — driver_cuda parse failed AND torch cu130 can't init CUDA → assuming driver < 13, will reinstall cu128"
+            _drv_cuda="12"
+        fi
+    fi
 
     _want_torch=""
     if [ -n "$_drv_cuda" ]; then
