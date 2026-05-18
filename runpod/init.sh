@@ -140,7 +140,13 @@ fi
 # -----------------------------------------------------------------------------
 # GPU check / maintenance mode
 # -----------------------------------------------------------------------------
-if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
+if [ "${RS_MAINTENANCE_MODE:-0}" = "1" ] || [ -f /workspace/.maintenance_mode ]; then
+    echo "[init] RS_MAINTENANCE_MODE=1 or /workspace/.maintenance_mode exists — entering MAINTENANCE MODE."
+    echo "[init] Pod will stay alive without launching bootstrap/startup/ComfyUI."
+    echo "[init] SSH access works normally. Fix the underlying issue, then either:"
+    echo "[init]   * Unset RS_MAINTENANCE_MODE in pod env vars + restart pod, OR"
+    echo "[init]   * rm /workspace/.maintenance_mode + restart pod"
+elif [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     echo "[init] No GPU detected — entering MAINTENANCE MODE."
     echo "[init] Full pod access except ComfyUI / CUDA-dependent work:"
     echo "[init]   * SSH (interactive + scp + sftp)"
