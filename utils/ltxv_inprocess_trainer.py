@@ -1225,7 +1225,10 @@ class InProcessTrainer:
         # (T/1) * (H/1) * (W/1) since latents are already VAE-compressed.
         _, C, T, H, W = video_latents.shape
         seq_length = T * H * W
-        sigmas = self._timestep_sampler.sample(B, seq_length, device=device)  # [B,]
+        # Sampler returns fp32; cast to latent dtype so noisy_video stays
+        # bf16/fp16. Otherwise dtype promotion makes the model input fp32,
+        # and quanto-fp8 Marlin gemm only supports bf16/fp16.
+        sigmas = self._timestep_sampler.sample(B, seq_length, device=device).to(video_latents.dtype)  # [B,]
 
         # Add noise: noisy = (1 - sigma) * clean + sigma * noise
         video_noise = torch.randn_like(video_latents)
