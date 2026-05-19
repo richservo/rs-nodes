@@ -27,6 +27,18 @@ BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpo
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
 
+# Pin JIT + HF caches to the network volume so they survive container
+# restarts. Default locations are under ~/.cache (container disk) and
+# get wiped every restart, forcing Triton/Inductor/comfy_kitchen to
+# recompile CUDA kernels (~2 min) and HF to re-download tokenizers and
+# configs on every boot. Pinning to /workspace makes 2nd+ boots fast.
+mkdir -p /workspace/.cache/triton \
+         /workspace/.cache/torch_inductor \
+         /workspace/.cache/huggingface
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/workspace/.cache/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/workspace/.cache/torch_inductor}"
+export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 

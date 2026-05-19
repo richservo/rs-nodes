@@ -45,6 +45,17 @@ export OLLAMA_MODELS OLLAMA_HOST
 # purpose so we accept this globally.
 export PIP_BREAK_SYSTEM_PACKAGES=1
 
+# Pin JIT + HF caches to the network volume so they survive container
+# restarts. See startup.sh for details — same idea, exported here so
+# first-boot bootstrap.sh (which doesn't go through startup.sh) also
+# uses /workspace cache paths.
+mkdir -p /workspace/.cache/triton \
+         /workspace/.cache/torch_inductor \
+         /workspace/.cache/huggingface
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/workspace/.cache/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/workspace/.cache/torch_inductor}"
+export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
