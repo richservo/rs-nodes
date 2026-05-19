@@ -1125,6 +1125,43 @@ class InProcessTrainer:
         torch.cuda.empty_cache()
         logger.info("Base model quantized (LoRA weights preserved in float)")
 
+        # Defensive guard: torch 2.12's torch.nn.functional.rms_norm can
+        # return fp32 even when input is bf16, which propagates into
+        # quanto's fp8 marlin gemm — and marlin only supports bf16/fp16.
+        # Patch QLinear.forward to coerce fp32 inputs to bf16 at the
+        # kernel boundary, so we don't have to chase every dtype-leak
+        # path through ComfyUI's model code.
+        self._patch_quanto_qlinear_dtype()
+
+    def _patch_quanto_qlinear_dtype(self) -> None:
+        """Coerce fp32 inputs to bf16 in optimum-quanto QLinear.forward.
+
+        torch.nn.functional.rms_norm + a few other ops in PyTorch 2.12
+        return fp32 even for bf16 input. When that fp32 hits a quanto
+        fp8 marlin gemm it crashes with "fp8_marlin_gemm only supports
+        bfloat16 and float16". Class-level monkey-patch handles every
+        QLinear in the model (block attn projections, adaln_single
+        linears, timestep_embedder layers, etc.).
+        """
+        try:
+            from optimum.quanto.nn.qlinear import QLinear
+        except ImportError:
+            return
+
+        if getattr(QLinear, "_rs_dtype_patched", False):
+            return
+
+        _orig_forward = QLinear.forward
+
+        def _patched_forward(self, input):
+            if input.dtype == torch.float32:
+                input = input.to(torch.bfloat16)
+            return _orig_forward(self, input)
+
+        QLinear.forward = _patched_forward
+        QLinear._rs_dtype_patched = True
+        logger.debug("Patched quanto QLinear.forward for fp32→bf16 input coercion")
+
     def _load_resume_checkpoint(self) -> None:
         """Load LoRA weights from a resume checkpoint into the current PEFT model.
 
