@@ -478,8 +478,39 @@ done
 if [ "$RS_INSTALL_OLLAMA" = "1" ]; then
     banner "Phase 5/7  Ollama (model: $OLLAMA_MODEL)"
     if ! command -v ollama >/dev/null 2>&1; then
-        log "Installing Ollama..."
-        curl -fsSL https://ollama.com/install.sh | sh
+        # Install with verify + retry. Previously this was a single
+        # `curl ... | sh` with no verification — when the install
+        # silently failed (network glitch, CDN issue, gpg verify
+        # failure), bootstrap continued without ollama in PATH and
+        # the user only discovered it broken hours later.
+        for _try in 1 2 3; do
+            log "Installing Ollama (attempt ${_try}/3)..."
+            curl -fsSL https://ollama.com/install.sh | sh || \
+                log "  install attempt ${_try} returned non-zero"
+            if command -v ollama >/dev/null 2>&1; then
+                log "Ollama installed: $(ollama --version 2>&1 | head -1)"
+                break
+            fi
+            log "  ollama binary not found after attempt ${_try}; retrying in 5s..."
+            sleep 5
+        done
+        # Final check — emit a LOUD warning if still missing so it's
+        # obvious in the log rather than buried.
+        if ! command -v ollama >/dev/null 2>&1; then
+            cat <<EOF >&2
+
+============================================================================
+==                                                                        ==
+==   WARNING: Ollama install FAILED after 3 attempts.                     ==
+==                                                                        ==
+==   Bootstrap will continue but ollama-dependent nodes will not work.   ==
+==   To install manually after bootstrap finishes, SSH in and run:        ==
+==     curl -fsSL https://ollama.com/install.sh | sh                      ==
+==                                                                        ==
+============================================================================
+EOF
+            log "WARN: ollama install failed after 3 attempts — see banner above"
+        fi
     else
         log "Ollama already installed: $(ollama --version 2>&1 | head -1)"
     fi
