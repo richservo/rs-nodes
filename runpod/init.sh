@@ -264,6 +264,33 @@ if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     exec tail -f /dev/null
 fi
 
+# -----------------------------------------------------------------------------
+# Normal-mode sshd start. Maintenance mode handles its own sshd above; the
+# normal path needs sshd too so the user can SSH in regardless of which
+# startup.sh fast-path runs after this. Host keys are persisted on the
+# volume so SSH clients don't see "host key changed" warnings.
+# -----------------------------------------------------------------------------
+mkdir -p /workspace/.ssh/host_keys /etc/ssh /run/sshd
+chmod 755 /run/sshd
+if compgen -G "/workspace/.ssh/host_keys/ssh_host_*" > /dev/null; then
+    cp -f /workspace/.ssh/host_keys/ssh_host_* /etc/ssh/
+elif compgen -G "/etc/ssh/ssh_host_*" > /dev/null; then
+    cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+else
+    ssh-keygen -A
+    cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+fi
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+
+if ! pgrep -x sshd >/dev/null 2>&1; then
+    if command -v service >/dev/null 2>&1; then
+        service ssh start 2>&1 | sed 's/^/[sshd] /' || true
+    elif [ -x /usr/sbin/sshd ]; then
+        /usr/sbin/sshd
+    fi
+fi
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #
