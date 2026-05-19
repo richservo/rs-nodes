@@ -10,6 +10,17 @@
 #   bash /workspace/startup.sh
 # Place a copy at /workspace/startup.sh once during initial volume setup
 # (see runpod/README.md for the one-time provisioning steps).
+#
+# Mode env vars (set in pod template's environment variables):
+#   SETUP=TRUE     → full warm-boot flow: git pulls, self-heal, pip
+#                    checks, ollama setup. Set on new pods and when
+#                    requirements change. Defaults FALSE.
+#   RS_NODES=TRUE  → fast launch + `git pull rs-nodes` only. Set after
+#                    pushing rs-nodes code changes you want picked up.
+#                    Defaults FALSE.
+#   both unset/FALSE → ultra-fast: activate venv, set LD_LIBRARY_PATH,
+#                    ensure ollama, exec ComfyUI. ~15s target.
+# Truthy values: TRUE, true, 1, yes, on (case-insensitive).
 
 set -euo pipefail
 
@@ -53,6 +64,48 @@ ensure_ollama_running() {
     setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
         ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
     disown 2>/dev/null || true
+}
+
+# Shared launch tail used by ultra-fast, RS_NODES-only, and the existing
+# express path. Activates the venv, recomputes LD_LIBRARY_PATH (env vars
+# don't persist across container restarts), ensures ollama is running,
+# then exec's ComfyUI as PID 1 of the script.
+launch_comfyui() {
+    if [ ! -f "$VENV/bin/python" ]; then
+        log "ERROR: venv missing at $VENV — set SETUP=TRUE to provision."
+        exit 1
+    fi
+    # shellcheck disable=SC1091
+    source "$VENV/bin/activate"
+
+    NV_LIB_PATHS=$(python -c "
+import nvidia, os
+r = os.path.dirname(nvidia.__file__)
+print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
+               if os.path.isdir(os.path.join(r, d, 'lib'))))
+" 2>/dev/null || echo "")
+    if [ -n "$NV_LIB_PATHS" ]; then
+        export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+
+    ensure_ollama_running
+
+    cd "$COMFY_DIR"
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
+    if [ "$COMFY_EXTRA_ARGS" = "NONE" ] || [ "$COMFY_EXTRA_ARGS" = "none" ]; then
+        COMFY_EXTRA_ARGS=""
+    fi
+    log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
+    exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
+}
+
+# Truthy-check helper for SETUP / RS_NODES env vars.
+# TRUE / true / 1 / yes / on all enable; anything else (including unset) disables.
+_is_truthy() {
+    case "${1,,}" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 log "rs-nodes pod startup beginning at $(date -Is)"
@@ -134,6 +187,57 @@ elif [ -s /root/.ssh/authorized_keys ]; then
 else
     log "WARN: no authorized_keys found anywhere — SSH key auth will fail"
 fi
+
+# -----------------------------------------------------------------------------
+# Mode selection — explicit env-var gating so warm boots can take ~15s
+# instead of 15-20 minutes. Up to this point we've done DNS + sshd + keys
+# (essential for SSH access regardless of mode); everything below is
+# gated on what the user actually wants to refresh.
+#
+#   SETUP=TRUE     → full warm-boot flow (git pulls, self-heal, pip
+#                    checks, ollama setup). Use after pod creation or
+#                    when requirements.txt has changed.
+#   RS_NODES=TRUE  → fast launch + `git pull rs-nodes` only. Use after
+#                    pushing rs-nodes code changes you want picked up.
+#   both unset/FALSE → ultra-fast: activate venv, set LD_LIBRARY_PATH,
+#                    ensure ollama, exec ComfyUI. Target: ~15s.
+#
+# Typical workflow:
+#   New pod first boot:    SETUP=TRUE RS_NODES=TRUE  (full provision)
+#   After rs-nodes commit: RS_NODES=TRUE only         (pull + relaunch)
+#   Steady state:          both unset                 (kill main → 15s)
+#
+# Accepts TRUE / true / 1 / yes / on (case-insensitive) as truthy.
+# -----------------------------------------------------------------------------
+MODE_SETUP=FALSE
+MODE_RS_NODES=FALSE
+_is_truthy "${SETUP:-FALSE}" && MODE_SETUP=TRUE
+_is_truthy "${RS_NODES:-FALSE}" && MODE_RS_NODES=TRUE
+log "Mode: SETUP=$MODE_SETUP, RS_NODES=$MODE_RS_NODES"
+
+if [ "$MODE_SETUP" != "TRUE" ]; then
+    if [ "$MODE_RS_NODES" = "TRUE" ]; then
+        log "RS_NODES fast mode: pulling rs-nodes then launching."
+        if [ -d "$RS_NODES_DIR/.git" ]; then
+            git -C "$RS_NODES_DIR" pull --ff-only 2>&1 | sed 's/^/  /' || \
+                log "WARN: rs-nodes pull failed"
+            git -C "$RS_NODES_DIR" submodule update --init --recursive 2>&1 | sed 's/^/  /' || \
+                log "WARN: submodule update failed"
+            # Mirror runpod helper scripts so updates land without a re-bootstrap
+            if [ -d "$RS_NODES_DIR/runpod" ]; then
+                cp -f "$RS_NODES_DIR/runpod/"*.sh /workspace/ 2>/dev/null || true
+                chmod +x /workspace/*.sh 2>/dev/null || true
+            fi
+        else
+            log "WARN: RS_NODES=TRUE but $RS_NODES_DIR/.git missing — skipping pull"
+        fi
+    else
+        log "Ultra-fast mode: skipping all setup. Direct to ComfyUI."
+    fi
+    launch_comfyui "$@"
+fi
+
+log "SETUP=TRUE — running full warm-boot setup."
 
 # -----------------------------------------------------------------------------
 # rclone + B2 helpers — install on demand for pods that bootstrapped
