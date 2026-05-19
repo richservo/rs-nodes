@@ -35,6 +35,26 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { printf '[startup] %s\n' "$*"; }
 
+# Idempotent: start ollama in a fully-detached session if it's not
+# already running. setsid + nohup + </dev/null + disown so ollama
+# survives the parent shell exiting OR being killed (e.g. user kills
+# ComfyUI to respring). Plain `nohup ... &` was leaving ollama in
+# the same process group; parent death cascaded to ollama.
+ensure_ollama_running() {
+    [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] || return 0
+    command -v ollama >/dev/null 2>&1 || return 0
+    if pgrep -f "ollama serve" >/dev/null 2>&1; then
+        return 0
+    fi
+    export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+    export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+    mkdir -p "$OLLAMA_MODELS"
+    log "Ollama not running — starting fully-detached..."
+    setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+        ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
+    disown 2>/dev/null || true
+}
+
 log "rs-nodes pod startup beginning at $(date -Is)"
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
@@ -205,13 +225,8 @@ print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
 " 2>/dev/null || echo "")
     [ -n "$NV_LIB_PATHS" ] && export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    # Spawn ollama in background (best effort)
-    if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] && command -v ollama >/dev/null 2>&1; then
-        export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
-        export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
-        nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
-            ollama serve >/workspace/ollama.log 2>&1 &
-    fi
+    # Ensure ollama running (detached, survives ComfyUI kill)
+    ensure_ollama_running
 
     cd "$COMFY_DIR"
     COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS-}"
@@ -432,9 +447,8 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
     mkdir -p "$OLLAMA_MODELS"
-    log "Starting Ollama in the background..."
-    nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
-        ollama serve >/workspace/ollama.log 2>&1 &
+    log "Starting Ollama (idempotent, detached)..."
+    ensure_ollama_running
 
     # Ollama models marker — only do first-time wait+pull if the marker
     # is missing AND the models aren't already on disk. Auto-detects
