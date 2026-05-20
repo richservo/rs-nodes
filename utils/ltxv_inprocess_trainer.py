@@ -276,20 +276,18 @@ class InProcessTrainer:
         if self._ffn_chunks > 0:
             self._apply_ffn_chunking()
 
-        # Step 5: move model to GPU (or set up layer offloading)
+        # Step 5: move model to GPU + install per-block checkpointing.
+        # We always use the same checkpoint machinery so gradient checkpointing
+        # works regardless of mode — only the CPU-offload step is conditional.
+        from .ltxv_layer_offload import setup_layer_offloading
         if self._layer_offloading:
-            from .ltxv_layer_offload import setup_layer_offloading
             logger.info("Setting up layer offloading (blocks stream CPU↔GPU one at a time)...")
-            self._transformer.train()
-            setup_layer_offloading(self._transformer, device)
-            self._embeddings_processor.to(device)
-            self._embeddings_processor.eval()
         else:
-            logger.info(f"Moving full transformer to GPU (quantization={self._quantization or 'none'})...")
-            self._transformer.to(device)
-            self._transformer.train()
-            self._embeddings_processor.to(device)
-            self._embeddings_processor.eval()
+            logger.info(f"Setting up per-block grad checkpointing on GPU (quantization={self._quantization or 'none'})...")
+        self._transformer.train()
+        setup_layer_offloading(self._transformer, device, offload=self._layer_offloading)
+        self._embeddings_processor.to(device)
+        self._embeddings_processor.eval()
         logger.info(
             f"VRAM after model setup: {torch.cuda.memory_allocated() / 1024**3:.1f} GB allocated, "
             f"{torch.cuda.memory_reserved() / 1024**3:.1f} GB reserved"

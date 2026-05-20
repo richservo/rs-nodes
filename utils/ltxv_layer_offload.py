@@ -26,36 +26,49 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class _OffloadCheckpointFn(torch.autograd.Function):
-    """Runs a single transformer block with combined offloading + checkpointing.
+    """Runs a single transformer block with gradient checkpointing.
 
-    Forward:  load block → clone inputs → run (no_grad) → evict → return detached
-    Backward: load block → recompute forward (with grad) → backward → evict
+    Two modes (selected by ``ctx.offload``):
+      offload=True   — block lives on CPU, streamed to GPU for forward
+                       then evicted. Saved hidden states go to CPU too.
+                       Use on low-VRAM GPUs (16GB).
+      offload=False  — block stays on GPU; only the checkpointing logic
+                       (recompute activations in backward) is used. Saved
+                       hidden states stay on GPU (cheap relative to the
+                       activations we're avoiding). Use on big-VRAM GPUs.
+
+    Both modes give checkpointed memory savings — the difference is just
+    whether block parameters move between CPU and GPU.
     """
 
     @staticmethod
-    def forward(ctx, vx, ax, block, block_kwargs, device, has_audio, block_idx):
+    def forward(ctx, vx, ax, block, block_kwargs, device, has_audio, block_idx, offload):
         # Clone inputs BEFORE the block mutates them in-place (addcmul_ etc.)
         # IMPORTANT: always clone both — never return an input tensor from
         # a custom Function (PyTorch forbids it and silently breaks the graph).
-        # Save on CPU — all 48 blocks' saved tensors coexist during forward,
-        # and keeping them on GPU would accumulate ~5 GB of hidden states.
+        # With offloading, save on CPU (~5GB of hidden states would otherwise
+        # accumulate). Without offloading, save on GPU — cheap.
+        save_device = "cpu" if offload else device
         ctx.save_for_backward(
-            vx.detach().clone().to("cpu", non_blocking=True),
-            ax.detach().clone().to("cpu", non_blocking=True),
+            vx.detach().clone().to(save_device, non_blocking=True),
+            ax.detach().clone().to(save_device, non_blocking=True),
         )
         ctx.block = block
         ctx.block_kwargs = block_kwargs
         ctx.device = device
         ctx.has_audio = has_audio
         ctx.block_idx = block_idx
+        ctx.offload = offload
 
-        block.to(device, non_blocking=True)
-        torch.cuda.synchronize(device)
+        if offload:
+            block.to(device, non_blocking=True)
+            torch.cuda.synchronize(device)
 
         with torch.no_grad():
             out_vx, out_ax = block((vx, ax), **block_kwargs)
 
-        block.to("cpu", non_blocking=True)
+        if offload:
+            block.to("cpu", non_blocking=True)
 
         # Always return NEW tensors (detached from block's no_grad graph).
         # The Function mechanism re-attaches grad_fn to these.
@@ -67,6 +80,7 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         block = ctx.block
         device = ctx.device
         has_audio = ctx.has_audio
+        offload = getattr(ctx, "offload", True)
 
         # Periodically clear VRAM cache during backward to prevent
         # fragmentation-induced OOM (which runs in C++ autograd and
@@ -76,11 +90,12 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         if block_idx >= 0 and block_idx % 12 == 0:
             torch.cuda.empty_cache()
 
-        block.to(device, non_blocking=True)
-        # Move saved hidden states back to GPU for recomputation
-        saved_vx = saved_vx.to(device, non_blocking=True)
-        saved_ax = saved_ax.to(device, non_blocking=True)
-        torch.cuda.synchronize(device)
+        if offload:
+            block.to(device, non_blocking=True)
+            # Move saved hidden states back to GPU for recomputation
+            saved_vx = saved_vx.to(device, non_blocking=True)
+            saved_ax = saved_ax.to(device, non_blocking=True)
+            torch.cuda.synchronize(device)
 
         # Create leaf tensors for gradient tracking.
         vx_leaf = saved_vx.detach().requires_grad_(True)
@@ -144,27 +159,30 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         ax_grad_out = input_grads[1] if has_audio else None
         param_grads = input_grads[len(inputs_list):]
 
-        # Collect param grads on GPU, then move block to CPU
+        # Collect param grads on GPU; keep on GPU if not offloading.
+        # AdamW reads .grad from whatever device the param is on.
         grad_map = {}
+        target_grad_device = "cpu" if offload else device
         for p, g in zip(param_list, param_grads):
             if g is not None:
-                grad_map[p] = g.to("cpu", non_blocking=True)
+                grad_map[p] = g.to(target_grad_device, non_blocking=True)
 
-        block.to("cpu", non_blocking=True)
+        if offload:
+            block.to("cpu", non_blocking=True)
         torch.cuda.synchronize(device)
 
-        # Accumulate into .grad on CPU (AdamW reads from .grad)
+        # Accumulate into .grad
         for p, g in grad_map.items():
             if p.grad is None:
                 p.grad = g
             else:
                 p.grad.add_(g)
 
-        # Returns for: vx, ax, block, block_kwargs, device, has_audio, block_idx
+        # Returns for: vx, ax, block, block_kwargs, device, has_audio, block_idx, offload
         return (
             vx_grad_out,
             ax_grad_out,
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         )
 
 
@@ -226,13 +244,14 @@ def _offloaded_process_blocks(
         a_prompt_timestep=a_prompt_timestep,
     )
 
+    offload = getattr(model, "_offload_blocks", True)
     for i, block in enumerate(model.transformer_blocks):
         # Pass the real ax (even if empty) — the block checks ax.numel() > 0
         # to decide whether to run audio processing.
         cur_ax = ax
 
         new_vx, new_ax = _OffloadCheckpointFn.apply(
-            vx, cur_ax, block, block_kwargs, device, has_audio, i,
+            vx, cur_ax, block, block_kwargs, device, has_audio, i, offload,
         )
 
         vx = new_vx
@@ -246,17 +265,21 @@ def _offloaded_process_blocks(
 # Public API
 # ---------------------------------------------------------------------------
 
-def setup_layer_offloading(peft_model, device: torch.device) -> None:
-    """Enable layer offloading on an LTX-2 transformer (PEFT-wrapped or plain).
+def setup_layer_offloading(peft_model, device: torch.device, offload: bool = True) -> None:
+    """Enable per-block gradient checkpointing (with optional CPU offloading).
 
     - Moves non-block parameters (patchify, adaln, proj_out, etc.) to GPU.
-    - Keeps transformer blocks on CPU.
-    - Monkey-patches ``_process_transformer_blocks`` so that each forward/
-      backward pass streams one block at a time.
+    - If offload=True: keeps blocks on CPU, streamed to GPU per step.
+    - If offload=False: keeps blocks on GPU; only the checkpointing logic
+      runs (forward recomputed in backward). Saves activation memory
+      without paying PCIe cost.
+    - Monkey-patches ``_process_transformer_blocks`` so every forward/
+      backward goes through ``_OffloadCheckpointFn``.
 
     Args:
         peft_model: The transformer (possibly wrapped by PEFT ``get_peft_model``).
         device: Target GPU device.
+        offload: True = stream blocks CPU↔GPU; False = stay on GPU.
     """
     # Resolve through PEFT wrapper to the raw model
     base = peft_model
@@ -279,18 +302,27 @@ def setup_layer_offloading(peft_model, device: torch.device) -> None:
         if name != "transformer_blocks":
             child.to(device)
 
-    # Ensure all blocks are on CPU
+    # Place blocks based on mode
+    block_device = "cpu" if offload else device
     for block in blocks:
-        block.to("cpu")
+        block.to(block_device)
 
-    # Store device reference for the patched function
+    # Store config for the patched function
     base._offload_device = device
+    base._offload_blocks = offload
 
-    logger.info(
-        f"Layer offloading enabled: {num_blocks} blocks on CPU, "
-        f"non-block params on GPU. "
-        f"VRAM after setup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB"
-    )
+    if offload:
+        logger.info(
+            f"Layer offloading enabled: {num_blocks} blocks on CPU, "
+            f"non-block params on GPU. "
+            f"VRAM after setup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB"
+        )
+    else:
+        logger.info(
+            f"Per-block gradient checkpointing enabled (no CPU offload): "
+            f"{num_blocks} blocks resident on GPU. "
+            f"VRAM after setup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB"
+        )
 
     # Monkey-patch the block loop
     base._process_transformer_blocks = types.MethodType(
