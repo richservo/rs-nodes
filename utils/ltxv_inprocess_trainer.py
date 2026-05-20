@@ -1462,11 +1462,17 @@ class InProcessTrainer:
     def _save_final_lora(self) -> Path:
         """Save the final LoRA weights to the ComfyUI loras folder.
 
+        Filename includes the step count (e.g. ``Lotte_step_01500.safetensors``)
+        so successive saves never overwrite each other — you can interrupt
+        at any step and keep the artifact.
+
         If training was stopped by divergence detection, copies the
         pre-divergence checkpoint instead of the current (diverged) weights.
         """
         self._loras_dir.mkdir(parents=True, exist_ok=True)
-        dest = self._loras_dir / f"{self._lora_name}.safetensors"
+        step = self._global_step
+        suffixed_name = f"{self._lora_name}_step_{step:05d}.safetensors"
+        dest = self._loras_dir / suffixed_name
 
         # If divergence stopped training, use the pre-divergence checkpoint
         diverge_ckpt = getattr(self, "_diverge_final_ckpt", None)
@@ -1474,15 +1480,15 @@ class InProcessTrainer:
             print(f"[divergence] Saving pre-divergence checkpoint as final LoRA: {diverge_ckpt}")
             shutil.copy2(diverge_ckpt, dest)
             # Also copy to output dir for consistency
-            shutil.copy2(diverge_ckpt, self._output_dir / f"{self._lora_name}.safetensors")
+            shutil.copy2(diverge_ckpt, self._output_dir / suffixed_name)
             return dest
 
         from safetensors.torch import save_file
 
         # Write to output_dir first
-        final_in_output = self._output_dir / f"{self._lora_name}.safetensors"
+        final_in_output = self._output_dir / suffixed_name
         state_dict = self._extract_lora_state_dict()
-        save_file(state_dict, final_in_output, metadata={"steps": str(self._total_steps)})
+        save_file(state_dict, final_in_output, metadata={"steps": str(step)})
 
         # Copy to loras folder
         shutil.copy2(final_in_output, dest)
