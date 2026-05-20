@@ -52,18 +52,72 @@ _is_truthy() {
 }
 
 ensure_ollama_running() {
-    [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] || return 0
-    command -v ollama >/dev/null 2>&1 || return 0
-    if pgrep -f "ollama serve" >/dev/null 2>&1; then
-        return 0
-    fi
+    # Never propagate failure — ollama issues should not abort ComfyUI
+    # launch. Errors are logged loudly; check the log to diagnose.
+    _ensure_ollama_inner || log "ollama: continuing without ollama (RSPromptFormatter will fail)"
+    return 0
+}
+
+_ensure_ollama_inner() {
+    [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] || { log "ollama: disabled via RS_INSTALL_OLLAMA=0"; return 0; }
+
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
     mkdir -p "$OLLAMA_MODELS"
-    log "Starting ollama (detached)..."
+
+    # 1. Install binary if missing. Official installer puts it at
+    #    /usr/local/bin/ollama which lives on the CONTAINER disk and
+    #    gets wiped every container restart, so this runs often.
+    if ! command -v ollama >/dev/null 2>&1; then
+        log "ollama: binary missing — installing..."
+        local _try
+        for _try in 1 2 3; do
+            curl -fsSL https://ollama.com/install.sh | sh 2>&1 | sed 's/^/[ollama-install] /' || true
+            if command -v ollama >/dev/null 2>&1; then
+                log "ollama: installed ($(ollama --version 2>&1 | head -1))"
+                break
+            fi
+            log "ollama: install attempt ${_try}/3 failed; retrying in 3s..."
+            sleep 3
+        done
+        if ! command -v ollama >/dev/null 2>&1; then
+            log "ollama: ERROR — install failed after 3 attempts."
+            return 1
+        fi
+    else
+        log "ollama: binary present ($(ollama --version 2>&1 | head -1))"
+    fi
+
+    # 2. If already running, healthcheck before returning.
+    if pgrep -f "ollama serve" >/dev/null 2>&1; then
+        if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+            log "ollama: already running and healthy on ${OLLAMA_HOST}"
+            return 0
+        fi
+        log "ollama: process exists but API unreachable — killing and restarting..."
+        pkill -f "ollama serve" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # 3. Launch fully-detached so it survives ComfyUI death.
+    log "ollama: starting (OLLAMA_MODELS=$OLLAMA_MODELS, OLLAMA_HOST=$OLLAMA_HOST)..."
     setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
         ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
     disown 2>/dev/null || true
+
+    # 4. Wait for the API to come up. Up to 30s.
+    local _i
+    for _i in $(seq 1 15); do
+        if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+            log "ollama: API up after $((_i * 2))s on ${OLLAMA_HOST}"
+            return 0
+        fi
+        sleep 2
+    done
+
+    log "ollama: ERROR — server didn't come up in 30s. Tail of /workspace/ollama.log:"
+    tail -20 /workspace/ollama.log 2>&1 | sed 's/^/[ollama-log] /' || true
+    return 1
 }
 
 launch_comfy() {
