@@ -308,23 +308,28 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
     OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 
-    # 1. Install if missing (download tarball directly to /workspace — no
-    #    /usr/local writes, no systemd unit, just the binary).
+    # 1. Install if missing — use the official install script with
+    #    OLLAMA_INSTALL_DIR override so it lands on /workspace (persistent
+    #    across container restarts). The script handles URL resolution,
+    #    GPU runner downloads, and architecture detection — we don't have
+    #    to track the actual tarball path (which moves between versions).
     if [ ! -x "$OLLAMA_BIN" ]; then
         echo "[init] ollama: installing to $OLLAMA_DIR (persistent — only happens once)"
-        mkdir -p "$OLLAMA_DIR"
+        mkdir -p "$OLLAMA_DIR/bin" "$OLLAMA_DIR/lib"
         OLLAMA_INSTALLED=0
         for _ot in 1 2 3; do
-            if curl -fsSL --max-time 300 \
-                "https://ollama.com/download/ollama-linux-amd64.tgz" -o /tmp/ollama.tgz \
-                && tar -xzf /tmp/ollama.tgz -C "$OLLAMA_DIR" 2>/dev/null; then
-                rm -f /tmp/ollama.tgz
-                OLLAMA_INSTALLED=1
-                echo "[init] ollama: installed"
-                break
+            # Skip systemd setup (none in containers) by setting the
+            # SYSTEMCTL_SKIP_REDIRECT env, and target our prefix dir.
+            if OLLAMA_INSTALL_DIR="$OLLAMA_DIR" \
+               curl -fsSL --max-time 600 https://ollama.com/install.sh | \
+               OLLAMA_INSTALL_DIR="$OLLAMA_DIR" sh 2>&1 | sed 's/^/[ollama-install] /'; then
+                if [ -x "$OLLAMA_BIN" ]; then
+                    OLLAMA_INSTALLED=1
+                    echo "[init] ollama: installed"
+                    break
+                fi
             fi
             echo "[init] ollama: install attempt ${_ot}/3 failed, retrying in 5s"
-            rm -f /tmp/ollama.tgz
             sleep 5
         done
         if [ "$OLLAMA_INSTALLED" != "1" ]; then
