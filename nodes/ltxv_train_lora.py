@@ -161,6 +161,7 @@ class RSLTXVTrainLoRA:
                                                      "tooltip": "Multiply LR by this factor each cycle reset. 1.0 = no decay, 0.8 = 20% reduction per cycle."}),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                 "ffn_chunks":             ("INT",     {"default": 0, "min": 0, "max": 16, "step": 1, "tooltip": "Split FFN layers into N chunks along sequence dim to reduce peak VRAM. 0 = disabled, 4 = good default. Trades speed for memory."}),
+                "layer_offloading":       (["auto", "on", "off"], {"default": "auto", "tooltip": "Stream transformer blocks CPU↔GPU one at a time. ON saves ~10GB VRAM but slow on PCIe; OFF keeps everything on GPU (fast, needs ~30GB+). AUTO = ON below 32GB free VRAM, OFF above."}),
                 # Quantization
                 "quantization": (["fp8-quanto", "int8-quanto", "int4-quanto", "none"], {"default": "fp8-quanto", "tooltip": "fp8 recommended (no C++ build tools needed). int4/int2 require 'pip install ninja' + C++ compiler."}),
                 # Strategy
@@ -205,6 +206,30 @@ class RSLTXVTrainLoRA:
     def IS_CHANGED(cls, **kwargs):
         # Always re-execute — training is never cacheable
         return float("nan")
+
+    @staticmethod
+    def _resolve_layer_offloading(setting: str) -> bool:
+        """Resolve "auto"/"on"/"off" to a bool. Auto = ON below 32GB free
+        VRAM, OFF above. The 22B model fp8-quantized + LoRA + activations
+        + optimizer fit in ~30GB; below that, layer offloading is needed."""
+        s = (setting or "auto").lower()
+        if s == "on":
+            return True
+        if s == "off":
+            return False
+        # auto
+        import torch
+        if not torch.cuda.is_available():
+            return True
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free_gb = (torch.cuda.mem_get_info()[0]) / 1024**3
+        # Use the larger of "total minus a 4GB safety margin" and "currently free"
+        # so a fresh cold GPU isn't penalized for stale allocations.
+        usable_gb = max(total_gb - 4.0, free_gb)
+        offload = usable_gb < 32.0
+        print(f"[RSLTXVTrainLoRA] layer_offloading=auto → {'ON' if offload else 'OFF'} "
+              f"(total={total_gb:.1f}GB, free={free_gb:.1f}GB, usable={usable_gb:.1f}GB)")
+        return offload
 
     @staticmethod
     def _find_latest_checkpoint(output_dir: Path) -> str:
@@ -258,6 +283,7 @@ class RSLTXVTrainLoRA:
         lr_cycle_decay: float = 1.0,
         gradient_checkpointing: bool = True,
         ffn_chunks: int = 0,
+        layer_offloading: str = "auto",
         quantization: str = "fp8-quanto",
         strategy: str = "text_to_video",
         first_frame_conditioning_p: float = 0.5,
@@ -537,7 +563,7 @@ class RSLTXVTrainLoRA:
             vocoder=vocoder,
             seed=42,
             resume_checkpoint=self._find_latest_checkpoint(output_dir) if resume else "",
-            layer_offloading=True,
+            layer_offloading=self._resolve_layer_offloading(layer_offloading),
             node_id=str(unique_id) if unique_id is not None else "",
             ffn_chunks=ffn_chunks,
         )
