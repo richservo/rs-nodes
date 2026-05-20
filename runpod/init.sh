@@ -291,6 +291,81 @@ if ! pgrep -x sshd >/dev/null 2>&1; then
     fi
 fi
 
+# -----------------------------------------------------------------------------
+# Ollama install + start. Lives here in init.sh (fetched fresh from GitHub
+# every boot via the Container Start Command) so it can't go stale, runs on
+# EVERY boot regardless of which startup.sh/bootstrap.sh path runs after.
+#
+# Binary lives at /workspace/.ollama-install (persistent network volume) so
+# after first-boot install it never needs to be reinstalled — every later
+# boot just symlinks and starts. ~5min first boot, ~3s every boot after.
+#
+# Skipped if RS_INSTALL_OLLAMA=0.
+# -----------------------------------------------------------------------------
+if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
+    OLLAMA_DIR="/workspace/.ollama-install"
+    OLLAMA_BIN="$OLLAMA_DIR/bin/ollama"
+    OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
+    OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+
+    # 1. Install if missing (download tarball directly to /workspace — no
+    #    /usr/local writes, no systemd unit, just the binary).
+    if [ ! -x "$OLLAMA_BIN" ]; then
+        echo "[init] ollama: installing to $OLLAMA_DIR (persistent — only happens once)"
+        mkdir -p "$OLLAMA_DIR"
+        OLLAMA_INSTALLED=0
+        for _ot in 1 2 3; do
+            if curl -fsSL --max-time 300 \
+                "https://ollama.com/download/ollama-linux-amd64.tgz" -o /tmp/ollama.tgz \
+                && tar -xzf /tmp/ollama.tgz -C "$OLLAMA_DIR" 2>/dev/null; then
+                rm -f /tmp/ollama.tgz
+                OLLAMA_INSTALLED=1
+                echo "[init] ollama: installed"
+                break
+            fi
+            echo "[init] ollama: install attempt ${_ot}/3 failed, retrying in 5s"
+            rm -f /tmp/ollama.tgz
+            sleep 5
+        done
+        if [ "$OLLAMA_INSTALLED" != "1" ]; then
+            echo "[init] ollama: ERROR — install failed after 3 attempts"
+        fi
+    else
+        echo "[init] ollama: present at $OLLAMA_BIN"
+    fi
+
+    # 2. Symlink to /usr/local/bin so plain `ollama` resolves everywhere.
+    #    /usr/local/bin lives on the container disk and gets wiped, so this
+    #    runs every boot (idempotent: -f overwrites the symlink).
+    if [ -x "$OLLAMA_BIN" ]; then
+        ln -sf "$OLLAMA_BIN" /usr/local/bin/ollama 2>/dev/null || true
+    fi
+
+    # 3. Start the server if it isn't already running. Fully detached so it
+    #    survives ComfyUI dying.
+    if [ -x "$OLLAMA_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+        mkdir -p "$OLLAMA_MODELS_VAL"
+        echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL"
+        setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS_VAL" OLLAMA_HOST="$OLLAMA_HOST_VAL" \
+            "$OLLAMA_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
+        disown 2>/dev/null || true
+    fi
+
+    # 4. Healthcheck — wait up to 20s for API.
+    if [ -x "$OLLAMA_BIN" ]; then
+        for _oi in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
+                echo "[init] ollama: API up on $OLLAMA_HOST_VAL"
+                break
+            fi
+            sleep 2
+        done
+        if ! curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
+            echo "[init] ollama: WARN — server didn't respond after 20s; check /workspace/ollama.log"
+        fi
+    fi
+fi
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #
