@@ -1431,10 +1431,18 @@ class RSLTXVGenerate:
                             f"Audio polish gate: audio_latent_out={audio_latent_out is not None}, "
                             f"audio_is_input={audio_is_input}, "
                             f"curve_used={_curve_used!r}, "
-                            f"upscale_steps={upscale_steps}, upscale_denoise={upscale_denoise}"
+                            f"upscale_steps={upscale_steps}, upscale_denoise={upscale_denoise}, "
+                            f"iclora={_iclora_has_control}"
                         )
+                        # SKIP audio polish entirely on IC-LoRA paths. IC-LoRA's
+                        # structural conditioning + extra guide-injection passes
+                        # make the polish step's silent overrides + sigma-schedule
+                        # surprises much more likely to throw the output way off.
+                        # User preference is: only 20-step main + 8-step upscale
+                        # rediffusion for IC-LoRA, nothing else that can affect output.
                         if (audio_latent_out is not None
                                 and not audio_is_input
+                                and not _iclora_has_control
                                 and _curve_used == "scaled"
                                 and upscale_steps > 0 and upscale_denoise > 0):
                             logger.info("Audio polish pass: shifted sigmas on audio, video frozen")
