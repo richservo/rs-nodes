@@ -1245,6 +1245,18 @@ class RSLTXVGenerate:
                             )
                             up_guider._current_rediff_pass = _rediff_i
                             up_guider._total_rediff_passes = _rediff_passes
+                            # Mark all subsequent .sample() calls on this guider as
+                            # using user-provided sigmas. The upscale rediffusion and
+                            # audio polish build their schedules from upscale_steps +
+                            # upscale_denoise — when denoise < 1.0, those sigmas start
+                            # below 1.0, which the distilled-mode auto-detector in
+                            # MultimodalGuider.sample() misclassifies as "default
+                            # fallback" and silently substitutes DISTILLED_SIGMAS
+                            # (8 fixed steps). That replacement ignored both
+                            # upscale_steps AND upscale_denoise — explains "CRAZY
+                            # outputs" symptom. Setting this flag bypasses the
+                            # auto-detect and honors our built sigmas verbatim.
+                            up_guider._user_provided_sigmas = True
                         else:
                             up_guider = comfy.samplers.CFGGuider(up_model)
                             up_guider.set_conds(positive, negative)
