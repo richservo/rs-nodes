@@ -276,16 +276,39 @@ class InProcessTrainer:
         if self._ffn_chunks > 0:
             self._apply_ffn_chunking()
 
-        # Step 5: move model to GPU + install per-block checkpointing.
-        # We always use the same checkpoint machinery so gradient checkpointing
-        # works regardless of mode — only the CPU-offload step is conditional.
+        # Step 5: move model to GPU. Three paths:
+        #   1. layer_offloading=True  → install per-block CPU↔GPU streaming
+        #      (blocks live on CPU, swapped to GPU one at a time). Mandatory
+        #      on low-VRAM (16GB) GPUs.
+        #   2. layer_offloading=False, gradient_checkpointing=True → install
+        #      per-block GPU-resident grad checkpointing (forward under
+        #      no_grad, recomputed in backward).
+        #   3. layer_offloading=False, gradient_checkpointing=False → SKIP
+        #      the per-block wrapper entirely. Model uses its default block
+        #      iteration with full activation residency. Highest throughput
+        #      — only viable when VRAM headroom exists (big-VRAM GPUs).
+        #
+        # The autograd Function wrapper used in paths 1 and 2 has ~150-250ms
+        # of Python overhead per block × 48 blocks × 2 (recompute) which on
+        # an H100 dominates total step time, so skipping it on path 3 gives
+        # a 4-8× step-time speedup when the user can spare the VRAM.
         from .ltxv_layer_offload import setup_layer_offloading
-        if self._layer_offloading:
-            logger.info("Setting up layer offloading (blocks stream CPU↔GPU one at a time)...")
-        else:
-            logger.info(f"Setting up per-block grad checkpointing on GPU (quantization={self._quantization or 'none'})...")
+        bypass_wrapper = (not self._layer_offloading) and (not self._gradient_checkpointing)
         self._transformer.train()
-        setup_layer_offloading(self._transformer, device, offload=self._layer_offloading)
+        if bypass_wrapper:
+            logger.info(
+                f"Full GPU residency — no per-block wrapper "
+                f"(quantization={self._quantization or 'none'}). "
+                f"All activations stay resident; expect significantly higher VRAM "
+                f"and significantly lower step time."
+            )
+            self._transformer.to(device)
+        else:
+            if self._layer_offloading:
+                logger.info("Setting up layer offloading (blocks stream CPU↔GPU one at a time)...")
+            else:
+                logger.info(f"Setting up per-block grad checkpointing on GPU (quantization={self._quantization or 'none'})...")
+            setup_layer_offloading(self._transformer, device, offload=self._layer_offloading)
         self._embeddings_processor.to(device)
         self._embeddings_processor.eval()
         logger.info(
