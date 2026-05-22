@@ -134,19 +134,19 @@ for entry in "${MODELS[@]}"; do
 done
 echo
 
-if [ "$missing_count" -eq 0 ]; then
-    echo "Everything in the manifest is already present. Nothing to download."
-    exit 0
-fi
-
 # ----------------------------------------------------------------------------
-# Phase 2: download missing
+# Phase 2: download missing models (skipped if nothing missing)
 # ----------------------------------------------------------------------------
-echo "=== Downloading $missing_count missing file(s) ==="
-echo "(safe: existing files are never touched)"
-echo
 ok_count=0
 fail_count=0
+if [ "$missing_count" -eq 0 ]; then
+    echo "All models already present — skipping model download phase."
+    echo
+else
+    echo "=== Downloading $missing_count missing file(s) ==="
+    echo "(safe: existing files are never touched)"
+    echo
+fi
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r subdir name repo_id repo_path <<< "$entry"
     dir="$MODELS_ROOT/$subdir"
