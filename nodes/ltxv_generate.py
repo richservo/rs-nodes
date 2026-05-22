@@ -1820,7 +1820,36 @@ class RSLTXVGenerate:
                         torch.cuda.empty_cache()
                         mm.soft_empty_cache()
 
-                        up_combined = upsampled
+                        # Include audio as conditioning during Pass 3.
+                        # Previous behaviour dropped audio entirely (up_combined
+                        # = upsampled), so the model had no cross-modal signal
+                        # at the final upscale -- LipDub / any AV LoRA cannot
+                        # do its job without the audio context. NOT an
+                        # audio-only rediffusion (the polish pass remains
+                        # skipped) -- the audio mask is 0 for input audio so
+                        # it's held as conditioning without being regenerated.
+                        if has_audio and audio_latent_out is not None:
+                            up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
+                            up_audio_mask_val = 0.0 if audio_is_input else 1.0
+                            up_audio_mask = torch.full_like(audio_latent_out[:, :1], up_audio_mask_val)
+                            if up_noise_mask is None:
+                                up_video_noise_mask = torch.ones(
+                                    upsampled.shape[0], 1, upsampled.shape[2], 1, 1,
+                                    device=upsampled.device, dtype=upsampled.dtype,
+                                )
+                                up_noise_mask = comfy.nested_tensor.NestedTensor(
+                                    (up_video_noise_mask, up_audio_mask)
+                                )
+                            else:
+                                up_noise_mask = comfy.nested_tensor.NestedTensor(
+                                    (up_noise_mask, up_audio_mask)
+                                )
+                            logger.info(
+                                f"Pass 3: audio included as conditioning "
+                                f"(audio_is_input={audio_is_input}, audio_mask={up_audio_mask_val})"
+                            )
+                        else:
+                            up_combined = upsampled
                         up_model = m.clone()
                         if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
                             lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
@@ -1877,6 +1906,12 @@ class RSLTXVGenerate:
                         if up_samples.is_nested:
                             up_parts = up_samples.unbind()
                             output_latent = {"samples": up_parts[0]}
+                            # Audio was included as conditioning above; for
+                            # input audio (mask=0) parts[1] is byte-identical
+                            # to what we fed in. For generated audio (mask=1)
+                            # it's the refined version -- capture either way.
+                            if len(up_parts) > 1:
+                                audio_latent_out = up_parts[1]
                         else:
                             output_latent = {"samples": up_samples}
 
