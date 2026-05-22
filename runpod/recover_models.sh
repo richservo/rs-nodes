@@ -45,6 +45,14 @@ set -eu
 # or corrupted (re-download with: curl -fSL ... -o /workspace/recover_models.sh)
 echo "[recover] Starting recover_models.sh (PID $$)"
 
+# Auto-prepend venv/bin to PATH so `hf` resolves without the user
+# needing to `source /workspace/.venv/bin/activate` first. This is
+# what venv activation does at the PATH level; we don't need the
+# other env-var changes (VIRTUAL_ENV, PS1).
+if [ -x "/workspace/.venv/bin/python" ]; then
+    export PATH="/workspace/.venv/bin:$PATH"
+fi
+
 MODELS_ROOT="${MODELS_ROOT:-/workspace/ComfyUI/models}"
 echo "[recover] MODELS_ROOT=$MODELS_ROOT"
 echo "[recover] CUSTOM_NODES_ROOT=${CUSTOM_NODES_ROOT:-/workspace/ComfyUI/custom_nodes}"
