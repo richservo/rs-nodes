@@ -178,13 +178,79 @@ for entry in "${MODELS[@]}"; do
 done
 
 # ----------------------------------------------------------------------------
-# Phase 3: final report
+# Phase 3: custom-node packs. Same pattern — manifest, check, clone if
+# missing, leave existing clones alone (just `git pull` to update).
 # ----------------------------------------------------------------------------
-echo "=== Summary ==="
-echo "  Downloaded: $ok_count"
-echo "  Failed:     $fail_count"
+CUSTOM_NODES_ROOT="${CUSTOM_NODES_ROOT:-/workspace/ComfyUI/custom_nodes}"
+PIP="${COMFY_VENV_PIP:-/workspace/.venv/bin/pip}"
+
+# Format: dirname | git url
+NODE_PACKS=(
+    "ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
+    "ComfyUI-VideoHelperSuite|https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+    "comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
+    "ComfyUI_essentials|https://github.com/cubiq/ComfyUI_essentials.git"
+    "RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
+    "ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
+    "ComfyUI-Video-Depth-Anything|https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything.git"
+    # rs-nodes intentionally NOT included — managed via your RS_NODES env var workflow.
+)
+
+echo "=== Custom-node packs status ==="
+node_missing=0
+for entry in "${NODE_PACKS[@]}"; do
+    IFS='|' read -r dirname url <<< "$entry"
+    if [ -d "$CUSTOM_NODES_ROOT/$dirname/.git" ]; then
+        printf "  OK       %s\n" "$dirname"
+    else
+        printf "  MISSING  %s\n" "$dirname"
+        node_missing=$((node_missing + 1))
+    fi
+done
 echo
-echo "=== Final state ==="
+
+if [ "$node_missing" -gt 0 ]; then
+    echo "=== Cloning $node_missing missing node pack(s) ==="
+    mkdir -p "$CUSTOM_NODES_ROOT"
+    node_ok=0
+    node_fail=0
+    for entry in "${NODE_PACKS[@]}"; do
+        IFS='|' read -r dirname url <<< "$entry"
+        target="$CUSTOM_NODES_ROOT/$dirname"
+        [ -d "$target/.git" ] && continue
+        echo "→ $dirname"
+        echo "  url: $url"
+        if git clone "$url" "$target"; then
+            if [ -f "$target/requirements.txt" ] && [ -x "$PIP" ]; then
+                echo "  installing $dirname requirements..."
+                "$PIP" install --no-cache-dir -r "$target/requirements.txt" 2>&1 | sed 's/^/    /' || \
+                    echo "  WARN: pip install for $dirname returned non-zero"
+            fi
+            if [ -f "$target/install.py" ]; then
+                ( cd "$target" && /workspace/.venv/bin/python install.py ) 2>&1 | sed 's/^/    /' || true
+            fi
+            echo "  ✓ done"
+            node_ok=$((node_ok + 1))
+        else
+            echo "  ✗ FAILED to clone $url"
+            node_fail=$((node_fail + 1))
+        fi
+        echo
+    done
+    echo "Custom nodes: $node_ok cloned, $node_fail failed."
+else
+    echo "All custom-node packs already present."
+fi
+
+# ----------------------------------------------------------------------------
+# Phase 4: final report
+# ----------------------------------------------------------------------------
+echo
+echo "=== Summary ==="
+echo "  Models downloaded:  $ok_count"
+echo "  Models failed:      $fail_count"
+echo
+echo "=== Models on disk ==="
 for d in checkpoints latent_upscale_models loras text_encoders; do
     if [ -d "$MODELS_ROOT/$d" ]; then
         echo "--- $MODELS_ROOT/$d/ ---"
@@ -193,7 +259,11 @@ for d in checkpoints latent_upscale_models loras text_encoders; do
     fi
 done
 
+echo "=== Custom nodes on disk ==="
+ls -1d "$CUSTOM_NODES_ROOT"/*/ 2>/dev/null | sed 's/^/  /'
+
 if [ "$fail_count" -gt 0 ]; then
+    echo
     echo "Some downloads failed. Re-run the script — it will only retry the missing files."
     exit 1
 fi
