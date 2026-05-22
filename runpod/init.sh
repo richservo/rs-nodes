@@ -390,55 +390,33 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Auto-sync ComfyUI's pip deps. ComfyUI updates (via git pull or
-# ComfyUI-Manager) can leave the venv missing packages the new code needs
-# (e.g. comfyui_workflow_templates, NAMING_CONVENTION) — ComfyUI then
-# crashes on startup and the container loops indefinitely. Lives in
-# init.sh (not startup.sh) so it runs from the fresh-from-GitHub copy
-# every boot, not from a possibly-stale /workspace/startup.sh.
+# Dispatch: ONLY SETUP=TRUE triggers a full bootstrap. Anything else
+# (FALSE, unset, empty) runs startup.sh, which does ollama + ComfyUI
+# and nothing more. A missing .bootstrap_done marker does NOT count
+# as "needs setup" — user intent wins.
 #
-# Cheap (sha256 of requirements.txt, ~100ms) when nothing changed; runs
-# pip install only when the hash actually differs from last install.
+# On a genuinely fresh pod with no /workspace/startup.sh present, the
+# user must explicitly set SETUP=TRUE once to provision. After that,
+# every boot is fast.
 # -----------------------------------------------------------------------------
-COMFY_REQ="/workspace/ComfyUI/requirements.txt"
-COMFY_VENV_PIP="/workspace/.venv/bin/pip"
-COMFY_HASH_FILE="/workspace/.comfy_req_hash"
-if [ -f "$COMFY_REQ" ] && [ -x "$COMFY_VENV_PIP" ]; then
-    _comfy_hash=$(sha256sum "$COMFY_REQ" 2>/dev/null | cut -d' ' -f1)
-    _stored_hash=$(cat "$COMFY_HASH_FILE" 2>/dev/null || echo "")
-    if [ -n "$_comfy_hash" ] && [ "$_comfy_hash" != "$_stored_hash" ]; then
-        echo "[init] ComfyUI requirements.txt changed — syncing venv (this avoids crash loops on upstream updates)"
-        if "$COMFY_VENV_PIP" install --no-cache-dir -r "$COMFY_REQ" 2>&1 | sed 's/^/[comfy-deps] /'; then
-            echo "$_comfy_hash" > "$COMFY_HASH_FILE"
-            echo "[init] ComfyUI deps synced."
-        else
-            echo "[init] WARN: ComfyUI deps install returned non-zero; ComfyUI may not start cleanly."
-        fi
-    fi
-fi
+case "${SETUP,,}" in
+    true|1|yes|on)
+        echo "[init] SETUP=TRUE — fetching bootstrap.sh and running full provision"
+        curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
+        chmod +x "$WORKSPACE/bootstrap.sh"
+        exec bash "$WORKSPACE/bootstrap.sh"
+        ;;
+esac
 
-# Subsequent-boot fast path: bootstrap fully completed at least once
-# (marker written by bootstrap.sh at the end of Phase 6).
-#
-# We require the marker rather than just file-existence checks: a
-# partial bootstrap interrupted mid-run (e.g. user edited pod config
-# and triggered a silent reboot) leaves startup.sh and the rs-nodes
-# clone in place but skips Phase 4 (model weights). The marker tells
-# us provisioning actually finished, so it's safe to take the fast
-# path.
-if [ -f "$DONE_MARKER" ] && [ -x "$WORKSPACE/startup.sh" ]; then
-    echo "[init] $DONE_MARKER present — running startup.sh (fast path)"
+# SETUP not TRUE — run startup.sh. Period.
+if [ -x "$WORKSPACE/startup.sh" ]; then
     exec bash "$WORKSPACE/startup.sh"
 fi
 
-# First-boot OR incomplete-bootstrap path: fetch and exec bootstrap.sh.
-# bootstrap.sh is idempotent; re-running on a partial volume picks up
-# from where the last run was killed.
-if [ -x "$WORKSPACE/startup.sh" ]; then
-    echo "[init] startup.sh present but bootstrap marker missing — re-running bootstrap.sh"
-else
-    echo "[init] First boot detected — fetching bootstrap.sh"
-fi
-curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
-chmod +x "$WORKSPACE/bootstrap.sh"
-exec bash "$WORKSPACE/bootstrap.sh"
+# Genuinely fresh pod — /workspace/startup.sh doesn't exist yet, and
+# user hasn't set SETUP=TRUE. Bail with a clear message instead of
+# silently bootstrapping.
+echo "[init] ERROR: /workspace/startup.sh missing and SETUP != TRUE."
+echo "[init]        This pod has not been provisioned yet. Set SETUP=TRUE in pod env vars,"
+echo "[init]        restart the container once, then change it back to FALSE/unset."
+exit 1
