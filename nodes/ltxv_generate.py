@@ -989,34 +989,40 @@ class RSLTXVGenerate:
         # Triggered automatically when lora_name_2 was set on the IC-LoRA
         # guider node. Stacking two IC-LoRAs makes their attention deltas
         # fight, so we run them sequentially instead: Pass A above (LoRA
-        # #1, full 20-step + 8-step rediff), then Pass B here (LoRA #2,
-        # full 20-step + 8-step rediff) using Pass A's final latent as
-        # the IC-LoRA guide. For dsf=1 LoRAs (e.g. LipDub), the latent is
-        # fed directly via control_latent — no VAE round-trip.
-        _chained_lora_2 = _iclora_info.get("_chained_lora_2") if _iclora_info else None
-        if not do_upscale and _iclora_has_control and _chained_lora_2 is not None:
-            if _chained_lora_2["downscale_factor"] != 1:
+        # #1, full 20-step + 8-step rediff), then Pass B (LoRA #2, full
+        # 20-step + 8-step rediff) using Pass A's final latent as the
+        # IC-LoRA guide. For dsf=1 LoRAs (e.g. LipDub), the latent is fed
+        # directly via control_latent — no VAE round-trip.
+        #
+        # The closure captures parent locals; it is invoked here (non-
+        # upscale path) and from inside the upscale path right before
+        # Pass 3's spatial upscale, so the chained 4-stage pipeline runs
+        # in BOTH paths and the spatial upscale always operates on the
+        # LoRA-2 result.
+        def _run_chained_pass_b(pb_iclora_info, pb_output_latent, pb_audio_latent_out):
+            cl2 = pb_iclora_info.get("_chained_lora_2") if pb_iclora_info else None
+            if cl2 is None:
+                return pb_output_latent, pb_audio_latent_out
+            if cl2["downscale_factor"] != 1:
                 raise NotImplementedError(
                     f"Chained second IC-LoRA with downscale_factor>1 not yet "
-                    f"supported. Got dsf={_chained_lora_2['downscale_factor']} "
-                    f"for {_chained_lora_2['name']}."
+                    f"supported. Got dsf={cl2['downscale_factor']} for {cl2['name']}."
                 )
             logger.info(
-                f"=== Chained Pass B starting: {_chained_lora_2['name']} "
-                f"(strength={_chained_lora_2['strength']}, dsf=1) ==="
+                f"=== Chained Pass B starting: {cl2['name']} "
+                f"(strength={cl2['strength']}, dsf=1) ==="
             )
 
-            # Pass A's final latent is Pass B's IC-LoRA guide (latent-direct).
-            pass_a_final_latent = output_latent["samples"]
+            pass_a_final_latent = pb_output_latent["samples"]
             pb_lat_t = pass_a_final_latent.shape[2]
             pb_lat_h = pass_a_final_latent.shape[3]
             pb_lat_w = pass_a_final_latent.shape[4]
 
             # Build Pass B control_info: swap to LoRA #2, no further chaining.
-            ci_b = dict(_iclora_info)
-            ci_b["lora_name"] = _chained_lora_2["name"]
-            ci_b["lora_strength"] = _chained_lora_2["strength"]
-            ci_b["downscale_factor"] = _chained_lora_2["downscale_factor"]
+            ci_b = dict(pb_iclora_info)
+            ci_b["lora_name"] = cl2["name"]
+            ci_b["lora_strength"] = cl2["strength"]
+            ci_b["downscale_factor"] = cl2["downscale_factor"]
             ci_b["lora_name_2"] = "none"
             ci_b["lora_strength_2"] = 0.0
             ci_b["_chained_lora_2"] = None
@@ -1032,16 +1038,15 @@ class RSLTXVGenerate:
                 control_latent=pass_a_final_latent,
             )
             pb_guider._current_rediff_pass = 0
-            pb_guider._total_rediff_passes = _iclora_info.get('_rediffusion_passes', 1)
-            # Propagate user_provided_sigmas flag (controls distilled-sigma override)
+            pb_guider._total_rediff_passes = pb_iclora_info.get('_rediffusion_passes', 1)
             try:
                 pb_guider._user_provided_sigmas = user_provided_sigmas
             except Exception:
                 pass
 
             pb_video_latent = torch.zeros_like(pass_a_final_latent)
-            if has_audio and audio_latent_out is not None:
-                pb_latent_image = comfy.nested_tensor.NestedTensor((pb_video_latent, audio_latent_out))
+            if has_audio and pb_audio_latent_out is not None:
+                pb_latent_image = comfy.nested_tensor.NestedTensor((pb_video_latent, pb_audio_latent_out))
             else:
                 pb_latent_image = pb_video_latent
             pb_latent_image = comfy.sample.fix_empty_latent_channels(pb_guider.model_patcher, pb_latent_image)
@@ -1061,18 +1066,17 @@ class RSLTXVGenerate:
             )
             pb_samples = pb_samples.to(mm.intermediate_device())
 
-            # Separate AV; guider already stripped its IC-LoRA guide frames.
             if has_audio and pb_samples.is_nested:
                 pb_parts = pb_samples.unbind()
                 pb_samples = pb_parts[0]
-                audio_latent_out = pb_parts[1] if len(pb_parts) > 1 else audio_latent_out
+                pb_audio_latent_out = pb_parts[1] if len(pb_parts) > 1 else pb_audio_latent_out
 
-            output_latent = {"samples": pb_samples}
+            pb_output_latent = {"samples": pb_samples}
             del pb_model, pb_guider
             self._free_vram()
 
             # --- Pass B: 8-step rediffusion (LoRA #2, Pass A latent as guide) ---
-            _pb_rediff_passes = _iclora_info.get('_rediffusion_passes', 1)
+            _pb_rediff_passes = pb_iclora_info.get('_rediffusion_passes', 1)
             if _pb_rediff_passes > 0 and upscale_steps > 0 and upscale_denoise > 0:
                 from comfy_extras.nodes_lt import get_noise_mask as pb_get_noise_mask
 
@@ -1080,7 +1084,7 @@ class RSLTXVGenerate:
                     logger.info(
                         f"=== Pass B rediffusion {_pb_rediff_i + 1}/{_pb_rediff_passes} ==="
                     )
-                    pb_rd_latent = output_latent["samples"]
+                    pb_rd_latent = pb_output_latent["samples"]
                     pb_rd_lat_t = pb_rd_latent.shape[2]
                     pb_rd_lat_h = pb_rd_latent.shape[3]
                     pb_rd_lat_w = pb_rd_latent.shape[4]
@@ -1109,7 +1113,6 @@ class RSLTXVGenerate:
                     pb_rd_sig = self._build_upscale_sigmas(upscale_steps, upscale_denoise, pb_rd_shift, _pb_curve)
                     logger.info(f"Pass B rediff sigmas ({_pb_curve}, {len(pb_rd_sig)}): {pb_rd_sig.tolist()}")
 
-                    # Build Pass B rediff guider — Pass A's latent is still the guide.
                     pb_rd_guider = self._rebuild_iclora_guider(
                         pb_rd_model, positive, negative, vae,
                         ci_b, upscale_cfg,
@@ -1128,10 +1131,10 @@ class RSLTXVGenerate:
                         )
 
                     pb_rd_combined = pb_rd_latent
-                    if has_audio and audio_latent_out is not None:
-                        pb_rd_combined = comfy.nested_tensor.NestedTensor((pb_rd_latent, audio_latent_out))
+                    if has_audio and pb_audio_latent_out is not None:
+                        pb_rd_combined = comfy.nested_tensor.NestedTensor((pb_rd_latent, pb_audio_latent_out))
                         audio_mask_val = 0.0 if audio_is_input else 1.0
-                        audio_mask = torch.full_like(audio_latent_out[:, :1], audio_mask_val)
+                        audio_mask = torch.full_like(pb_audio_latent_out[:, :1], audio_mask_val)
                         pb_rd_noise_mask = comfy.nested_tensor.NestedTensor((pb_rd_noise_mask, audio_mask))
 
                     pb_rd_latent_image = comfy.sample.fix_empty_latent_channels(pb_rd_guider.model_patcher, pb_rd_combined)
@@ -1152,15 +1155,22 @@ class RSLTXVGenerate:
 
                     if pb_rd_samples.is_nested:
                         pb_rd_parts = pb_rd_samples.unbind()
-                        output_latent = {"samples": pb_rd_parts[0]}
-                        audio_latent_out = pb_rd_parts[1] if len(pb_rd_parts) > 1 else audio_latent_out
+                        pb_output_latent = {"samples": pb_rd_parts[0]}
+                        pb_audio_latent_out = pb_rd_parts[1] if len(pb_rd_parts) > 1 else pb_audio_latent_out
                     else:
-                        output_latent = {"samples": pb_rd_samples}
+                        pb_output_latent = {"samples": pb_rd_samples}
 
                     del pb_rd_model, pb_rd_guider
                     self._free_vram()
 
             logger.info("=== Chained Pass B complete ===")
+            return pb_output_latent, pb_audio_latent_out
+
+        # Invoke from non-upscale path (Pass A's rediff completed above).
+        if not do_upscale and _iclora_has_control:
+            output_latent, audio_latent_out = _run_chained_pass_b(
+                _iclora_info, output_latent, audio_latent_out,
+            )
 
         # ----------------------------------------------------------------
         # 7. UPSCALE (optional)
@@ -1676,6 +1686,15 @@ class RSLTXVGenerate:
                         # Free rediffusion model to reclaim VRAM for VAE decode
                         del up_model, up_guider
                         self._free_vram()
+
+                # Chained Pass B (upscale path): full sample+rediff with
+                # LoRA #2 at half resolution, BEFORE the spatial upscale.
+                # The user-facing requirement is "both passes then upscale" —
+                # so Pass 3 below operates on the LoRA-2 half-res result.
+                if _iclora_needs_normal_upscale:
+                    output_latent, audio_latent_out = _run_chained_pass_b(
+                        _iclora_info, output_latent, audio_latent_out,
+                    )
 
                 # IC-LoRA pass 3: normal spatial upscale + re-diffusion
                 # (passes 1+2 produced a refined half-res latent, now upscale it properly)
