@@ -303,29 +303,44 @@ fi
 # Skipped if RS_INSTALL_OLLAMA=0.
 # -----------------------------------------------------------------------------
 if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
-    OLLAMA_DIR="/workspace/.ollama-install"
-    OLLAMA_BIN="$OLLAMA_DIR/bin/ollama"
+    # Persistence target on the network volume — survives container restarts.
+    OLLAMA_PERSIST_DIR="/workspace/.ollama-install"
+    OLLAMA_PERSIST_BIN="$OLLAMA_PERSIST_DIR/bin/ollama"
+    OLLAMA_PERSIST_LIB="$OLLAMA_PERSIST_DIR/lib/ollama"
+    # Install path the official installer ACTUALLY uses (it ignores
+    # OLLAMA_INSTALL_DIR despite docs claiming otherwise on some versions).
+    OLLAMA_SYS_BIN="/usr/local/bin/ollama"
+    OLLAMA_SYS_LIB="/usr/local/lib/ollama"
     OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
     OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 
-    # 1. Install if missing — use the official install script with
-    #    OLLAMA_INSTALL_DIR override so it lands on /workspace (persistent
-    #    across container restarts). The script handles URL resolution,
-    #    GPU runner downloads, and architecture detection — we don't have
-    #    to track the actual tarball path (which moves between versions).
-    if [ ! -x "$OLLAMA_BIN" ]; then
-        echo "[init] ollama: installing to $OLLAMA_DIR (persistent — only happens once)"
-        mkdir -p "$OLLAMA_DIR/bin" "$OLLAMA_DIR/lib"
+    # Strategy: try restore-from-volume first (fast, no network), fall back
+    # to fresh install (slow, ~15s download). After fresh install, mirror
+    # /usr/local → /workspace for next-boot restore.
+
+    # 1. Restore from /workspace if we have a cached install. /usr/local
+    #    gets wiped on every container restart, so we re-populate it from
+    #    /workspace on each boot if possible.
+    if [ -x "$OLLAMA_PERSIST_BIN" ] && [ ! -x "$OLLAMA_SYS_BIN" ]; then
+        echo "[init] ollama: restoring cached install from $OLLAMA_PERSIST_DIR"
+        mkdir -p /usr/local/bin /usr/local/lib
+        cp -a "$OLLAMA_PERSIST_BIN" "$OLLAMA_SYS_BIN"
+        [ -d "$OLLAMA_PERSIST_LIB" ] && cp -a "$OLLAMA_PERSIST_LIB" /usr/local/lib/ 2>/dev/null || true
+        chmod +x "$OLLAMA_SYS_BIN"
+    fi
+
+    # 2. If still missing, run the official installer (it installs to
+    #    /usr/local regardless of OLLAMA_INSTALL_DIR — accept this and
+    #    mirror to /workspace after).
+    if [ ! -x "$OLLAMA_SYS_BIN" ]; then
+        echo "[init] ollama: not present — running official installer"
         OLLAMA_INSTALLED=0
         for _ot in 1 2 3; do
-            # Skip systemd setup (none in containers) by setting the
-            # SYSTEMCTL_SKIP_REDIRECT env, and target our prefix dir.
-            if OLLAMA_INSTALL_DIR="$OLLAMA_DIR" \
-               curl -fsSL --max-time 600 https://ollama.com/install.sh | \
-               OLLAMA_INSTALL_DIR="$OLLAMA_DIR" sh 2>&1 | sed 's/^/[ollama-install] /'; then
-                if [ -x "$OLLAMA_BIN" ]; then
+            if curl -fsSL --max-time 600 https://ollama.com/install.sh | \
+               sh 2>&1 | sed 's/^/[ollama-install] /'; then
+                if [ -x "$OLLAMA_SYS_BIN" ]; then
                     OLLAMA_INSTALLED=1
-                    echo "[init] ollama: installed"
+                    echo "[init] ollama: installed at $OLLAMA_SYS_BIN"
                     break
                 fi
             fi
@@ -334,30 +349,33 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
         done
         if [ "$OLLAMA_INSTALLED" != "1" ]; then
             echo "[init] ollama: ERROR — install failed after 3 attempts"
+        else
+            # Mirror to /workspace so next boot can restore without
+            # network. cp -a preserves perms/symlinks within the lib dir.
+            echo "[init] ollama: mirroring install to $OLLAMA_PERSIST_DIR for next-boot reuse"
+            mkdir -p "$OLLAMA_PERSIST_DIR/bin"
+            cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
+            if [ -d "$OLLAMA_SYS_LIB" ]; then
+                mkdir -p "$OLLAMA_PERSIST_DIR/lib"
+                cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
+            fi
         fi
     else
-        echo "[init] ollama: present at $OLLAMA_BIN"
+        echo "[init] ollama: binary present at $OLLAMA_SYS_BIN"
     fi
 
-    # 2. Symlink to /usr/local/bin so plain `ollama` resolves everywhere.
-    #    /usr/local/bin lives on the container disk and gets wiped, so this
-    #    runs every boot (idempotent: -f overwrites the symlink).
-    if [ -x "$OLLAMA_BIN" ]; then
-        ln -sf "$OLLAMA_BIN" /usr/local/bin/ollama 2>/dev/null || true
-    fi
-
-    # 3. Start the server if it isn't already running. Fully detached so it
+    # 3. Start the server if not already running. Fully detached so it
     #    survives ComfyUI dying.
-    if [ -x "$OLLAMA_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+    if [ -x "$OLLAMA_SYS_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
         mkdir -p "$OLLAMA_MODELS_VAL"
         echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL"
         setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS_VAL" OLLAMA_HOST="$OLLAMA_HOST_VAL" \
-            "$OLLAMA_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
+            "$OLLAMA_SYS_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
         disown 2>/dev/null || true
     fi
 
     # 4. Healthcheck — wait up to 20s for API.
-    if [ -x "$OLLAMA_BIN" ]; then
+    if [ -x "$OLLAMA_SYS_BIN" ]; then
         for _oi in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
                 echo "[init] ollama: API up on $OLLAMA_HOST_VAL"
