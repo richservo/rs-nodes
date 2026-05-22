@@ -1045,10 +1045,28 @@ class RSLTXVGenerate:
                 pass
 
             pb_video_latent = torch.zeros_like(pass_a_final_latent)
+            # Build noise_mask. The video mask is all-ones (denoise the
+            # video fully — it's a fresh 20-step sample). The audio mask
+            # must be 0 when audio_is_input so the user-supplied audio
+            # passes through as conditioning instead of being regenerated.
+            # Without this, LipDub has no audio signal to lip-sync to and
+            # the LoRA's effect collapses.
+            pb_video_noise_mask = torch.ones(
+                pb_video_latent.shape[0], 1, pb_video_latent.shape[2], 1, 1,
+                device=pb_video_latent.device, dtype=pb_video_latent.dtype,
+            )
             if has_audio and pb_audio_latent_out is not None:
                 pb_latent_image = comfy.nested_tensor.NestedTensor((pb_video_latent, pb_audio_latent_out))
+                pb_audio_mask_val = 0.0 if audio_is_input else 1.0
+                pb_audio_noise_mask = torch.full(
+                    (pb_audio_latent_out.shape[0], 1, *pb_audio_latent_out.shape[2:]),
+                    pb_audio_mask_val,
+                    device=pb_audio_latent_out.device, dtype=pb_audio_latent_out.dtype,
+                )
+                pb_denoise_mask = comfy.nested_tensor.NestedTensor((pb_video_noise_mask, pb_audio_noise_mask))
             else:
                 pb_latent_image = pb_video_latent
+                pb_denoise_mask = pb_video_noise_mask
             pb_latent_image = comfy.sample.fix_empty_latent_channels(pb_guider.model_patcher, pb_latent_image)
 
             pb_seed = seed + 100
@@ -1056,10 +1074,12 @@ class RSLTXVGenerate:
             pb_sampler = getattr(pb_guider, 'ic_lora_sampler', None) or comfy.samplers.sampler_object("euler_ancestral")
             pb_callback = latent_preview.prepare_callback(pb_guider.model_patcher, sigmas.shape[-1] - 1)
 
-            logger.info("Pass B: 20-step base sample (LoRA #2)")
+            logger.info(
+                f"Pass B: 20-step base sample (LoRA #2), audio_is_input={audio_is_input}"
+            )
             pb_samples = pb_guider.sample(
                 pb_noise, pb_latent_image, pb_sampler, sigmas,
-                denoise_mask=None,
+                denoise_mask=pb_denoise_mask,
                 callback=pb_callback,
                 disable_pbar=disable_pbar,
                 seed=pb_seed,
