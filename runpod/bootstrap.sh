@@ -398,13 +398,30 @@ HAVE_HF=$(command -v hf >/dev/null 2>&1 && echo 1 || echo 0)
 
 # Pass HF_TOKEN to child processes via environment, NEVER via CLI args.
 # CLI args (--token, --header=Bearer ...) appear in `ps -ef` and are
-# visible to anyone with read access to /proc, including process listings
-# captured in screenshots, logs, or chat transcripts. The hf CLI reads
-# HF_TOKEN from the environment by default, and so does huggingface_hub.
+# visible to anyone with read access to /proc. The hf CLI reads HF_TOKEN
+# from the environment by default, and so does huggingface_hub.
+#
+# AUTH HUGELY MATTERS for download speed. Without HF_TOKEN, HuggingFace
+# rate-limits downloads to ~1-5 MB/s and bootstraps can take hours.
+# With a token (read scope is enough) you get 100-500 MB/s on good
+# peering. Set HF_TOKEN in your RunPod pod env vars — get a token at
+# https://huggingface.co/settings/tokens.
 if [ -n "${HF_TOKEN:-}" ]; then
     export HF_TOKEN
+    log "HF_TOKEN detected — authenticated downloads enabled (fast)"
 else
-    log "No HF_TOKEN — proceeding unauthenticated (rate-limited; ungated repos only)"
+    log ""
+    log "============================================================"
+    log "  WARN: HF_TOKEN not set — downloads will be SLOW"
+    log "  Anonymous HF is rate-limited (~1-5 MB/s, hours per model)"
+    log ""
+    log "  Set HF_TOKEN in your RunPod pod env vars to fix:"
+    log "    1. Get token: https://huggingface.co/settings/tokens"
+    log "    2. RunPod console → Edit Pod → Environment Variables"
+    log "    3. Add HF_TOKEN=hf_xxxxxxxxxxxxx"
+    log "    4. Restart container"
+    log "============================================================"
+    log ""
 fi
 
 # Manifest format: <subdir>|<filename>|<repo_id>|<repo_path>

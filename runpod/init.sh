@@ -404,6 +404,23 @@ fi
 case "${SETUP,,}" in
     true|1|yes|on)
         echo "[init] SETUP=TRUE — fetching bootstrap.sh and running full provision"
+        # Up-front warning if HF_TOKEN missing — bootstrap downloads ~50 GB
+        # of weights, and unauthenticated HF caps at ~1-5 MB/s = many hours.
+        # With a token, the same downloads take minutes. Warn BEFORE we
+        # spend 10 minutes on pip just to crawl HF.
+        if [ -z "${HF_TOKEN:-}" ]; then
+            echo "[init] ============================================================"
+            echo "[init]   WARN: HF_TOKEN not set — bootstrap model downloads will"
+            echo "[init]   be RATE-LIMITED to ~1-5 MB/s by HuggingFace."
+            echo "[init]   With auth, the same downloads run at 100-500 MB/s."
+            echo "[init]"
+            echo "[init]   To enable: get token at"
+            echo "[init]     https://huggingface.co/settings/tokens"
+            echo "[init]   then add HF_TOKEN to your pod env vars and restart."
+            echo "[init] ============================================================"
+        else
+            echo "[init] HF_TOKEN detected — authenticated downloads enabled (fast)"
+        fi
         curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
         chmod +x "$WORKSPACE/bootstrap.sh"
         exec bash "$WORKSPACE/bootstrap.sh"
