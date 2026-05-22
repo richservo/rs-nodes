@@ -185,14 +185,38 @@ CUSTOM_NODES_ROOT="${CUSTOM_NODES_ROOT:-/workspace/ComfyUI/custom_nodes}"
 PIP="${COMFY_VENV_PIP:-/workspace/.venv/bin/pip}"
 
 # Format: dirname | git url
+# Comprehensive set — covers the standard bootstrap packs + every
+# common community pack that ships utility / switch / preprocessor
+# nodes. Pip install is fast because torch + deps are already there.
 NODE_PACKS=(
+    # === Core LTX-2 / video stack ===
     "ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
     "ComfyUI-VideoHelperSuite|https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+
+    # === Preprocessors / control inputs ===
     "comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
+    "ComfyUI-Video-Depth-Anything|https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything.git"
+    "ComfyUI-DepthAnythingV2|https://github.com/kijai/ComfyUI-DepthAnythingV2.git"
+
+    # === Wan family (you had these per earlier logs) ===
+    "ComfyUI-WanVideoWrapper|https://github.com/kijai/ComfyUI-WanVideoWrapper.git"
+    "ComfyUI-WanAnimatePreprocess|https://github.com/kijai/ComfyUI-WanAnimatePreprocess.git"
+
+    # === Utility / switch / general nodes (any of these may have your
+    # "Switch" node — install all so you don't have to guess) ===
     "ComfyUI_essentials|https://github.com/cubiq/ComfyUI_essentials.git"
+    "rgthree-comfy|https://github.com/rgthree/rgthree-comfy.git"
+    "comfy_mtb|https://github.com/melMass/comfy_mtb.git"
+    "was-node-suite-comfyui|https://github.com/WASasquatch/was-node-suite-comfyui.git"
+    "ComfyUI-Impact-Pack|https://github.com/ltdrdata/ComfyUI-Impact-Pack.git"
+    "ComfyUI-KJNodes|https://github.com/kijai/ComfyUI-KJNodes.git"
+    "ComfyUI-Easy-Use|https://github.com/yolain/ComfyUI-Easy-Use.git"
+    "ComfyUI-Manager|https://github.com/ltdrdata/ComfyUI-Manager.git"
+
+    # === Sampling + upscaling ===
     "RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
     "ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
-    "ComfyUI-Video-Depth-Anything|https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything.git"
+
     # rs-nodes intentionally NOT included — managed via your RS_NODES env var workflow.
 )
 
