@@ -89,9 +89,10 @@ fi
 #   sometimes nested like split_files/text_encoders/x.safetensors)
 # ----------------------------------------------------------------------------
 MODELS=(
-    # === LTX-2.3 base checkpoints ===
+    # === LTX-2.3 base checkpoint (bf16 dev) ===
     "checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors"
-    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
+    # fp8 checkpoint omitted — uncomment if you specifically want it:
+    # "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
 
     # === Text encoder ===
     "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"

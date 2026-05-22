@@ -425,7 +425,9 @@ MODELS=(
 if [ "${RS_LTX_BF16:-1}" = "1" ]; then
     MODELS+=("checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors")
 fi
-if [ "${RS_LTX_FP8:-1}" = "1" ]; then
+# fp8 checkpoint OFF by default — set RS_LTX_FP8=1 to enable.
+# bf16 is the primary inference checkpoint; fp8 is a quantized alt.
+if [ "${RS_LTX_FP8:-0}" = "1" ]; then
     MODELS+=("checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors")
 fi
 
