@@ -1050,11 +1050,28 @@ class ICLoRAGuider(MultimodalGuider):
             # guide; face/lips get freed to lip-sync.
             if self._free_mask is not None:
                 fm = self._free_mask
-                # Mask comes as [T, H, W] or [B, T, H, W] or [T, 1, H, W].
-                # Normalize to [T, H, W] then resize spatially to (dil_h, dil_w)
-                # and temporally to match guide_mask's T dim.
-                if fm.ndim == 4:  # [B, T, H, W] or [T, C, H, W]
-                    fm = fm[:, 0] if fm.shape[1] == 1 else fm[0]
+                # Normalize to [T, H, W] regardless of input format. Common
+                # shapes from upstream nodes:
+                #   IMAGE  [T, H, W, 3]  — SAM3 / standard ComfyUI image
+                #   IMAGE  [T, H, W, 4]  — RGBA
+                #   IMAGE  [T, H, W, 1]  — grayscale single channel
+                #   MASK   [T, H, W]     — already in mask format
+                #   MASK   [H, W]        — single-frame mask
+                #   batched [B, T, H, W] / [T, C, H, W]
+                if fm.ndim == 5:  # [B, T, H, W, C] — take batch 0
+                    fm = fm[0]
+                if fm.ndim == 4:
+                    # Disambiguate [T, H, W, C] (IMAGE) vs [B, T, H, W] / [T, C, H, W] (batched)
+                    # by checking last dim: if it's 1/3/4, it's a channel dim.
+                    last = fm.shape[-1]
+                    if last in (1, 3, 4):
+                        # IMAGE format → collapse channels to grayscale by max
+                        # (any non-black pixel is "free"). Max handles RGB masks
+                        # where SAM3 might render mask as red overlay.
+                        fm = fm.max(dim=-1).values  # [T, H, W]
+                    else:
+                        # Batched mask — take first batch or first channel
+                        fm = fm[:, 0] if fm.shape[1] == 1 else fm[0]
                 if fm.ndim == 2:  # [H, W] single-frame mask broadcast
                     fm = fm.unsqueeze(0)
                 # fm now [T_pixel, H_pixel, W_pixel]
