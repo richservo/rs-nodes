@@ -391,13 +391,15 @@ fi
 
 # -----------------------------------------------------------------------------
 # Dispatch: ONLY SETUP=TRUE triggers a full bootstrap. Anything else
-# (FALSE, unset, empty) runs startup.sh, which does ollama + ComfyUI
-# and nothing more. A missing .bootstrap_done marker does NOT count
-# as "needs setup" — user intent wins.
+# (FALSE, unset, empty) runs startup.sh.
 #
-# On a genuinely fresh pod with no /workspace/startup.sh present, the
-# user must explicitly set SETUP=TRUE once to provision. After that,
-# every boot is fast.
+# Separate from bootstrap: if ComfyUI itself updated (via git pull or
+# ComfyUI-Manager) and its requirements.txt now needs packages the venv
+# doesn't have, we run JUST `pip install -r ComfyUI/requirements.txt`
+# to heal. This is NOT the full bootstrap — no torch reinstall, no
+# ollama model pulls, no model downloads. Just ComfyUI's own deps.
+# Triggered only when ComfyUI's startup imports actually fail; healthy
+# boots skip it entirely.
 # -----------------------------------------------------------------------------
 case "${SETUP,,}" in
     true|1|yes|on)
@@ -407,6 +409,32 @@ case "${SETUP,,}" in
         exec bash "$WORKSPACE/bootstrap.sh"
         ;;
 esac
+
+# ComfyUI requirements sync — ONLY fires when ComfyUI's imports actually
+# fail. Healthy venv → import test passes in <1s → skip pip install.
+# Broken venv → run pip install -r ComfyUI/requirements.txt (this is NOT
+# the full bootstrap; nothing else runs).
+COMFY_REQ="/workspace/ComfyUI/requirements.txt"
+COMFY_VENV_PY="/workspace/.venv/bin/python"
+COMFY_VENV_PIP="/workspace/.venv/bin/pip"
+if [ -f "$COMFY_REQ" ] && [ -x "$COMFY_VENV_PY" ] && [ -x "$COMFY_VENV_PIP" ]; then
+    if ! ( cd /workspace/ComfyUI && "$COMFY_VENV_PY" -c "
+import sys
+sys.path.insert(0, '/workspace/ComfyUI')
+import comfy
+import server
+import comfyui_workflow_templates
+import comfyui_frontend_package
+" 2>/dev/null ); then
+        echo "[init] ComfyUI imports broken — running pip install -r ComfyUI/requirements.txt to heal venv"
+        echo "[init] (this is NOT the full bootstrap — only ComfyUI's deps)"
+        if "$COMFY_VENV_PIP" install --no-cache-dir -r "$COMFY_REQ" 2>&1 | sed 's/^/[comfy-reqs] /'; then
+            echo "[init] ComfyUI deps healed."
+        else
+            echo "[init] WARN: pip install returned non-zero; ComfyUI may not start cleanly."
+        fi
+    fi
+fi
 
 # SETUP not TRUE — run startup.sh. Period.
 if [ -x "$WORKSPACE/startup.sh" ]; then
