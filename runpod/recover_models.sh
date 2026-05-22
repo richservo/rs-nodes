@@ -87,46 +87,62 @@ fi
 # - hf_repo_id: HuggingFace repo id (org/name)
 # - hf_repo_path: path within the HF repo (often same as filename but
 #   sometimes nested like split_files/text_encoders/x.safetensors)
+# - min_size_mb: expected minimum size in MiB. Files smaller than this
+#   are treated as PARTIAL (corrupted/interrupted download) and
+#   re-downloaded. Use ~90% of the actual file size to allow for minor
+#   variation between releases without false positives.
 # ----------------------------------------------------------------------------
 MODELS=(
-    # === LTX-2.3 base checkpoint (bf16 dev) ===
-    "checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors"
+    # === LTX-2.3 base checkpoint (bf16 dev, ~43 GB) ===
+    "checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors|40000"
     # fp8 checkpoint omitted — uncomment if you specifically want it:
-    # "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
+    # "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors|26000"
 
-    # === Text encoder ===
-    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    # === Text encoder (~8.8 GB) ===
+    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors|8000"
 
-    # === Spatial upscaler ===
-    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    # === Spatial upscaler (~950 MB) ===
+    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|800"
 
-    # === Distilled LoRA (for fast 8-step generation) ===
-    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+    # === Distilled LoRA (~7.1 GB) ===
+    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|6500"
 
     # === IC-LoRAs ===
-    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
-    "loras|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors"
+    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|550"
+    "loras|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors|280"
 
-    # === Add more here as needed. Examples (uncomment + verify repo paths) ===
-    # "loras|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-HDR|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors"
-    # "loras|ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Lipdub|ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
-    # "loras|ltx-2.3-22b-ic-lora-refocus.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Refocus|ltx-2.3-22b-ic-lora-refocus.safetensors"
-    # "loras|ltx-2.3-22b-ic-lora-uncompress.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Uncompress|ltx-2.3-22b-ic-lora-uncompress.safetensors"
-    # "loras|ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-HDR|ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors"
-    # "loras|ltx-2.3-ID-LoRA-CelebVHQ-3K.safetensors|Lightricks/LTX-2.3-ID-LoRA|ltx-2.3-ID-LoRA-CelebVHQ-3K.safetensors"
+    # === Add more here as needed. Examples (uncomment + verify repo paths + sizes) ===
+    # "loras|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-HDR|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors|550"
+    # "loras|ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Lipdub|ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors|550"
+    # "loras|ltx-2.3-22b-ic-lora-refocus.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Refocus|ltx-2.3-22b-ic-lora-refocus.safetensors|550"
+    # "loras|ltx-2.3-22b-ic-lora-uncompress.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Uncompress|ltx-2.3-22b-ic-lora-uncompress.safetensors|550"
+    # "loras|ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-HDR|ltx-2.3-22b-ic-lora-hdr-scene-emb.safetensors|1"
+    # "loras|ltx-2.3-ID-LoRA-CelebVHQ-3K.safetensors|Lightricks/LTX-2.3-ID-LoRA|ltx-2.3-ID-LoRA-CelebVHQ-3K.safetensors|550"
 )
 
 # ----------------------------------------------------------------------------
 # Phase 1: status check
+# Treats partial downloads (file smaller than expected) as missing so they
+# get re-downloaded. A non-zero file from an interrupted download is NOT
+# the same thing as a complete file.
 # ----------------------------------------------------------------------------
 echo "=== Current status ==="
 missing_count=0
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r subdir name repo_id repo_path <<< "$entry"
+    IFS='|' read -r subdir name repo_id repo_path min_size_mb <<< "$entry"
     file="$MODELS_ROOT/$subdir/$name"
     if [ -s "$file" ]; then
-        size=$(du -h "$file" 2>/dev/null | cut -f1)
-        printf "  OK       %8s  %s/%s\n" "$size" "$subdir" "$name"
+        actual_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        actual_mb=$((actual_bytes / 1048576))
+        if [ -n "${min_size_mb:-}" ] && [ "$actual_mb" -lt "$min_size_mb" ]; then
+            size=$(du -h "$file" 2>/dev/null | cut -f1)
+            printf "  PARTIAL  %8s  %s/%s  (expected ≥%sMB — will redownload)\n" \
+                "$size" "$subdir" "$name" "$min_size_mb"
+            missing_count=$((missing_count + 1))
+        else
+            size=$(du -h "$file" 2>/dev/null | cut -f1)
+            printf "  OK       %8s  %s/%s\n" "$size" "$subdir" "$name"
+        fi
     else
         printf "  MISSING            %s/%s\n" "$subdir" "$name"
         missing_count=$((missing_count + 1))
@@ -148,10 +164,23 @@ else
     echo
 fi
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r subdir name repo_id repo_path <<< "$entry"
+    IFS='|' read -r subdir name repo_id repo_path min_size_mb <<< "$entry"
     dir="$MODELS_ROOT/$subdir"
     file="$dir/$name"
-    [ -s "$file" ] && continue
+
+    # Skip only if file is present AND meets the expected-size threshold.
+    # Partial / corrupted files (smaller than threshold) get re-downloaded.
+    if [ -s "$file" ]; then
+        actual_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        actual_mb=$((actual_bytes / 1048576))
+        if [ -z "${min_size_mb:-}" ] || [ "$actual_mb" -ge "$min_size_mb" ]; then
+            continue
+        fi
+        # Partial — delete it before re-downloading so the staging
+        # mv-into-place doesn't get confused by the existing file.
+        echo "→ $subdir/$name  (deleting ${actual_mb}MB partial)"
+        rm -f "$file"
+    fi
 
     mkdir -p "$dir"
     staging=$(mktemp -d -p /workspace)
