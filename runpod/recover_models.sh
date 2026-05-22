@@ -72,6 +72,88 @@ fi
 export HF_TOKEN
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
+# ============================================================================
+# Phase 0: ComfyUI itself + its pip deps
+#
+# A partial bootstrap can leave the pod with venv + torch installed but
+# /workspace/ComfyUI missing or its small deps (comfyui_workflow_templates,
+# comfyui_frontend_package, NAMING_CONVENTION...) not in the venv.
+#
+# This phase:
+#   - Clones /workspace/ComfyUI if missing
+#   - Clones /workspace/ComfyUI/custom_nodes/rs-nodes if missing
+#   - Runs pip install -r ComfyUI/requirements.txt (FAST: torch already
+#     installed, only small missing deps actually get downloaded)
+#
+# Skipped entirely if ComfyUI is already present AND its imports work.
+# ============================================================================
+COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
+RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
+VENV_DIR="${VENV_DIR:-/workspace/.venv}"
+VENV_PY="$VENV_DIR/bin/python"
+VENV_PIP="$VENV_DIR/bin/pip"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "ERROR: venv missing at $VENV_DIR — recover_models.sh can't proceed."
+    echo "       This script assumes torch + dependencies are already installed."
+    echo "       Set SETUP=TRUE once to run the full bootstrap, then back to FALSE."
+    exit 1
+fi
+
+echo "=== Phase 0: ComfyUI core ==="
+
+# Clone ComfyUI if missing
+if [ ! -d "$COMFY_DIR/.git" ]; then
+    echo "→ ComfyUI missing — cloning to $COMFY_DIR"
+    if git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"; then
+        echo "  ✓ cloned"
+    else
+        echo "  ✗ git clone failed — aborting"
+        exit 1
+    fi
+else
+    echo "  OK   ComfyUI present at $COMFY_DIR"
+fi
+
+# Clone rs-nodes if missing
+if [ ! -d "$RS_NODES_DIR/.git" ]; then
+    echo "→ rs-nodes missing — cloning"
+    if git clone https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"; then
+        # submodule (LTX-2)
+        git -C "$RS_NODES_DIR" submodule update --init --recursive 2>&1 | sed 's/^/    /' || true
+        echo "  ✓ cloned"
+    else
+        echo "  ✗ git clone failed for rs-nodes — continuing without it"
+    fi
+else
+    echo "  OK   rs-nodes present"
+fi
+
+# Verify ComfyUI imports work; if not, run pip install -r requirements.txt.
+# This catches the case where ComfyUI updated but the venv didn't get the
+# new small deps (comfyui_workflow_templates, etc.).
+echo "→ Checking ComfyUI imports..."
+if ( cd "$COMFY_DIR" && "$VENV_PY" -c "
+import sys
+sys.path.insert(0, '$COMFY_DIR')
+import comfy
+import server
+import comfyui_workflow_templates
+import comfyui_frontend_package
+" 2>/dev/null ); then
+    echo "  OK   ComfyUI imports working"
+else
+    echo "  ComfyUI imports broken — running pip install -r requirements.txt"
+    echo "  (FAST: torch + heavy deps already installed, only small missing ones download)"
+    if [ -f "$COMFY_DIR/requirements.txt" ]; then
+        "$VENV_PIP" install --no-cache-dir -r "$COMFY_DIR/requirements.txt" 2>&1 | sed 's/^/    /'
+        echo "  ✓ deps synced"
+    else
+        echo "  WARN: $COMFY_DIR/requirements.txt missing"
+    fi
+fi
+echo
+
 # ----------------------------------------------------------------------------
 # hf CLI check
 # ----------------------------------------------------------------------------
