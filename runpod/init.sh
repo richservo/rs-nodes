@@ -389,6 +389,34 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     fi
 fi
 
+# -----------------------------------------------------------------------------
+# Auto-sync ComfyUI's pip deps. ComfyUI updates (via git pull or
+# ComfyUI-Manager) can leave the venv missing packages the new code needs
+# (e.g. comfyui_workflow_templates, NAMING_CONVENTION) — ComfyUI then
+# crashes on startup and the container loops indefinitely. Lives in
+# init.sh (not startup.sh) so it runs from the fresh-from-GitHub copy
+# every boot, not from a possibly-stale /workspace/startup.sh.
+#
+# Cheap (sha256 of requirements.txt, ~100ms) when nothing changed; runs
+# pip install only when the hash actually differs from last install.
+# -----------------------------------------------------------------------------
+COMFY_REQ="/workspace/ComfyUI/requirements.txt"
+COMFY_VENV_PIP="/workspace/.venv/bin/pip"
+COMFY_HASH_FILE="/workspace/.comfy_req_hash"
+if [ -f "$COMFY_REQ" ] && [ -x "$COMFY_VENV_PIP" ]; then
+    _comfy_hash=$(sha256sum "$COMFY_REQ" 2>/dev/null | cut -d' ' -f1)
+    _stored_hash=$(cat "$COMFY_HASH_FILE" 2>/dev/null || echo "")
+    if [ -n "$_comfy_hash" ] && [ "$_comfy_hash" != "$_stored_hash" ]; then
+        echo "[init] ComfyUI requirements.txt changed — syncing venv (this avoids crash loops on upstream updates)"
+        if "$COMFY_VENV_PIP" install --no-cache-dir -r "$COMFY_REQ" 2>&1 | sed 's/^/[comfy-deps] /'; then
+            echo "$_comfy_hash" > "$COMFY_HASH_FILE"
+            echo "[init] ComfyUI deps synced."
+        else
+            echo "[init] WARN: ComfyUI deps install returned non-zero; ComfyUI may not start cleanly."
+        fi
+    fi
+fi
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #

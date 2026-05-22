@@ -138,6 +138,27 @@ print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
         export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
 
+    # Auto-sync ComfyUI's pip deps when its requirements.txt changes. Without
+    # this, a ComfyUI git pull (manual or via ComfyUI-Manager) can leave the
+    # venv missing packages the new code needs (e.g. comfyui_workflow_templates,
+    # NAMING_CONVENTION in app.database.models) — ComfyUI then crashes on
+    # startup and the container loops. Hash check is cheap (~100ms); pip
+    # install only runs when the hash actually differs from last successful
+    # install.
+    if [ -f "$COMFY_DIR/requirements.txt" ]; then
+        _comfy_hash=$(sha256sum "$COMFY_DIR/requirements.txt" 2>/dev/null | cut -d' ' -f1)
+        _stored_hash=$(cat "$WORKSPACE/.comfy_req_hash" 2>/dev/null || echo "")
+        if [ -n "$_comfy_hash" ] && [ "$_comfy_hash" != "$_stored_hash" ]; then
+            log "ComfyUI requirements.txt changed — installing deps to sync venv..."
+            if "$VENV/bin/pip" install --no-cache-dir -r "$COMFY_DIR/requirements.txt" 2>&1 | sed 's/^/[comfy-deps] /'; then
+                echo "$_comfy_hash" > "$WORKSPACE/.comfy_req_hash"
+                log "ComfyUI deps synced."
+            else
+                log "WARN: ComfyUI deps install failed; ComfyUI may not start."
+            fi
+        fi
+    fi
+
     ensure_ollama_running
 
     cd "$COMFY_DIR"
