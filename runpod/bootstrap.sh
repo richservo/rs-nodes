@@ -441,13 +441,10 @@ for entry in "${MODELS[@]}"; do
     fi
     log "[fetch] $subdir/$name (repo=$repo_id)"
     if [ "$HAVE_HF" = "1" ]; then
-        # hf download writes into a layout cache by default; use --local-dir
-        # to drop the file directly at the target path. The CLI puts files
-        # under <local-dir>/<repo_path>, so we download into a temp staging
-        # dir then move the file to its final flat location.
-        # No `| sed` pipe — hf-transfer's progress bar uses carriage returns
-        # which a pipe would block-buffer until completion. Stream direct.
-        # No --token — hf reads HF_TOKEN from the environment (exported above).
+        # Download to staging dir. On success, atomic-mv into place. On
+        # FAILURE never touch $file — only clean up staging. This is the
+        # critical invariant: a failed re-download must NEVER destroy an
+        # existing good copy of the model.
         staging=$(mktemp -d -p /workspace 2>/dev/null || mktemp -d)
         if hf download "$repo_id" "$repo_path" \
                 --local-dir "$staging"; then
@@ -456,14 +453,14 @@ for entry in "${MODELS[@]}"; do
             rm -rf "$staging"
             log "  done: $(stat -c%s "$file") bytes"
         else
-            log "  ERROR: hf download failed for $name"
-            rm -rf "$staging" "$file"
+            log "  ERROR: hf download failed for $name (existing $file preserved if any)"
+            rm -rf "$staging"
             continue
         fi
     else
-        # Fallback: curl with header in a 0600 temp file. Avoids the token
-        # appearing in `ps` (which `wget --header="Authorization: Bearer X"`
-        # would do). curl's `-H @file` reads the header from a file path.
+        # Fallback: curl. Download to $file.partial, mv into place on
+        # success, leave existing $file alone on failure. Same invariant
+        # as the hf path — failed download must never destroy good copy.
         url="https://huggingface.co/${repo_id}/resolve/main/${repo_path}"
         hdrfile=""
         curl_auth=()
@@ -473,13 +470,16 @@ for entry in "${MODELS[@]}"; do
             printf 'Authorization: Bearer %s\n' "$HF_TOKEN" > "$hdrfile"
             curl_auth=(-H "@$hdrfile")
         fi
+        partial="$file.partial"
         if curl -L --fail --retry 3 -C - --progress-bar \
                 "${curl_auth[@]}" \
-                -o "$file" "$url"; then
+                -o "$partial" "$url"; then
+            mv -f "$partial" "$file"
             log "  done: $(stat -c%s "$file") bytes"
         else
-            log "  ERROR: curl download failed for $name"
-            rm -f "$file"
+            log "  ERROR: curl download failed for $name (existing $file preserved if any)"
+            # Leave $partial in place so -C - on the next run can resume it.
+            # NEVER touch $file.
         fi
         [ -n "$hdrfile" ] && rm -f "$hdrfile"
     fi
