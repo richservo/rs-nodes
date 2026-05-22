@@ -41,7 +41,16 @@
 
 set -eu
 
+# Proof-of-life — if you don't see this line, the script file is empty
+# or corrupted (re-download with: curl -fSL ... -o /workspace/recover_models.sh)
+echo "[recover] Starting recover_models.sh (PID $$)"
+
 MODELS_ROOT="${MODELS_ROOT:-/workspace/ComfyUI/models}"
+echo "[recover] MODELS_ROOT=$MODELS_ROOT"
+echo "[recover] CUSTOM_NODES_ROOT=${CUSTOM_NODES_ROOT:-/workspace/ComfyUI/custom_nodes}"
+echo "[recover] HF_TOKEN ${HF_TOKEN:+SET}${HF_TOKEN:-NOT SET}"
+echo "[recover] PATH=$PATH"
+echo
 
 # ----------------------------------------------------------------------------
 # HF_TOKEN prompt — read from env if already set, otherwise ask the user.
