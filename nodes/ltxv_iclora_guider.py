@@ -145,12 +145,29 @@ class RSLTXVICLoRAGuider:
             m, _ = comfy.sd.load_lora_for_models(m, None, lora_data, lora_strength, 0)
             logger.info(f"Applied LoRA (strength={lora_strength})")
 
-        # --- Optional second LoRA stacked on top ---
+        # --- Chained second IC-LoRA: DO NOT stack weights on the same model.
+        # Stacking two IC-LoRAs makes their attention deltas fight each other
+        # since they target the same layers. Instead, store the second LoRA's
+        # config and let ICLoRAGuider run a chained two-pass: Pass A with
+        # LoRA #1 on the user-provided control_image, then Pass B with LoRA
+        # #2 using Pass A's output latent as the reference. Latent stays
+        # in-model the whole time (no VAE round-trip).
+        chained_lora_2 = None
         if lora_name_2 and lora_name_2 != "none" and lora_strength_2 != 0:
             lora_path_2 = folder_paths.get_full_path_or_raise("loras", lora_name_2)
-            lora_data_2 = comfy.utils.load_torch_file(lora_path_2, safe_load=True)
-            m, _ = comfy.sd.load_lora_for_models(m, None, lora_data_2, lora_strength_2, 0)
-            logger.info(f"Applied second LoRA: {lora_name_2} (strength={lora_strength_2})")
+            dsf_2 = self._read_downscale_factor(lora_path_2)
+            chained_lora_2 = {
+                "path": lora_path_2,
+                "name": lora_name_2,
+                "strength": lora_strength_2,
+                "downscale_factor": dsf_2,
+                "base_model": model,  # original, pre-LoRA-1 — needed to clone fresh for Pass B
+            }
+            logger.info(
+                f"Chained second IC-LoRA configured: {lora_name_2} "
+                f"(strength={lora_strength_2}, downscale_factor={dsf_2}). "
+                f"Will run as Pass B after Pass A completes."
+            )
 
         # --- Attention override ---
         attn_func = None
@@ -373,6 +390,7 @@ class RSLTXVICLoRAGuider:
             max_shift=max_shift,
             base_shift=base_shift,
             iclora_none_mode=no_iclora_weights,
+            chained_lora_2=chained_lora_2,
             video_cfg=cfg,
             audio_cfg=audio_cfg,
             stg_scale=stg_scale,
