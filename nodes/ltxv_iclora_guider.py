@@ -53,6 +53,7 @@ class RSLTXVICLoRAGuider:
                 "scene_embed_strength": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.01,
                                                     "tooltip": "Multiplier applied to the scene embed tensor before concat. 1.0 = as released; <1.0 = softer effect; >1.0 = stronger."}),
                 "control_strength":  ("FLOAT", {"default": 1.0, "min": 0.0,   "max": 1.0,  "step": 0.01}),
+                "free_mask":         ("MASK",  {"tooltip": "Optional per-frame mask of regions to FREE from IC-LoRA control (1=free, 0=locked). Wire a face/lips mask from SAM3 here to let the model lip-sync to audio without IC-LoRA's structural conditioning fighting it. Body stays locked to canny/depth/pose; face is free to follow audio. Frame count should match the control_image."}),
                 "guide_frame_idx":   ("INT",   {"default": 0,   "min": -1,    "max": 10000}),
                 "crf":               ("INT",   {"default": 35,  "min": 0,     "max": 100,
                                                 "tooltip": "CRF compression to match IC-LoRA training distribution. 0 = disabled."}),
@@ -106,7 +107,8 @@ class RSLTXVICLoRAGuider:
 
     def create_guider(
         self, model, positive, negative, vae, control_image, lora_name,
-        lora_strength=1.0, control_strength=1.0, guide_frame_idx=0, crf=35,
+        lora_strength=1.0, control_strength=1.0, free_mask=None,
+        guide_frame_idx=0, crf=35,
         cfg=3.0, audio_cfg=7.0, stg_scale=0.0, stg_perturbation=1.0, stg_blocks="29", stg_indexes="0",
         rescale=0.7, cfg_end=-1.0, stg_end=-1.0,
         cfg_star_rescale=True, skip_sigma=0.0,
@@ -367,6 +369,7 @@ class RSLTXVICLoRAGuider:
             downscale_factor=downscale_factor,
             guide_strength=control_strength,
             guide_frame_idx=guide_frame_idx,
+            free_mask=free_mask,
             max_shift=max_shift,
             base_shift=base_shift,
             iclora_none_mode=no_iclora_weights,

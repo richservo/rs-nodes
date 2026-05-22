@@ -889,6 +889,7 @@ class ICLoRAGuider(MultimodalGuider):
         max_shift,
         base_shift,
         iclora_none_mode=False,
+        free_mask=None,
         **kwargs,
     ):
         super().__init__(model, positive, negative, **kwargs)
@@ -897,6 +898,7 @@ class ICLoRAGuider(MultimodalGuider):
         self._downscale_factor = downscale_factor
         self._guide_strength = guide_strength
         self._guide_frame_idx = guide_frame_idx
+        self._free_mask = free_mask  # optional per-frame mask: 1=free from IC-LoRA, 0=locked
         self._max_shift = max_shift
         self._base_shift = base_shift
         # When True (lora_name='none'): install MasaCtrl-style mutual self-
@@ -1040,6 +1042,43 @@ class ICLoRAGuider(MultimodalGuider):
             guide_mask[..., ::dsf, ::dsf] = 1.0
             guide_latent = dilated
             logger.info(f"Dilated to: {list(guide_latent.shape)}")
+
+            # Apply free_mask: regions where the mask is 1 get the guide
+            # signal removed (guide_mask set to -1 = "no guide here") so the
+            # model has no IC-LoRA structural conditioning in those regions
+            # and is free to fit text + audio. Body stays locked to the
+            # guide; face/lips get freed to lip-sync.
+            if self._free_mask is not None:
+                fm = self._free_mask
+                # Mask comes as [T, H, W] or [B, T, H, W] or [T, 1, H, W].
+                # Normalize to [T, H, W] then resize spatially to (dil_h, dil_w)
+                # and temporally to match guide_mask's T dim.
+                if fm.ndim == 4:  # [B, T, H, W] or [T, C, H, W]
+                    fm = fm[:, 0] if fm.shape[1] == 1 else fm[0]
+                if fm.ndim == 2:  # [H, W] single-frame mask broadcast
+                    fm = fm.unsqueeze(0)
+                # fm now [T_pixel, H_pixel, W_pixel]
+                target_T = guide_mask.shape[2]
+                # Temporal resize: select frames evenly across the mask sequence
+                if fm.shape[0] != target_T:
+                    idx = torch.linspace(
+                        0, fm.shape[0] - 1, target_T,
+                    ).long().to(fm.device)
+                    fm = fm[idx]
+                # Spatial resize to (dil_h, dil_w) via bilinear
+                import torch.nn.functional as F
+                fm = F.interpolate(
+                    fm.unsqueeze(1).float(),
+                    size=(dil_h, dil_w), mode="bilinear", align_corners=False,
+                ).squeeze(1)  # [T, dil_h, dil_w]
+                # Broadcast to [B=1, 1, T, dil_h, dil_w] to match guide_mask
+                fm = fm.unsqueeze(0).unsqueeze(0).to(
+                    device=guide_mask.device, dtype=guide_mask.dtype,
+                )
+                # Where free_mask is 1, set guide_mask to -1 ("no guide")
+                guide_mask = torch.where(fm > 0.5, torch.full_like(guide_mask, -1.0), guide_mask)
+                freed_frac = (fm > 0.5).float().mean().item()
+                logger.info(f"free_mask applied: {freed_frac:.1%} of token positions freed from IC-LoRA control")
 
         self._num_guide_frames = guide_latent.shape[2]
 
