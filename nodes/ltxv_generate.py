@@ -984,6 +984,185 @@ class RSLTXVGenerate:
                 logger.info("IC-LoRA rediffusion complete")
 
         # ----------------------------------------------------------------
+        # 6c. CHAINED PASS B: full sample+rediff with the second IC-LoRA
+        # ----------------------------------------------------------------
+        # Triggered automatically when lora_name_2 was set on the IC-LoRA
+        # guider node. Stacking two IC-LoRAs makes their attention deltas
+        # fight, so we run them sequentially instead: Pass A above (LoRA
+        # #1, full 20-step + 8-step rediff), then Pass B here (LoRA #2,
+        # full 20-step + 8-step rediff) using Pass A's final latent as
+        # the IC-LoRA guide. For dsf=1 LoRAs (e.g. LipDub), the latent is
+        # fed directly via control_latent — no VAE round-trip.
+        _chained_lora_2 = _iclora_info.get("_chained_lora_2") if _iclora_info else None
+        if not do_upscale and _iclora_has_control and _chained_lora_2 is not None:
+            if _chained_lora_2["downscale_factor"] != 1:
+                raise NotImplementedError(
+                    f"Chained second IC-LoRA with downscale_factor>1 not yet "
+                    f"supported. Got dsf={_chained_lora_2['downscale_factor']} "
+                    f"for {_chained_lora_2['name']}."
+                )
+            logger.info(
+                f"=== Chained Pass B starting: {_chained_lora_2['name']} "
+                f"(strength={_chained_lora_2['strength']}, dsf=1) ==="
+            )
+
+            # Pass A's final latent is Pass B's IC-LoRA guide (latent-direct).
+            pass_a_final_latent = output_latent["samples"]
+            pb_lat_t = pass_a_final_latent.shape[2]
+            pb_lat_h = pass_a_final_latent.shape[3]
+            pb_lat_w = pass_a_final_latent.shape[4]
+
+            # Build Pass B control_info: swap to LoRA #2, no further chaining.
+            ci_b = dict(_iclora_info)
+            ci_b["lora_name"] = _chained_lora_2["name"]
+            ci_b["lora_strength"] = _chained_lora_2["strength"]
+            ci_b["downscale_factor"] = _chained_lora_2["downscale_factor"]
+            ci_b["lora_name_2"] = "none"
+            ci_b["lora_strength_2"] = 0.0
+            ci_b["_chained_lora_2"] = None
+
+            self._free_vram()
+
+            # --- Pass B: 20-step base sample (LoRA #2, Pass A latent as guide) ---
+            pb_model = m.clone()
+            pb_guider = self._rebuild_iclora_guider(
+                pb_model, positive, negative, vae,
+                ci_b, cfg,
+                latent_h=pb_lat_h, latent_w=pb_lat_w, latent_t=pb_lat_t,
+                control_latent=pass_a_final_latent,
+            )
+            pb_guider._current_rediff_pass = 0
+            pb_guider._total_rediff_passes = _iclora_info.get('_rediffusion_passes', 1)
+            # Propagate user_provided_sigmas flag (controls distilled-sigma override)
+            try:
+                pb_guider._user_provided_sigmas = user_provided_sigmas
+            except Exception:
+                pass
+
+            pb_video_latent = torch.zeros_like(pass_a_final_latent)
+            if has_audio and audio_latent_out is not None:
+                pb_latent_image = comfy.nested_tensor.NestedTensor((pb_video_latent, audio_latent_out))
+            else:
+                pb_latent_image = pb_video_latent
+            pb_latent_image = comfy.sample.fix_empty_latent_channels(pb_guider.model_patcher, pb_latent_image)
+
+            pb_seed = seed + 100
+            pb_noise = comfy.sample.prepare_noise(pb_latent_image, pb_seed)
+            pb_sampler = getattr(pb_guider, 'ic_lora_sampler', None) or comfy.samplers.sampler_object("euler_ancestral")
+            pb_callback = latent_preview.prepare_callback(pb_guider.model_patcher, sigmas.shape[-1] - 1)
+
+            logger.info("Pass B: 20-step base sample (LoRA #2)")
+            pb_samples = pb_guider.sample(
+                pb_noise, pb_latent_image, pb_sampler, sigmas,
+                denoise_mask=None,
+                callback=pb_callback,
+                disable_pbar=disable_pbar,
+                seed=pb_seed,
+            )
+            pb_samples = pb_samples.to(mm.intermediate_device())
+
+            # Separate AV; guider already stripped its IC-LoRA guide frames.
+            if has_audio and pb_samples.is_nested:
+                pb_parts = pb_samples.unbind()
+                pb_samples = pb_parts[0]
+                audio_latent_out = pb_parts[1] if len(pb_parts) > 1 else audio_latent_out
+
+            output_latent = {"samples": pb_samples}
+            del pb_model, pb_guider
+            self._free_vram()
+
+            # --- Pass B: 8-step rediffusion (LoRA #2, Pass A latent as guide) ---
+            _pb_rediff_passes = _iclora_info.get('_rediffusion_passes', 1)
+            if _pb_rediff_passes > 0 and upscale_steps > 0 and upscale_denoise > 0:
+                from comfy_extras.nodes_lt import get_noise_mask as pb_get_noise_mask
+
+                for _pb_rediff_i in range(_pb_rediff_passes):
+                    logger.info(
+                        f"=== Pass B rediffusion {_pb_rediff_i + 1}/{_pb_rediff_passes} ==="
+                    )
+                    pb_rd_latent = output_latent["samples"]
+                    pb_rd_lat_t = pb_rd_latent.shape[2]
+                    pb_rd_lat_h = pb_rd_latent.shape[3]
+                    pb_rd_lat_w = pb_rd_latent.shape[4]
+
+                    pb_rd_model = m.clone()
+                    if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                        lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                        lora = None
+                        if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
+                            lora = self.loaded_lora[1]
+                        if lora is None:
+                            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                            self.loaded_lora = (lora_path, lora)
+                        pb_rd_model, _ = comfy.sd.load_lora_for_models(pb_rd_model, None, lora, upscale_lora_strength, 0)
+                        logger.info(f"Pass B rediff LoRA applied: {upscale_lora} (strength={upscale_lora_strength})")
+
+                    pb_rd_tokens = min(math.prod(pb_rd_latent.shape[2:]), x2 * 2)
+                    pb_rd_shift = pb_rd_tokens * mm_shift + b
+                    logger.info(f"Pass B rediff shift: tokens={pb_rd_tokens}, shift={pb_rd_shift:.3f}")
+
+                    pb_rd_sampling = ModelSamplingAdvanced(pb_rd_model.model.model_config)
+                    pb_rd_sampling.set_parameters(shift=pb_rd_shift)
+                    pb_rd_model.add_object_patch("model_sampling", pb_rd_sampling)
+
+                    _pb_curve = self._resolve_upscale_sigma_curve(upscale_sigma_curve, upscale_lora)
+                    pb_rd_sig = self._build_upscale_sigmas(upscale_steps, upscale_denoise, pb_rd_shift, _pb_curve)
+                    logger.info(f"Pass B rediff sigmas ({_pb_curve}, {len(pb_rd_sig)}): {pb_rd_sig.tolist()}")
+
+                    # Build Pass B rediff guider — Pass A's latent is still the guide.
+                    pb_rd_guider = self._rebuild_iclora_guider(
+                        pb_rd_model, positive, negative, vae,
+                        ci_b, upscale_cfg,
+                        latent_h=pb_rd_lat_h, latent_w=pb_rd_lat_w, latent_t=pb_rd_lat_t,
+                        control_latent=pass_a_final_latent,
+                    )
+                    pb_rd_guider._current_rediff_pass = _pb_rediff_i
+                    pb_rd_guider._total_rediff_passes = _pb_rediff_passes
+
+                    pb_rd_latent_dict = {"samples": pb_rd_latent}
+                    pb_rd_noise_mask = pb_get_noise_mask(pb_rd_latent_dict)
+                    if rediffusion_mask is not None:
+                        pb_rd_noise_mask = self._apply_rediffusion_mask(
+                            pb_rd_noise_mask, rediffusion_mask, rediffusion_mask_strength,
+                            pb_rd_lat_h, pb_rd_lat_w,
+                        )
+
+                    pb_rd_combined = pb_rd_latent
+                    if has_audio and audio_latent_out is not None:
+                        pb_rd_combined = comfy.nested_tensor.NestedTensor((pb_rd_latent, audio_latent_out))
+                        audio_mask_val = 0.0 if audio_is_input else 1.0
+                        audio_mask = torch.full_like(audio_latent_out[:, :1], audio_mask_val)
+                        pb_rd_noise_mask = comfy.nested_tensor.NestedTensor((pb_rd_noise_mask, audio_mask))
+
+                    pb_rd_latent_image = comfy.sample.fix_empty_latent_channels(pb_rd_guider.model_patcher, pb_rd_combined)
+                    pb_rd_seed = seed + 200 + _pb_rediff_i
+                    pb_rd_noise = comfy.sample.prepare_noise(pb_rd_latent_image, pb_rd_seed)
+                    pb_rd_sampler = getattr(pb_rd_guider, 'ic_lora_sampler', None) or comfy.samplers.sampler_object("euler_ancestral")
+                    pb_rd_callback = latent_preview.prepare_callback(pb_rd_guider.model_patcher, pb_rd_sig.shape[-1] - 1)
+
+                    self._free_vram()
+                    pb_rd_samples = pb_rd_guider.sample(
+                        pb_rd_noise, pb_rd_latent_image, pb_rd_sampler, pb_rd_sig,
+                        denoise_mask=pb_rd_noise_mask,
+                        callback=pb_rd_callback,
+                        disable_pbar=disable_pbar,
+                        seed=pb_rd_seed,
+                    )
+                    pb_rd_samples = pb_rd_samples.to(mm.intermediate_device())
+
+                    if pb_rd_samples.is_nested:
+                        pb_rd_parts = pb_rd_samples.unbind()
+                        output_latent = {"samples": pb_rd_parts[0]}
+                        audio_latent_out = pb_rd_parts[1] if len(pb_rd_parts) > 1 else audio_latent_out
+                    else:
+                        output_latent = {"samples": pb_rd_samples}
+
+                    del pb_rd_model, pb_rd_guider
+                    self._free_vram()
+
+            logger.info("=== Chained Pass B complete ===")
+
+        # ----------------------------------------------------------------
         # 7. UPSCALE (optional)
         # ----------------------------------------------------------------
 
@@ -2041,7 +2220,8 @@ class RSLTXVGenerate:
     @staticmethod
     def _rebuild_iclora_guider(up_model, positive, negative, vae,
                                control_info, upscale_cfg, latent_h, latent_w,
-                               latent_t, propagate_distilled_lora=True):
+                               latent_t, propagate_distilled_lora=True,
+                               control_latent=None):
         """Rebuild an ICLoRAGuider at upscaled resolution.
 
         Uses ICLoRAGuider with deferred encoding — the control image is
@@ -2101,14 +2281,17 @@ class RSLTXVGenerate:
                 lambda func, *args, **kwargs: attn_func(*args, **kwargs)
             )
 
-        # CRF preprocess control image
+        # CRF preprocess control image. Skipped when a pre-encoded
+        # control_latent is supplied (chained Pass B path — no pixels to
+        # process; the guide is already a latent).
         control_image = ci["control_image"]
-        crf = ci.get("crf", 35)
-        if crf > 0:
-            processed_frames = []
-            for i in range(control_image.shape[0]):
-                processed_frames.append(ltxv_preprocess(control_image[i], crf))
-            control_image = torch.stack(processed_frames)
+        if control_latent is None:
+            crf = ci.get("crf", 35)
+            if crf > 0:
+                processed_frames = []
+                for i in range(control_image.shape[0]):
+                    processed_frames.append(ltxv_preprocess(control_image[i], crf))
+                control_image = torch.stack(processed_frames)
 
         # Stamp frame rate
         fr = ci.get("frame_rate", 25.0)
@@ -2119,6 +2302,7 @@ class RSLTXVGenerate:
         up_guider = ICLoRAGuider(
             up_model, positive, negative,
             control_pixels=control_image,
+            control_latent=control_latent,
             vae=vae,
             downscale_factor=ci["downscale_factor"],
             guide_strength=ci["control_strength"],

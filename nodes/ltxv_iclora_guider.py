@@ -148,10 +148,9 @@ class RSLTXVICLoRAGuider:
         # --- Chained second IC-LoRA: DO NOT stack weights on the same model.
         # Stacking two IC-LoRAs makes their attention deltas fight each other
         # since they target the same layers. Instead, store the second LoRA's
-        # config and let ICLoRAGuider run a chained two-pass: Pass A with
-        # LoRA #1 on the user-provided control_image, then Pass B with LoRA
-        # #2 using Pass A's output latent as the reference. Latent stays
-        # in-model the whole time (no VAE round-trip).
+        # config; ltxv_generate.py runs a full Pass A (sample+rediff with
+        # LoRA #1), then a full Pass B (sample+rediff with LoRA #2 only)
+        # using Pass A's output latent as the new IC-LoRA guide.
         chained_lora_2 = None
         if lora_name_2 and lora_name_2 != "none" and lora_strength_2 != 0:
             lora_path_2 = folder_paths.get_full_path_or_raise("loras", lora_name_2)
@@ -161,12 +160,12 @@ class RSLTXVICLoRAGuider:
                 "name": lora_name_2,
                 "strength": lora_strength_2,
                 "downscale_factor": dsf_2,
-                "base_model": model,  # original, pre-LoRA-1 — needed to clone fresh for Pass B
+                "base_model": model,  # original, pre-LoRA-1 — clone fresh for Pass B
             }
             logger.info(
                 f"Chained second IC-LoRA configured: {lora_name_2} "
                 f"(strength={lora_strength_2}, downscale_factor={dsf_2}). "
-                f"Will run as Pass B after Pass A completes."
+                f"Will run as Pass B (full sample+rediff) after Pass A completes."
             )
 
         # --- Attention override ---
@@ -343,6 +342,12 @@ class RSLTXVICLoRAGuider:
         negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
         # --- Build control_info for upscale re-encoding ---
+        # When chaining, set lora_name_2='none' so _rebuild_iclora_guider
+        # does NOT stack both LoRAs during Pass A's rediffusion. Pass B
+        # gets its own control_info derived from this one with lora_name
+        # swapped to LoRA #2.
+        ci_lora_name_2 = "none" if chained_lora_2 is not None else lora_name_2
+        ci_lora_strength_2 = 0.0 if chained_lora_2 is not None else lora_strength_2
         control_info = {
             "control_image": control_image,
             "downscale_factor": downscale_factor,
@@ -351,8 +356,8 @@ class RSLTXVICLoRAGuider:
             "crf": crf,
             "lora_name": lora_name,
             "lora_strength": lora_strength,
-            "lora_name_2": lora_name_2,
-            "lora_strength_2": lora_strength_2,
+            "lora_name_2": ci_lora_name_2,
+            "lora_strength_2": ci_lora_strength_2,
             "attention_mode": attention_mode,
             "cfg": cfg,
             "audio_cfg": audio_cfg,
@@ -376,6 +381,7 @@ class RSLTXVICLoRAGuider:
             "_rediffusion_passes": rediffusion_passes,
             "_distilled_lora": distilled_lora,
             "_distilled_lora_strength": distilled_lora_strength,
+            "_chained_lora_2": chained_lora_2,
         }
 
         # --- Create ICLoRAGuider (deferred encoding at sample() time) ---
@@ -390,7 +396,6 @@ class RSLTXVICLoRAGuider:
             max_shift=max_shift,
             base_shift=base_shift,
             iclora_none_mode=no_iclora_weights,
-            chained_lora_2=chained_lora_2,
             video_cfg=cfg,
             audio_cfg=audio_cfg,
             stg_scale=stg_scale,

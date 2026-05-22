@@ -890,7 +890,7 @@ class ICLoRAGuider(MultimodalGuider):
         base_shift,
         iclora_none_mode=False,
         free_mask=None,
-        chained_lora_2=None,
+        control_latent=None,
         **kwargs,
     ):
         super().__init__(model, positive, negative, **kwargs)
@@ -902,11 +902,12 @@ class ICLoRAGuider(MultimodalGuider):
         self._free_mask = free_mask  # optional per-frame mask: 1=free from IC-LoRA, 0=locked
         self._max_shift = max_shift
         self._base_shift = base_shift
-        # Chained second IC-LoRA: dict with keys path/name/strength/
-        # downscale_factor/base_model, or None for single-pass.
-        self._chained_lora_2 = chained_lora_2
-        # Track which pass we're in (for downscale_factor lookup etc.)
-        self._current_pass = "A"
+        # Pre-encoded guide latent. When set, _encode_and_inject_guide skips
+        # the VAE encode and uses this directly. Used by the chained LoRA-2
+        # path to feed Pass A's output back in as Pass B's guide without a
+        # VAE round-trip (only valid when downscale_factor==1, since dsf>1
+        # requires pixel-space dilation).
+        self._control_latent = control_latent
         # When True (lora_name='none'): install MasaCtrl-style mutual self-
         # attention. At each sampler step, run TWO model forward passes:
         # capture-pass on noised source (caches K, V per self-attn layer)
@@ -1000,30 +1001,51 @@ class ICLoRAGuider(MultimodalGuider):
         noise_mask = get_noise_mask(video_dict)
 
         # --- Causal fix (matches official iclora.py:166-172) ---
-        images = self._control_pixels
-        num_frames_to_keep = ((images.shape[0] - 1) // time_sf) * time_sf + 1
-        images = images[:num_frames_to_keep]
-        causal_fix = self._guide_frame_idx == 0 or num_frames_to_keep == 1
-        if not causal_fix:
-            images = torch.cat([images[:1], images], dim=0)
+        # When a pre-encoded control_latent is provided (chained Pass B
+        # path), use it as the "images count" for keyframe index math and
+        # skip the VAE encode entirely. control_latent is only valid for
+        # dsf==1 because dsf>1 dilation operates on pixel frames.
+        if self._control_latent is not None:
+            if dsf > 1:
+                raise ValueError(
+                    f"control_latent path requires downscale_factor=1, got {dsf}. "
+                    f"For dsf>1 LoRAs, supply control_pixels instead."
+                )
+            guide_latent = self._control_latent
+            # Stand-in images count for get_latent_index() — only the
+            # length matters there, not the pixel data.
+            num_pseudo_frames = guide_latent.shape[2]
+            images = [None] * num_pseudo_frames  # only len() is read downstream
+            causal_fix = True
+            logger.info(
+                f"Using pre-encoded control_latent (chained pass): "
+                f"{list(guide_latent.shape)}"
+            )
+        else:
+            images = self._control_pixels
+            num_frames_to_keep = ((images.shape[0] - 1) // time_sf) * time_sf + 1
+            images = images[:num_frames_to_keep]
+            causal_fix = self._guide_frame_idx == 0 or num_frames_to_keep == 1
+            if not causal_fix:
+                images = torch.cat([images[:1], images], dim=0)
 
-        # --- Encode at reduced resolution (matches official iclora.py:174-185) ---
-        # The official IC-LoRA encode computes:
-        #   target = int(latent_dim * scale_factor / dsf)
-        # We pass latent_dim/dsf to base LTXVAddGuide.encode which multiplies
-        # by scale_factor internally, producing the same pixel resolution.
-        enc_w = latent_w // dsf if dsf > 1 else latent_w
-        enc_h = latent_h // dsf if dsf > 1 else latent_h
-        _, guide_latent = LTXVAddGuide.encode(
-            self._vae, enc_w, enc_h, images, scale_factors
-        )
+            # --- Encode at reduced resolution (matches official iclora.py:174-185) ---
+            # The official IC-LoRA encode computes:
+            #   target = int(latent_dim * scale_factor / dsf)
+            # We pass latent_dim/dsf to base LTXVAddGuide.encode which multiplies
+            # by scale_factor internally, producing the same pixel resolution.
+            enc_w = latent_w // dsf if dsf > 1 else latent_w
+            enc_h = latent_h // dsf if dsf > 1 else latent_h
+            _, guide_latent = LTXVAddGuide.encode(
+                self._vae, enc_w, enc_h, images, scale_factors
+            )
 
-        # Strip prepended causal frame
-        if not causal_fix:
-            guide_latent = guide_latent[:, :, 1:, :, :]
-            images = images[1:]
+            # Strip prepended causal frame
+            if not causal_fix:
+                guide_latent = guide_latent[:, :, 1:, :, :]
+                images = images[1:]
 
-        logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
+            logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
 
         # --- Sparse dilation (matches official LTXVDilateLatent exactly) ---
         guide_mask = None
@@ -1137,7 +1159,7 @@ class ICLoRAGuider(MultimodalGuider):
         # capture-then-inject every model call. Each noisy token's query
         # looks up K, V from the source video's structure at the same
         # position -> per-position routing, content-specific, no LoRA needed.
-        if self._iclora_none_mode:
+        if self._iclora_none_mode and self._control_latent is None:
             # Encode source at full latent resolution (bypass IC-LoRA half-res)
             src_imgs = self._control_pixels[:num_frames_to_keep]
             if not causal_fix:
@@ -1281,12 +1303,6 @@ class ICLoRAGuider(MultimodalGuider):
     DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 
     def sample(self, noise, latent_image, sampler, sigmas, **kwargs):
-        # Capture the input latent + denoise_mask before _encode_and_inject_guide
-        # mutates them. Chained Pass B needs the ORIGINAL (pre-guide-injection)
-        # shapes to construct its own injection.
-        latent_image_orig = latent_image
-        denoise_mask_orig = kwargs.get("denoise_mask", None)
-
         # 1. Apply model sampling shift (deferred until latent dims known)
         self._apply_model_sampling(latent_image)
 
@@ -1370,198 +1386,5 @@ class ICLoRAGuider(MultimodalGuider):
         logger.info(f"Guide strip: {pre_strip_dim} → {post_strip_dim} "
                     f"(removed {self._num_guide_frames} guide frame(s))")
 
-        # === Chained Pass B (chained second IC-LoRA) ===
-        # If lora_name_2 was set on the node, run a second pass using
-        # Pass A's output latent as the reference for LoRA #2. Latent
-        # stays in-model — no VAE round-trip.
-        if self._chained_lora_2 is not None:
-            result = self._run_chained_pass_b(
-                pass_a_result=result,
-                pass_a_input_latent=latent_image_orig,
-                pass_a_denoise_mask=denoise_mask_orig,
-                sampler=sampler,
-                sigmas=sigmas,
-                kwargs=kwargs,
-            )
-
         return result
 
-    def _run_chained_pass_b(self, pass_a_result, pass_a_input_latent,
-                            pass_a_denoise_mask, sampler, sigmas, kwargs):
-        """Run a second IC-LoRA pass using Pass A's output as the reference.
-
-        Swaps to LoRA #2's weights (clone of base model), injects Pass A's
-        denoised video latent as the new guide (skipping VAE encode since
-        we already have a latent), and samples again with the same cfg/stg
-        config. The latent never leaves the model — no pixel round-trip.
-        """
-        cfg2 = self._chained_lora_2
-        logger.info(
-            f"=== Chained Pass B starting: LoRA #2 = {cfg2['name']} "
-            f"(strength={cfg2['strength']}, dsf={cfg2['downscale_factor']}) ==="
-        )
-
-        # 1. Extract Pass A's video latent (the new guide reference).
-        if pass_a_result.is_nested:
-            pass_a_parts = pass_a_result.unbind()
-            pass_a_video = pass_a_parts[0]
-        else:
-            pass_a_video = pass_a_result
-
-        # 2. Build a fresh model_patcher with LoRA #2 only (clone of base).
-        #    Don't stack on top of self.model_patcher — that has LoRA #1.
-        base = cfg2["base_model"]
-        m2 = base.clone()
-        lora_data_2 = comfy.utils.load_torch_file(cfg2["path"], safe_load=True)
-        m2, _ = comfy.sd.load_lora_for_models(m2, None, lora_data_2, cfg2["strength"], 0)
-
-        # Preserve attention override (sage attention etc.) from the original.
-        orig_tx_opts = self.model_patcher.model_options.get("transformer_options", {}) or {}
-        attn_override = orig_tx_opts.get("optimized_attention_override")
-        if attn_override is not None:
-            m2.model_options.setdefault("transformer_options", {})["optimized_attention_override"] = attn_override
-
-        # Apply distilled LoRA if it was configured (Pass B may also need it)
-        distilled_lora = getattr(self, '_distilled_lora', None)
-        if distilled_lora is not None:
-            dl_data, dl_strength, dl_name = distilled_lora
-            m2, _ = comfy.sd.load_lora_for_models(m2, None, dl_data, dl_strength, 0)
-
-        # 3. Swap to Pass B state. Save current state to restore on return.
-        pass_a_model_patcher = self.model_patcher
-        pass_a_downscale_factor = self._downscale_factor
-        pass_a_num_guide_frames = self._num_guide_frames
-
-        self.model_patcher = m2
-        self._downscale_factor = cfg2["downscale_factor"]
-        self._current_pass = "B"
-
-        # 4. Re-apply model sampling shift for the new patcher.
-        self._apply_model_sampling(pass_a_input_latent)
-
-        # 5. Inject Pass A's video latent as the new guide. Skip VAE encode.
-        new_latent, new_denoise_mask = self._inject_guide_from_latent(
-            pass_a_input_latent, pass_a_denoise_mask, pass_a_video
-        )
-
-        # 6. Fresh noise for Pass B (different seed than Pass A).
-        pass_b_seed = (kwargs.get("seed", 0) or 0) + 1
-        pass_b_noise = comfy.sample.prepare_noise(new_latent, pass_b_seed)
-
-        # 7. Sample Pass B with the same sampler/sigmas/cfg as Pass A.
-        pass_b_kwargs = dict(kwargs)
-        pass_b_kwargs["denoise_mask"] = new_denoise_mask
-        pass_b_kwargs["seed"] = pass_b_seed
-        logger.info(
-            f"Pass B guide latent shape: {list(pass_a_video.shape)}, "
-            f"appended frames: {self._num_guide_frames}"
-        )
-        result_b = super().sample(pass_b_noise, new_latent, sampler, sigmas, **pass_b_kwargs)
-
-        # 8. Strip Pass B's guide frames.
-        result_b = self._strip_guide(result_b)
-        logger.info(f"=== Chained Pass B complete ===")
-
-        # Restore Pass A state (so any downstream code sees the original patcher).
-        self.model_patcher = pass_a_model_patcher
-        self._downscale_factor = pass_a_downscale_factor
-        self._num_guide_frames = pass_a_num_guide_frames
-        self._current_pass = "A"
-
-        return result_b
-
-    def _inject_guide_from_latent(self, latent_image, denoise_mask, guide_video_latent):
-        """Inject a pre-encoded video latent as the IC-LoRA guide.
-
-        Counterpart to _encode_and_inject_guide() that operates on a latent
-        directly instead of running VAE encode on pixel frames. Used by the
-        chained Pass B path.
-        """
-        from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask
-
-        # Reset conditioning to original state
-        self.inner_set_conds({
-            "positive": self._orig_positive,
-            "negative": self._orig_negative,
-        })
-
-        # Extract video latent + audio (if AV)
-        if latent_image.is_nested:
-            parts = latent_image.unbind()
-            video = parts[0]
-            audio = parts[1] if len(parts) > 1 else None
-        else:
-            video = latent_image
-            audio = None
-
-        _, _, latent_t, latent_h, latent_w = video.shape
-        scale_factors = self._vae.downscale_index_formula
-        dsf = self._downscale_factor
-
-        # Build noise mask matching video shape
-        video_dict = {"samples": video}
-        if denoise_mask is not None:
-            if denoise_mask.is_nested:
-                video_dict["noise_mask"] = denoise_mask.unbind()[0]
-            else:
-                video_dict["noise_mask"] = denoise_mask
-        noise_mask = get_noise_mask(video_dict)
-
-        # Pass A's video latent IS our guide_latent.
-        guide_latent = guide_video_latent
-        logger.info(f"Pass B guide (from Pass A latent): {list(guide_latent.shape)}")
-
-        # Optional dilation if LoRA #2 has dsf > 1 (rare; LipDub is dsf=1).
-        guide_mask = None
-        if dsf > 1:
-            # Same logic as _encode_and_inject_guide. For the LipDub case
-            # (dsf=1) this branch never runs, so leaving the more
-            # complete encode-path logic untouched. If a dsf>1 LoRA is
-            # ever used as LoRA #2 we can extend here.
-            logger.warning(
-                f"Pass B with dsf={dsf}>1 not yet fully supported; running "
-                f"without dilation. Output may not match LoRA #2's training distribution."
-            )
-
-        self._num_guide_frames = guide_latent.shape[2]
-
-        # Inject as keyframe (same as encode path)
-        positive = self._get_positive()
-        negative = self._get_negative()
-
-        frame_idx_actual, _ = LTXVAddGuide.get_latent_index(
-            positive, latent_t,
-            guide_latent.shape[2], self._guide_frame_idx, scale_factors
-        )
-
-        positive, negative, video_out, noise_mask_out = LTXVAddGuide.append_keyframe(
-            positive, negative, frame_idx_actual,
-            video, noise_mask,
-            guide_latent, self._guide_strength, scale_factors,
-            guide_mask=guide_mask,
-            latent_downscale_factor=dsf,
-            causal_fix=True,
-        )
-        logger.info(
-            f"Pass B guide injected at frame_idx={frame_idx_actual}, "
-            f"strength={self._guide_strength}"
-        )
-
-        self.inner_set_conds({"positive": positive, "negative": negative})
-
-        # Reassemble NestedTensor if AV
-        if audio is not None:
-            latent_out = comfy.nested_tensor.NestedTensor((video_out, audio))
-            if denoise_mask is not None and denoise_mask.is_nested:
-                audio_dm = denoise_mask.unbind()[1] if len(denoise_mask.unbind()) > 1 else None
-            else:
-                audio_dm = None
-            if audio_dm is not None:
-                denoise_out = comfy.nested_tensor.NestedTensor((noise_mask_out, audio_dm))
-            else:
-                denoise_out = comfy.nested_tensor.NestedTensor((noise_mask_out,))
-        else:
-            latent_out = video_out
-            denoise_out = noise_mask_out
-
-        return latent_out, denoise_out
