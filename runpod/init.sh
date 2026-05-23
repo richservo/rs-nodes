@@ -368,36 +368,40 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
         echo "[init] ollama: binary present at $OLLAMA_SYS_BIN"
     fi
 
-    # 2b. Validate GPU support. Fast path: if cuda_v* libs are restored
-    #     from /workspace or already in place, this is a single stat call
-    #     and we move on. Slow path (GPU present but CPU-only install)
-    #     triggers wipe + reinstall + re-mirror to /workspace, so the
-    #     fix is permanent across reboots.
-    if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
-        : # GPU build already present — silent fast path
-    elif [ -x "$OLLAMA_SYS_BIN" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        echo "[init] ollama: GPU detected but cuda_v* libs missing — forcing fresh install"
-        pkill -9 -f "ollama serve" 2>/dev/null || true
-        sleep 2
-        rm -rf "$OLLAMA_SYS_BIN" "$OLLAMA_SYS_LIB"
-        rm -rf "$OLLAMA_PERSIST_BIN" "$OLLAMA_PERSIST_LIB" 2>/dev/null || true
-        for _ot in 1 2 3; do
-            curl -fsSL --max-time 600 https://ollama.com/install.sh | \
-                sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+    # 2b. Validate GPU support. The official installer's GPU detection
+    #     sometimes mis-fires on RunPod's image and ships the CPU-only
+    #     payload (no cuda_v* lib dir). Then ollama loads 24GB models on
+    #     CPU at ~50x slower than the GPU sitting idle next to it. If we
+    #     have a GPU but no cuda_v* libs, wipe and reinstall — and also
+    #     blow away the persisted /workspace cache so we don't restore the
+    #     bad install on subsequent boots.
+    if [ -x "$OLLAMA_SYS_BIN" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        if ! ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
+            echo "[init] ollama: GPU detected but cuda_v* libs missing — forcing fresh install"
+            pkill -9 -f "ollama serve" 2>/dev/null || true
+            sleep 2
+            rm -rf "$OLLAMA_SYS_BIN" "$OLLAMA_SYS_LIB"
+            rm -rf "$OLLAMA_PERSIST_BIN" "$OLLAMA_PERSIST_LIB" 2>/dev/null || true
+            for _ot in 1 2 3; do
+                curl -fsSL --max-time 600 https://ollama.com/install.sh | \
+                    sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+                if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
+                    echo "[init] ollama: GPU build installed"
+                    break
+                fi
+                echo "[init] ollama: reinstall attempt ${_ot}/3 still missing cuda libs; retrying in 5s"
+                sleep 5
+            done
             if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
-                echo "[init] ollama: GPU build installed"
-                break
+                echo "[init] ollama: mirroring GPU install to $OLLAMA_PERSIST_DIR"
+                mkdir -p "$OLLAMA_PERSIST_DIR/bin" "$OLLAMA_PERSIST_DIR/lib"
+                cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
+                cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
+            else
+                echo "[init] ollama: WARN — reinstall finished but cuda_v* libs still missing; daemon will run on CPU"
             fi
-            echo "[init] ollama: reinstall attempt ${_ot}/3 still missing cuda libs; retrying in 5s"
-            sleep 5
-        done
-        if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
-            echo "[init] ollama: mirroring GPU install to $OLLAMA_PERSIST_DIR"
-            mkdir -p "$OLLAMA_PERSIST_DIR/bin" "$OLLAMA_PERSIST_DIR/lib"
-            cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
-            cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
         else
-            echo "[init] ollama: WARN — reinstall finished but cuda_v* libs still missing; daemon will run on CPU"
+            echo "[init] ollama: GPU build present (cuda libs at $OLLAMA_SYS_LIB)"
         fi
     fi
 
