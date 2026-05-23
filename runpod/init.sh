@@ -313,10 +313,6 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     OLLAMA_SYS_LIB="/usr/local/lib/ollama"
     OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
     OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
-    # RunPod container env can ship NVIDIA_VISIBLE_DEVICES=void which hides
-    # all GPUs from ollama serve and forces silent CPU fallback. Override
-    # to 'all' so the daemon sees the GPU at load time.
-    NVIDIA_VISIBLE_DEVICES_VAL="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 
     # Strategy: try restore-from-volume first (fast, no network), fall back
     # to fresh install (slow, ~15s download). After fresh install, mirror
@@ -372,9 +368,8 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     #    survives ComfyUI dying.
     if [ -x "$OLLAMA_SYS_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
         mkdir -p "$OLLAMA_MODELS_VAL"
-        echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL (NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES_VAL)"
+        echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL"
         setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS_VAL" OLLAMA_HOST="$OLLAMA_HOST_VAL" \
-            NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES_VAL" \
             "$OLLAMA_SYS_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
         disown 2>/dev/null || true
     fi

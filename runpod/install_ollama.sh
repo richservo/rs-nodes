@@ -26,12 +26,8 @@ set -euo pipefail
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
 OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
-# RunPod containers can launch with NVIDIA_VISIBLE_DEVICES=void which hides
-# all GPUs from ollama serve. Force visibility on so the daemon loads to
-# GPU instead of silently falling back to CPU.
-NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 
-export OLLAMA_MODELS OLLAMA_HOST NVIDIA_VISIBLE_DEVICES
+export OLLAMA_MODELS OLLAMA_HOST
 
 # DNS guard.
 if ! getent hosts ollama.com >/dev/null 2>&1; then
@@ -54,9 +50,8 @@ fi
 if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     echo "[install_ollama] Ollama server already running on $OLLAMA_HOST"
 else
-    echo "[install_ollama] Starting Ollama server on $OLLAMA_HOST (NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)"
+    echo "[install_ollama] Starting Ollama server on $OLLAMA_HOST"
     nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
-        NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
         ollama serve > /workspace/ollama.log 2>&1 &
 
     # Wait up to 60s for it to come up.
