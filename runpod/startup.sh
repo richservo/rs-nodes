@@ -93,50 +93,36 @@ _ensure_ollama_inner() {
         log "ollama: binary present ($(ollama --version 2>&1 | head -1))"
     fi
 
-    # 1b. Validate GPU support is installed. The official installer's
-    #     GPU detection sometimes mis-fires on RunPod's image and installs
-    #     the CPU-only payload (no cuda_v* lib dir). That makes ollama
-    #     load 24GB models on CPU at ~50x slower than the GPU sitting
-    #     idle next to it. If we have a GPU but no cuda_v* libs, force
-    #     a fresh reinstall to pull the CUDA payload.
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        local _ollama_lib_dir
-        _ollama_lib_dir=""
-        if [ -d /usr/local/lib/ollama ]; then
-            _ollama_lib_dir=/usr/local/lib/ollama
-        elif [ -d /usr/share/ollama/lib ]; then
-            _ollama_lib_dir=/usr/share/ollama/lib
-        fi
-        local _has_cuda_libs=0
-        if [ -n "$_ollama_lib_dir" ] && ls "$_ollama_lib_dir"/cuda_v* >/dev/null 2>&1; then
-            _has_cuda_libs=1
-        fi
-        if [ "$_has_cuda_libs" = "0" ]; then
-            log "ollama: GPU present but cuda_v* libs missing — forcing fresh install"
-            pkill -9 -f "ollama serve" 2>/dev/null || true
-            sleep 2
-            rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /usr/share/ollama/lib
-            # Also wipe the persisted cache so the next boot doesn't restore
-            # the CPU-only install from /workspace.
-            rm -rf /workspace/.ollama-bin/lib /workspace/.ollama-bin/bin 2>/dev/null || true
-            local _try
-            for _try in 1 2 3; do
-                curl -fsSL https://ollama.com/install.sh | sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
-                if [ -d /usr/local/lib/ollama ] && ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
-                    log "ollama: GPU build installed ($(ollama --version 2>&1 | head -1))"
-                    break
-                fi
-                log "ollama: reinstall attempt ${_try}/3 still has no cuda libs; retrying in 3s..."
-                sleep 3
-            done
-            if [ ! -d /usr/local/lib/ollama ] || ! ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
-                log "ollama: WARN — reinstall finished but cuda_v* libs still missing; daemon will run on CPU."
+    # 1b. Validate GPU support. Fast path: if cuda_v* libs are already in
+    #     place, this whole block is a single stat call. Slow path (GPU
+    #     present but CPU-only install) triggers a forced reinstall — the
+    #     official installer occasionally mis-detects on RunPod's image
+    #     and ships the CPU-only payload, which then loads 24GB models on
+    #     CPU at ~50x slower than the GPU sitting idle next to it.
+    if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1 \
+       || ls /usr/share/ollama/lib/cuda_v* >/dev/null 2>&1; then
+        : # cuda libs present, nothing to do (silent fast path)
+    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        log "ollama: GPU detected but cuda_v* libs missing — forcing fresh install"
+        pkill -9 -f "ollama serve" 2>/dev/null || true
+        sleep 2
+        rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /usr/share/ollama/lib
+        # Wipe the persisted cache so the next boot doesn't restore the
+        # CPU-only install from /workspace.
+        rm -rf /workspace/.ollama-bin/lib /workspace/.ollama-bin/bin 2>/dev/null || true
+        local _try
+        for _try in 1 2 3; do
+            curl -fsSL https://ollama.com/install.sh | sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+            if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+                log "ollama: GPU build installed ($(ollama --version 2>&1 | head -1))"
+                break
             fi
-        else
-            log "ollama: GPU build present (cuda libs in $_ollama_lib_dir)"
+            log "ollama: reinstall attempt ${_try}/3 still has no cuda libs; retrying in 3s..."
+            sleep 3
+        done
+        if ! ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+            log "ollama: WARN — reinstall finished but cuda_v* libs still missing; daemon will run on CPU."
         fi
-    else
-        log "ollama: no GPU detected — skipping cuda-libs validation"
     fi
 
     # 2. If already running, healthcheck before returning.
