@@ -49,26 +49,6 @@ else
     echo "[install_ollama] Ollama already installed: $(ollama --version)"
 fi
 
-# 1b. Validate GPU support. The official installer occasionally drops
-#     the CPU-only payload on RunPod (no cuda_v* lib dir). With a GPU
-#     present, force a reinstall so we get the CUDA libs.
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    if ! ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
-        echo "[install_ollama] GPU detected but cuda_v* libs missing — reinstalling for GPU support"
-        pkill -9 -f "ollama serve" 2>/dev/null || true
-        sleep 2
-        rm -rf /usr/local/bin/ollama /usr/local/lib/ollama
-        curl -fsSL https://ollama.com/install.sh | sh
-        if ! ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
-            echo "[install_ollama] WARN — reinstall completed but cuda_v* libs still missing; daemon will run on CPU"
-        else
-            echo "[install_ollama] GPU build installed"
-        fi
-    else
-        echo "[install_ollama] GPU build verified (cuda libs present)"
-    fi
-fi
-
 # 2. Start (or reuse) the server in the background. We log to
 #    /workspace/ollama.log so the log itself persists too.
 if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
