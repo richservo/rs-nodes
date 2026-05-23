@@ -63,6 +63,11 @@ _ensure_ollama_inner() {
 
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+    # RunPod's container env can ship NVIDIA_VISIBLE_DEVICES=void, which
+    # makes the NVIDIA runtime hide all GPUs from ollama serve. The daemon
+    # then silently picks CPU at load time -- a 24GB model on CPU is ~50x
+    # slower than the A100 sitting idle next to it. Force visibility on.
+    export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
     mkdir -p "$OLLAMA_MODELS"
 
     # 1. Install binary if missing. Official installer puts it at
@@ -100,8 +105,9 @@ _ensure_ollama_inner() {
     fi
 
     # 3. Launch fully-detached so it survives ComfyUI death.
-    log "ollama: starting (OLLAMA_MODELS=$OLLAMA_MODELS, OLLAMA_HOST=$OLLAMA_HOST)..."
+    log "ollama: starting (OLLAMA_MODELS=$OLLAMA_MODELS, OLLAMA_HOST=$OLLAMA_HOST, NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)..."
     setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+        NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
         ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
     disown 2>/dev/null || true
 

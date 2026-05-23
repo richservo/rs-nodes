@@ -34,11 +34,15 @@ PORT="${COMFY_PORT:-8188}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
 OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+# RunPod containers can ship NVIDIA_VISIBLE_DEVICES=void which hides all
+# GPUs from ollama serve and forces silent CPU fallback. Force visibility
+# to 'all' (override via NVIDIA_VISIBLE_DEVICES_OVERRIDE if needed).
+NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
 RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
 RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf}"
 
-export OLLAMA_MODELS OLLAMA_HOST
+export OLLAMA_MODELS OLLAMA_HOST NVIDIA_VISIBLE_DEVICES
 
 # Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed,
 # blocking pip installs unless we opt in. The container is single-
@@ -551,8 +555,9 @@ EOF
     if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
         log "Ollama server already running on $OLLAMA_HOST"
     else
-        log "Starting Ollama server (OLLAMA_MODELS=$OLLAMA_MODELS)"
+        log "Starting Ollama server (OLLAMA_MODELS=$OLLAMA_MODELS, NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)"
         nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+            NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
             ollama serve > /workspace/ollama.log 2>&1 &
         for i in $(seq 1 30); do
             curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
