@@ -34,11 +34,14 @@ PORT="${COMFY_PORT:-8188}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
 OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+# Force NVIDIA_VISIBLE_DEVICES=all in case the container env hides GPUs
+# (RunPod sometimes ships NVIDIA_VISIBLE_DEVICES=void).
+NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
 RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
 RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf}"
 
-export OLLAMA_MODELS OLLAMA_HOST
+export OLLAMA_MODELS OLLAMA_HOST NVIDIA_VISIBLE_DEVICES
 
 # Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed,
 # blocking pip installs unless we opt in. The container is single-
@@ -548,11 +551,36 @@ EOF
     fi
     mkdir -p "$OLLAMA_MODELS"
 
+    # GPU build validation. Fast path noop if cuda_v* present. Slow path
+    # (GPU detected but cuda libs missing): wipe + reinstall, bounded
+    # to 3 tries.
+    if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+        : # GPU build present
+    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        log "ollama: GPU detected but cuda_v* libs missing — reinstalling (3 tries max)"
+        pkill -9 -f "ollama serve" 2>/dev/null || true
+        sleep 2
+        rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /workspace/.ollama-install
+        _BS_CUDA_OK=0
+        for _bsi in 1 2 3; do
+            curl -fsSL https://ollama.com/install.sh | sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+            if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+                log "ollama: GPU build installed on attempt ${_bsi}"
+                _BS_CUDA_OK=1
+                break
+            fi
+            log "ollama: attempt ${_bsi}/3 still missing cuda libs; retrying in 5s"
+            sleep 5
+        done
+        [ "$_BS_CUDA_OK" = "1" ] || log "ollama: GIVE UP — daemon will run on CPU on this template"
+    fi
+
     if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
         log "Ollama server already running on $OLLAMA_HOST"
     else
-        log "Starting Ollama server (OLLAMA_MODELS=$OLLAMA_MODELS)"
+        log "Starting Ollama server (OLLAMA_MODELS=$OLLAMA_MODELS, NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)"
         nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+            NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
             ollama serve > /workspace/ollama.log 2>&1 &
         for i in $(seq 1 30); do
             curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break

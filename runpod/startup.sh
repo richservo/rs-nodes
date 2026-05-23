@@ -63,6 +63,10 @@ _ensure_ollama_inner() {
 
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+    # RunPod containers can ship NVIDIA_VISIBLE_DEVICES=void, which hides
+    # all GPUs from ollama serve and forces silent CPU fallback. Override
+    # to 'all' (or NVIDIA_VISIBLE_DEVICES_OVERRIDE if user wants to pin).
+    export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
     mkdir -p "$OLLAMA_MODELS"
 
     # 1. Install binary if missing. Official installer puts it at
@@ -88,6 +92,39 @@ _ensure_ollama_inner() {
         log "ollama: binary present ($(ollama --version 2>&1 | head -1))"
     fi
 
+    # 1b. Cache-poison guard. Fast path: if cuda_v* libs are present, we
+    #     skip the entire block in a single stat call with no log output.
+    #     Slow path: GPU present but no cuda libs (because a previous pod
+    #     mirrored a CPU-only install to /workspace and init.sh restored
+    #     it here) -> wipe + reinstall, BOUNDED to 3 tries. If 3 retries
+    #     still fail, log a clear warning and let ollama run on CPU rather
+    #     than infinite-loop on a template where the installer can't
+    #     detect the GPU at all (looking at you, A100 template).
+    if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1 \
+       || ls /usr/share/ollama/lib/cuda_v* >/dev/null 2>&1; then
+        : # GPU build present — silent fast path
+    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        log "ollama: GPU detected but cuda_v* libs missing — wiping cache + reinstalling (3 tries max)"
+        pkill -9 -f "ollama serve" 2>/dev/null || true
+        sleep 2
+        rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /usr/share/ollama/lib
+        rm -rf /workspace/.ollama-install 2>/dev/null || true
+        local _try _ok=0
+        for _try in 1 2 3; do
+            curl -fsSL https://ollama.com/install.sh | sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+            if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+                log "ollama: GPU build installed on attempt ${_try}"
+                _ok=1
+                break
+            fi
+            log "ollama: reinstall attempt ${_try}/3 still missing cuda libs; retrying in 3s..."
+            sleep 3
+        done
+        if [ "$_ok" != "1" ]; then
+            log "ollama: GIVE UP — installer can't produce GPU build on this template after 3 tries. Daemon will run on CPU."
+        fi
+    fi
+
     # 2. If already running, healthcheck before returning.
     if pgrep -f "ollama serve" >/dev/null 2>&1; then
         if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
@@ -100,8 +137,9 @@ _ensure_ollama_inner() {
     fi
 
     # 3. Launch fully-detached so it survives ComfyUI death.
-    log "ollama: starting (OLLAMA_MODELS=$OLLAMA_MODELS, OLLAMA_HOST=$OLLAMA_HOST)..."
+    log "ollama: starting (OLLAMA_MODELS=$OLLAMA_MODELS, OLLAMA_HOST=$OLLAMA_HOST, NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)..."
     setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+        NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
         ollama serve >>/workspace/ollama.log 2>&1 </dev/null &
     disown 2>/dev/null || true
 

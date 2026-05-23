@@ -26,8 +26,11 @@ set -euo pipefail
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
 OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+# Force NVIDIA_VISIBLE_DEVICES=all in case the container env hides GPUs
+# (RunPod sometimes ships NVIDIA_VISIBLE_DEVICES=void).
+NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 
-export OLLAMA_MODELS OLLAMA_HOST
+export OLLAMA_MODELS OLLAMA_HOST NVIDIA_VISIBLE_DEVICES
 
 # DNS guard.
 if ! getent hosts ollama.com >/dev/null 2>&1; then
@@ -45,13 +48,38 @@ else
     echo "[install_ollama] Ollama already installed: $(ollama --version)"
 fi
 
+# 1b. GPU build validation. Fast path noop if cuda_v* present. Slow path
+#     (GPU detected but cuda libs missing): wipe + reinstall, bounded to
+#     3 tries so a broken template never infinite-loops.
+if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+    : # GPU build present
+elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    echo "[install_ollama] GPU detected but cuda_v* libs missing — reinstalling (3 tries max)"
+    pkill -9 -f "ollama serve" 2>/dev/null || true
+    sleep 2
+    rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /workspace/.ollama-install
+    _CUDA_OK=0
+    for _it in 1 2 3; do
+        curl -fsSL https://ollama.com/install.sh | sh
+        if ls /usr/local/lib/ollama/cuda_v* >/dev/null 2>&1; then
+            echo "[install_ollama] GPU build installed on attempt ${_it}"
+            _CUDA_OK=1
+            break
+        fi
+        echo "[install_ollama] attempt ${_it}/3 still missing cuda libs; retrying in 5s"
+        sleep 5
+    done
+    [ "$_CUDA_OK" = "1" ] || echo "[install_ollama] GIVE UP — daemon will run on CPU on this template"
+fi
+
 # 2. Start (or reuse) the server in the background. We log to
 #    /workspace/ollama.log so the log itself persists too.
 if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
     echo "[install_ollama] Ollama server already running on $OLLAMA_HOST"
 else
-    echo "[install_ollama] Starting Ollama server on $OLLAMA_HOST"
+    echo "[install_ollama] Starting Ollama server on $OLLAMA_HOST (NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES)"
     nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+        NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES" \
         ollama serve > /workspace/ollama.log 2>&1 &
 
     # Wait up to 60s for it to come up.
