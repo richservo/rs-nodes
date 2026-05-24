@@ -318,40 +318,6 @@ class RSLTXVGenerate:
                 logger.info(f"Audio duration {audio_duration:.2f}s → overriding num_frames: {num_frames} → {audio_num_frames}")
                 num_frames = audio_num_frames
 
-        # Frame compensation for keyframe strip.
-        # LTXVAddGuide.append_keyframe appends 1 latent frame per wired
-        # keyframe (first/middle/last image) and the post-sample strip at
-        # line ~820 removes them again -- net result is the user gets
-        # 8 pixel frames FEWER than requested per keyframe. Pre-pad
-        # num_frames upfront by 8 * num_keyframes so the final output
-        # equals (or exceeds) what the user asked for, NEVER less.
-        # Output must never silently drop frames -- pro workflows can't
-        # tolerate that.
-        #
-        # Skipped when audio is wired: the audio latent length is locked
-        # to the user-supplied waveform, so bumping the video latent
-        # would create a video/audio T-dim mismatch in the NestedTensor.
-        # In the audio+keyframes case the drift is inherent to LTXV's
-        # design and the user gets a warning instead.
-        _kf_pad = sum(1 for _img in (first_image, middle_image, last_image) if _img is not None)
-        if _kf_pad > 0:
-            if audio is not None and audio_vae is not None:
-                _expected_short = 8 * _kf_pad
-                logger.info(
-                    f"WARN: {_kf_pad} keyframe(s) wired with audio — output will be "
-                    f"{_expected_short} pixel frames short of {num_frames} (audio sync "
-                    f"prevents the usual frame-compensation pad). To get exact frame "
-                    f"counts, generate without audio and combine later."
-                )
-            else:
-                _orig_nf = num_frames
-                num_frames = num_frames + 8 * _kf_pad
-                logger.info(
-                    f"Keyframe compensation: requested {_orig_nf} pixel frames + "
-                    f"{_kf_pad} keyframe(s) → bumping internal num_frames to {num_frames} "
-                    f"so post-strip output yields {_orig_nf} frames as requested"
-                )
-
         # When upscaling, generate at half resolution — the 2x latent upscaler
         # brings it to the target width x height afterwards.
         # Round to 64-align so latent dims are even (required for IC-LoRA dsf=2)
