@@ -1810,10 +1810,26 @@ class RSLTXVGenerate:
                         output_latent = {"samples": upsampled}
 
                     # --- Normal re-diffusion ---
+                    # ALWAYS run rediff polish on the upscaled latent when
+                    # the user asked for it (upscale_steps > 0 and
+                    # upscale_denoise > 0). The previous gate of
+                    # `has_image_guides` was wrong -- IC-LoRA workflows
+                    # without first/middle/last image keyframes silently
+                    # skipped the polish and decoded the raw upscale-model
+                    # output, which looked dramatically worse than yesterday.
+                    # For IC-LoRA workflows we ALSO swap the guider to the
+                    # IC-LoRA guider so the control_image conditions the
+                    # polish (instead of generic Standard CFG that has no
+                    # idea about the IC-LoRA's structural input).
+                    do_rediffusion = upscale_denoise > 0 and upscale_steps > 0
                     has_image_guides = len(up_guides) > 0
-                    do_rediffusion = has_image_guides and upscale_denoise > 0 and upscale_steps > 0
+                    _p3_iclora_info = getattr(guider, 'control_info', None)
+                    _p3_use_iclora = _p3_iclora_info is not None and _p3_iclora_info.get("control_image") is not None
                     if do_rediffusion:
-                        logger.info(f"Pass 3 re-diffusion ({upscale_steps} steps, cfg={upscale_cfg})")
+                        logger.info(
+                            f"Pass 3 re-diffusion ({upscale_steps} steps, cfg={upscale_cfg}, "
+                            f"image_guides={has_image_guides}, iclora_guider={_p3_use_iclora})"
+                        )
                         # Free spatial upscale model VRAM before loading diffusion model
                         mm.unload_all_models()
                         gc.collect()
@@ -1884,10 +1900,22 @@ class RSLTXVGenerate:
 
                         logger.info(f"Pass 3 sigmas ({len(up_sig)}): {up_sig.tolist()}")
 
-                        # Standard CFGGuider — no IC-LoRA, no distilled
-                        up_guider = comfy.samplers.CFGGuider(up_model)
-                        up_guider.set_conds(positive, negative)
-                        up_guider.set_cfg(upscale_cfg)
+                        # IC-LoRA workflows: use IC-LoRA guider so the
+                        # control_image conditions the polish at full
+                        # resolution. Otherwise fall back to Standard
+                        # CFGGuider for plain T2V/keyframe upscales.
+                        if _p3_use_iclora:
+                            _, _, _p3_lt, _p3_lh, _p3_lw = upsampled.shape
+                            up_guider = self._rebuild_iclora_guider(
+                                up_model, positive, negative, vae,
+                                _p3_iclora_info, upscale_cfg,
+                                latent_h=_p3_lh, latent_w=_p3_lw, latent_t=_p3_lt,
+                                propagate_distilled_lora=False,
+                            )
+                        else:
+                            up_guider = comfy.samplers.CFGGuider(up_model)
+                            up_guider.set_conds(positive, negative)
+                            up_guider.set_cfg(upscale_cfg)
 
                         up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
                         up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
