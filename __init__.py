@@ -23,6 +23,7 @@ from .nodes.flux2_generate import RSFlux2Generate
 from .nodes.prompt_formatter_local import RSPromptFormatterLocal
 from .nodes.z_image_generate import RSZImageGenerate
 from .nodes.counter import RSCounter
+from .nodes.video_batch_loader import RSVideoBatchLoader
 from .nodes.frame_splitter import RSFrameSplitter
 from .nodes.frame_collector import RSFrameCollector
 from .nodes.ltxv_prepare_dataset import RSLTXVPrepareDataset
@@ -57,6 +58,7 @@ NODE_CLASS_MAPPINGS = {
     "RSPromptFormatterLocal": RSPromptFormatterLocal,
     "RSZImageGenerate": RSZImageGenerate,
     "RSCounter": RSCounter,
+    "RSVideoBatchLoader": RSVideoBatchLoader,
     "RSFrameSplitter": RSFrameSplitter,
     "RSFrameCollector": RSFrameCollector,
     "RSLTXVPrepareDataset": RSLTXVPrepareDataset,
@@ -90,6 +92,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSPromptFormatterLocal": "RS Prompt Formatter Local",
     "RSZImageGenerate": "RS Z-Image Generate",
     "RSCounter": "RS Counter",
+    "RSVideoBatchLoader": "RS Video Batch Loader",
     "RSFrameSplitter": "RS Frame Splitter",
     "RSFrameCollector": "RS Frame Collector",
     "RSLTXVPrepareDataset": "RS LTXV Prepare Dataset",
