@@ -1885,11 +1885,12 @@ class RSLTXVGenerate:
                         nz_omz = omz[non_zero]
                         sf = nz_omz[-1] / (1.0 - 0.1)
                         omz[non_zero] = nz_omz / sf
-                        up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
-                        start_step = int((1.0 - upscale_denoise) * upscale_steps)
-                        up_sig = up_sig[start_step:]
-
-                        logger.info(f"Pass 3 sigmas ({len(up_sig)}): {up_sig.tolist()}")
+                        # Keep the full (un-trimmed) schedule so the FG and BG
+                        # passes can each trim to their own denoise level.
+                        full_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+                        fg_start = int((1.0 - upscale_denoise) * upscale_steps)
+                        up_sig = full_sig[fg_start:]
+                        logger.info(f"Pass 3 sigmas (FG, {len(up_sig)}): {up_sig.tolist()}")
 
                         # Standard CFGGuider — no IC-LoRA, no distilled.
                         # Honours upscale_denoise / upscale_steps as the
@@ -1904,15 +1905,89 @@ class RSLTXVGenerate:
                         up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
                         up_sampler = sampler if sampler is not None else comfy.samplers.sampler_object("euler_ancestral")
 
-                        up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
-                        up_samples = up_guider.sample(
-                            up_noise, up_latent_image, up_sampler, up_sig,
-                            denoise_mask=up_noise_mask,
-                            callback=up_callback,
-                            disable_pbar=disable_pbar,
-                            seed=seed + 1,
-                        )
-                        up_samples = up_samples.to(mm.intermediate_device())
+                        # Two-pass FG/BG masked rediffusion. With a
+                        # rediffusion_mask wired, the foreground (subject)
+                        # always gets the full upscale_denoise pass, then a
+                        # SECOND pass rediffuses only the background at
+                        # upscale_denoise * rediffusion_mask_strength with its
+                        # own (shorter) sigma schedule. Each region gets its
+                        # correct step count -- a single masked pass can't do
+                        # that since it has one global sigma schedule.
+                        # rediffusion_mask_strength here is the BG denoise
+                        # multiplier (NOT a mask blend): 0 = BG untouched
+                        # (pure spatial upscale), 0.5 = BG at half the FG
+                        # denoise, 1.0 = BG same as FG.
+                        if rediffusion_mask is not None:
+                            _, _, _, up_lat_h, up_lat_w = upsampled.shape
+                            _vid0 = up_combined.unbind()[0] if up_combined.is_nested else up_combined
+                            _dt = _vid0.dtype
+                            _b, _c, _t, _h, _w = _vid0.shape
+                            # Dilated + feathered subject mask (1=FG, 0=BG).
+                            fg = self._feather_mask(rediffusion_mask, up_lat_h, up_lat_w, _vid0.device, _dt)
+
+                            # Split base noise_mask into video + audio parts.
+                            if up_noise_mask is not None and up_noise_mask.is_nested:
+                                base_vid_nm, base_aud_nm = up_noise_mask.unbind()
+                            elif up_noise_mask is not None:
+                                base_vid_nm, base_aud_nm = up_noise_mask, None
+                            else:
+                                base_vid_nm, base_aud_nm = None, None
+                            if base_vid_nm is None:
+                                base_vid_nm = torch.ones(_b, 1, _t, 1, 1, device=_vid0.device, dtype=_dt)
+
+                            def _nest(vid_nm):
+                                if up_combined.is_nested and base_aud_nm is not None:
+                                    return comfy.nested_tensor.NestedTensor((vid_nm, base_aud_nm))
+                                return vid_nm
+
+                            # --- Pass 1: foreground at full upscale_denoise ---
+                            fg_nm = _nest(base_vid_nm * fg)
+                            up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                            logger.info(
+                                f"Pass 3 FG rediff: denoise={upscale_denoise}, "
+                                f"{len(up_sig) - 1} steps, subject mask"
+                            )
+                            up_samples = up_guider.sample(
+                                up_noise, up_latent_image, up_sampler, up_sig,
+                                denoise_mask=fg_nm, callback=up_callback,
+                                disable_pbar=disable_pbar, seed=seed + 1,
+                            )
+                            up_samples = up_samples.to(mm.intermediate_device())
+
+                            # --- Pass 2: background at upscale_denoise * strength ---
+                            bg_denoise = upscale_denoise * rediffusion_mask_strength
+                            bg_start = int((1.0 - bg_denoise) * upscale_steps)
+                            bg_sig = full_sig[bg_start:]
+                            if bg_denoise > 0 and len(bg_sig) >= 2:
+                                bg_latent = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_samples)
+                                bg_noise = comfy.sample.prepare_noise(bg_latent, seed + 2)
+                                bg_nm = _nest(base_vid_nm * (1.0 - fg))
+                                bg_cb = latent_preview.prepare_callback(up_guider.model_patcher, bg_sig.shape[-1] - 1)
+                                logger.info(
+                                    f"Pass 3 BG rediff: denoise={bg_denoise:.3f}, "
+                                    f"{len(bg_sig) - 1} steps, inverted mask"
+                                )
+                                up_samples = up_guider.sample(
+                                    bg_noise, bg_latent, up_sampler, bg_sig,
+                                    denoise_mask=bg_nm, callback=bg_cb,
+                                    disable_pbar=disable_pbar, seed=seed + 2,
+                                )
+                                up_samples = up_samples.to(mm.intermediate_device())
+                            else:
+                                logger.info(
+                                    f"Pass 3 BG rediff skipped (bg_denoise={bg_denoise:.3f}) "
+                                    f"— background stays pure spatial upscale"
+                                )
+                        else:
+                            up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                            up_samples = up_guider.sample(
+                                up_noise, up_latent_image, up_sampler, up_sig,
+                                denoise_mask=up_noise_mask,
+                                callback=up_callback,
+                                disable_pbar=disable_pbar,
+                                seed=seed + 1,
+                            )
+                            up_samples = up_samples.to(mm.intermediate_device())
 
                         if up_samples.is_nested:
                             up_parts = up_samples.unbind()
@@ -2460,6 +2535,38 @@ class RSLTXVGenerate:
         m = m.unsqueeze(2).to(device=noise_mask.device, dtype=noise_mask.dtype)
 
         return noise_mask * m
+
+    @staticmethod
+    def _feather_mask(mask, latent_h, latent_w, device, dtype, dilate=2, blur=3):
+        """Resize a subject mask to latent dims, grow it slightly, and feather
+        the edge so the two-pass FG/BG rediffusion has no hard seam.
+
+        Returns [1, 1, 1, latent_h, latent_w] in [0,1] — broadcasts over
+        batch and time. 1 = foreground, 0 = background, fractional at the
+        feathered boundary so the FG and BG passes blend across it.
+        """
+        import torch.nn.functional as F
+
+        if mask.ndim == 2:
+            m = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.ndim == 3:
+            m = mask[:1].unsqueeze(0)
+        else:
+            m = mask
+        m = m.float()
+        m = F.interpolate(m, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
+
+        # Grow (dilate) so the FG pass slightly overshoots the subject edge,
+        # then blur to feather. Both kernels are tiny in latent space.
+        if dilate > 0:
+            k = dilate * 2 + 1
+            m = F.max_pool2d(m, kernel_size=k, stride=1, padding=dilate)
+        if blur > 0:
+            k = blur if blur % 2 == 1 else blur + 1
+            m = F.avg_pool2d(m, kernel_size=k, stride=1, padding=k // 2)
+        m = m.clamp(0.0, 1.0)
+
+        return m.unsqueeze(2).to(device=device, dtype=dtype)
 
     def _free_vram(self):
         """Unload models and flush all VRAM/RAM caches."""
