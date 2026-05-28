@@ -2431,11 +2431,18 @@ class RSLTXVGenerate:
 
     @staticmethod
     def _apply_rediffusion_mask(noise_mask, mask, strength=1.0, latent_h=None, latent_w=None):
-        """Multiply noise_mask by a spatial mask resized to latent dims.
+        """Scale noise_mask by a spatial mask resized to latent dims.
+
+        Inside the mask = ALWAYS full denoise (100%). Outside the mask =
+        lifts from 0 to full as `strength` increases. This is the direct
+        direction: higher strength = more background rediffusion.
 
         noise_mask: [B, 1, T, H, W] — existing rediffusion mask (may have 1x1 spatial)
-        mask: [H, W] or [B, H, W] — pixel-space subject mask (1=rediffuse, 0=preserve)
-        strength: 0.0 = ignore mask entirely, 1.0 = full mask effect
+        mask: [H, W] or [B, H, W] — pixel-space subject mask (1=foreground/full, 0=background)
+        strength: background lift.
+            0.0 = background gets NO rediffusion (pure spatial upscale)
+            1.0 = background gets FULL rediffusion (same as foreground = no mask)
+            0.5 = background gets half the foreground's denoise
         latent_h/latent_w: actual latent spatial dims (required when noise_mask is 1x1)
         """
         import torch.nn.functional as F
@@ -2453,8 +2460,10 @@ class RSLTXVGenerate:
             _, _, _, latent_h, latent_w = noise_mask.shape
         m = F.interpolate(m.float(), size=(latent_h, latent_w), mode="bilinear", align_corners=False)
 
-        # Blend: strength=1 → full mask, strength=0 → all ones (no masking)
-        m = m * strength + (1.0 - strength)
+        # Inside (mask=1) always 1.0; outside (mask=0) = strength.
+        #   m = mask + (1 - mask) * strength
+        # strength=0 → outside 0 (no bg rediff); strength=1 → outside 1 (no mask).
+        m = m + (1.0 - m) * strength
 
         # Broadcast: [1, 1, 1, H, W] — applies uniformly across time and channels
         m = m.unsqueeze(2).to(device=noise_mask.device, dtype=noise_mask.dtype)
