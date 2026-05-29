@@ -1922,8 +1922,9 @@ class RSLTXVGenerate:
                             _vid0 = up_combined.unbind()[0] if up_combined.is_nested else up_combined
                             _dt = _vid0.dtype
                             _b, _c, _t, _h, _w = _vid0.shape
-                            # Dilated + feathered subject mask (1=FG, 0=BG).
-                            fg = self._feather_mask(rediffusion_mask, up_lat_h, up_lat_w, _vid0.device, _dt)
+                            # Dilated + feathered subject mask (1=FG, 0=BG),
+                            # per-frame so an animated mask tracks the subject.
+                            fg = self._feather_mask(rediffusion_mask, _t, up_lat_h, up_lat_w, _vid0.device, _dt)
 
                             # Split base noise_mask into video + audio parts.
                             if up_noise_mask is not None and up_noise_mask.is_nested:
@@ -2505,72 +2506,44 @@ class RSLTXVGenerate:
         return up_guider
 
     @staticmethod
-    def _mask_to_hw(mask):
-        """Normalize any MASK or IMAGE mask input to a [1, 1, H, W] float tensor.
+    def _mask_to_thw(mask):
+        """Normalize any MASK or IMAGE mask input to a [T, H, W] float tensor,
+        PRESERVING the temporal dimension so animated masks track per-frame.
 
         Accepts:
-          MASK  [H, W] / [B, H, W]
-          IMAGE [H, W, C] / [B, H, W, C]  (C = 1/3/4, channels-last)
-        Collapses channels by max (any non-black pixel reads as masked) and
-        takes the first batch element. White = foreground/subject = 1.
+          MASK  [H, W] / [T, H, W]
+          IMAGE [T, H, W, C] / [B, T, H, W, C]  (C = 1/3/4, channels-last;
+                ComfyUI IMAGE batches frames as the leading dim)
+        Collapses channels by max (any non-black pixel reads as masked).
+        White = foreground/subject = 1. A single-frame mask returns T=1
+        (broadcasts over all video frames downstream).
         """
         m = mask.float()
-        if m.ndim == 5:          # [B, T, H, W, C] — take batch 0, frame 0
-            m = m[0, 0]
-        if m.ndim == 4:          # [B, H, W, C] IMAGE — take batch 0
-            m = m[0]
-        if m.ndim == 3:
-            # [H, W, C] (IMAGE channels-last) vs [B, H, W] (MASK batch)
-            if m.shape[-1] in (1, 3, 4):
-                m = m.max(dim=-1).values     # collapse channels → [H, W]
-            else:
-                m = m[0]                     # first batch → [H, W]
-        # m is now [H, W]
-        return m.unsqueeze(0).unsqueeze(0)   # [1, 1, H, W]
+        if m.ndim == 5:                  # [B, T, H, W, C] → drop batch
+            m = m[0]                     # [T, H, W, C]
+        if m.ndim == 4:                  # IMAGE [T, H, W, C] (frames = leading dim)
+            m = m.max(dim=-1).values     # collapse channels → [T, H, W]
+        elif m.ndim == 2:                # MASK [H, W]
+            m = m.unsqueeze(0)           # [1, H, W]
+        # ndim == 3 → MASK [T, H, W], already correct
+        return m                         # [T, H, W]
 
     @staticmethod
-    def _apply_rediffusion_mask(noise_mask, mask, strength=1.0, latent_h=None, latent_w=None):
-        """Multiply noise_mask by a spatial mask resized to latent dims.
+    def _resize_mask_to_latent(m_thw, latent_t, latent_h, latent_w, device, dtype,
+                               dilate=0, blur=0):
+        """Resize a [T, H, W] mask to [1, 1, latent_t, latent_h, latent_w].
 
-        noise_mask: [B, 1, T, H, W] — existing rediffusion mask (may have 1x1 spatial)
-        mask: MASK or IMAGE — subject mask (white/1=rediffuse subject, black/0=preserve bg)
-        strength: 0.0 = ignore mask entirely, 1.0 = full mask effect
-        latent_h/latent_w: actual latent spatial dims (required when noise_mask is 1x1)
+        Spatial resize per frame, optional dilate + feather per frame, then
+        temporal resample (even index selection) from the mask's frame count
+        to the latent temporal length so each latent frame gets its own mask
+        slice — animated masks track the moving subject.
         """
         import torch.nn.functional as F
 
-        # Normalize MASK/IMAGE → [1, 1, H, W] for interpolation
-        m = RSLTXVGenerate._mask_to_hw(mask)
-
-        # Use explicit latent dims if provided, otherwise read from noise_mask
-        if latent_h is None or latent_w is None:
-            _, _, _, latent_h, latent_w = noise_mask.shape
-        m = F.interpolate(m.float(), size=(latent_h, latent_w), mode="bilinear", align_corners=False)
-
-        # Blend: strength=1 → full mask, strength=0 → all ones (no masking)
-        m = m * strength + (1.0 - strength)
-
-        # Broadcast: [1, 1, 1, H, W] — applies uniformly across time and channels
-        m = m.unsqueeze(2).to(device=noise_mask.device, dtype=noise_mask.dtype)
-
-        return noise_mask * m
-
-    @staticmethod
-    def _feather_mask(mask, latent_h, latent_w, device, dtype, dilate=2, blur=3):
-        """Resize a subject mask to latent dims, grow it slightly, and feather
-        the edge so the two-pass FG/BG rediffusion has no hard seam.
-
-        Returns [1, 1, 1, latent_h, latent_w] in [0,1] — broadcasts over
-        batch and time. 1 = foreground, 0 = background, fractional at the
-        feathered boundary so the FG and BG passes blend across it.
-        """
-        import torch.nn.functional as F
-
-        m = RSLTXVGenerate._mask_to_hw(mask)
+        t = m_thw.shape[0]
+        # Spatial: [T, H, W] → [T, 1, H, W] → interpolate → [T, 1, lat_h, lat_w]
+        m = m_thw.unsqueeze(1).float()
         m = F.interpolate(m, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
-
-        # Grow (dilate) so the FG pass slightly overshoots the subject edge,
-        # then blur to feather. Both kernels are tiny in latent space.
         if dilate > 0:
             k = dilate * 2 + 1
             m = F.max_pool2d(m, kernel_size=k, stride=1, padding=dilate)
@@ -2579,7 +2552,56 @@ class RSLTXVGenerate:
             m = F.avg_pool2d(m, kernel_size=k, stride=1, padding=k // 2)
         m = m.clamp(0.0, 1.0)
 
-        return m.unsqueeze(2).to(device=device, dtype=dtype)
+        # Temporal: resample T → latent_t by even index selection. T=1 just
+        # repeats the single frame across all latent frames.
+        if t != latent_t:
+            idx = torch.linspace(0, t - 1, latent_t).round().long().clamp(0, t - 1)
+            m = m[idx]                          # [latent_t, 1, lat_h, lat_w]
+
+        # → [1, 1, latent_t, lat_h, lat_w]
+        m = m.squeeze(1).unsqueeze(0).unsqueeze(0)
+        return m.to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _apply_rediffusion_mask(noise_mask, mask, strength=1.0, latent_h=None, latent_w=None):
+        """Multiply noise_mask by a spatial mask resized to latent dims.
+
+        noise_mask: [B, 1, T, H, W] — existing rediffusion mask (may have 1x1 spatial)
+        mask: MASK or IMAGE — subject mask (white/1=rediffuse subject, black/0=preserve bg).
+              Animated masks are applied per-frame.
+        strength: 0.0 = ignore mask entirely, 1.0 = full mask effect
+        latent_h/latent_w: actual latent spatial dims (required when noise_mask is 1x1)
+        """
+        latent_t = noise_mask.shape[2]
+        if latent_h is None or latent_w is None:
+            _, _, _, latent_h, latent_w = noise_mask.shape
+
+        m_thw = RSLTXVGenerate._mask_to_thw(mask)
+        m = RSLTXVGenerate._resize_mask_to_latent(
+            m_thw, latent_t, latent_h, latent_w, noise_mask.device, noise_mask.dtype
+        )
+
+        # Blend: strength=1 → full mask, strength=0 → all ones (no masking)
+        m = m * strength + (1.0 - strength)
+
+        return noise_mask * m
+
+    @staticmethod
+    def _feather_mask(mask, latent_t, latent_h, latent_w, device, dtype, dilate=2, blur=3):
+        """Resize a subject mask to latent dims (per-frame), grow it slightly,
+        and feather the edge so the two-pass FG/BG rediffusion has no hard seam.
+
+        Returns [1, 1, latent_t, latent_h, latent_w] in [0,1]. Animated masks
+        track per-frame (each latent frame gets its own mask slice); a static
+        single-frame mask repeats across all frames. 1 = foreground, 0 =
+        background, fractional at the feathered boundary so the FG and BG
+        passes blend across it.
+        """
+        m_thw = RSLTXVGenerate._mask_to_thw(mask)
+        return RSLTXVGenerate._resize_mask_to_latent(
+            m_thw, latent_t, latent_h, latent_w, device, dtype,
+            dilate=dilate, blur=blur,
+        )
 
     def _free_vram(self):
         """Unload models and flush all VRAM/RAM caches."""
