@@ -92,8 +92,8 @@ class RSLTXVGenerate:
                 "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 "upscale_tiling":    ("BOOLEAN", {"default": False, "tooltip": "Enable temporal tiling for upscale. Reduces VRAM but will cause temporal instability in fine details. Use ffn_chunks instead if possible."}),
                 "upscale_tile_t":    ("INT",     {"default": 4, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size (latent frames) when upscale_tiling is enabled (0 = auto). Reduce if OOM during upscale."}),
-                "rediffusion_mask":  ("MASK", {"tooltip": "Spatial mask for rediffusion. 1=rediffuse (subject), 0=preserve (background). Use RMBG to generate."}),
-                "rediffusion_mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength of the rediffusion mask. 0=ignore mask (full rediffusion everywhere), 1=full mask effect."}),
+                "rediffusion_mask":  ("IMAGE", {"tooltip": "Spatial mask image for rediffusion (white=subject/foreground, black=background). Accepts a raster image mask (SAM3 / RMBG / any IMAGE) — converted to a mask internally."}),
+                "rediffusion_mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Background denoise multiplier for the two-pass upscale rediffusion. Foreground (mask) always gets full upscale_denoise; background gets upscale_denoise * this. 0=background untouched (pure spatial upscale), 0.5=half, 1.0=same as foreground."}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": True}),
                 "tile_t":            ("INT",     {"default": 0, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size for VAE decode (0 = auto). Lower values reduce VRAM but may cause seams."}),
@@ -2505,23 +2505,42 @@ class RSLTXVGenerate:
         return up_guider
 
     @staticmethod
+    def _mask_to_hw(mask):
+        """Normalize any MASK or IMAGE mask input to a [1, 1, H, W] float tensor.
+
+        Accepts:
+          MASK  [H, W] / [B, H, W]
+          IMAGE [H, W, C] / [B, H, W, C]  (C = 1/3/4, channels-last)
+        Collapses channels by max (any non-black pixel reads as masked) and
+        takes the first batch element. White = foreground/subject = 1.
+        """
+        m = mask.float()
+        if m.ndim == 5:          # [B, T, H, W, C] — take batch 0, frame 0
+            m = m[0, 0]
+        if m.ndim == 4:          # [B, H, W, C] IMAGE — take batch 0
+            m = m[0]
+        if m.ndim == 3:
+            # [H, W, C] (IMAGE channels-last) vs [B, H, W] (MASK batch)
+            if m.shape[-1] in (1, 3, 4):
+                m = m.max(dim=-1).values     # collapse channels → [H, W]
+            else:
+                m = m[0]                     # first batch → [H, W]
+        # m is now [H, W]
+        return m.unsqueeze(0).unsqueeze(0)   # [1, 1, H, W]
+
+    @staticmethod
     def _apply_rediffusion_mask(noise_mask, mask, strength=1.0, latent_h=None, latent_w=None):
         """Multiply noise_mask by a spatial mask resized to latent dims.
 
         noise_mask: [B, 1, T, H, W] — existing rediffusion mask (may have 1x1 spatial)
-        mask: [H, W] or [B, H, W] — pixel-space subject mask (1=rediffuse, 0=preserve)
+        mask: MASK or IMAGE — subject mask (white/1=rediffuse subject, black/0=preserve bg)
         strength: 0.0 = ignore mask entirely, 1.0 = full mask effect
         latent_h/latent_w: actual latent spatial dims (required when noise_mask is 1x1)
         """
         import torch.nn.functional as F
 
-        # Ensure 2D → [1, 1, H, W] for interpolation
-        if mask.ndim == 2:
-            m = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.ndim == 3:
-            m = mask[:1].unsqueeze(0)  # take first batch, add channel dim
-        else:
-            m = mask
+        # Normalize MASK/IMAGE → [1, 1, H, W] for interpolation
+        m = RSLTXVGenerate._mask_to_hw(mask)
 
         # Use explicit latent dims if provided, otherwise read from noise_mask
         if latent_h is None or latent_w is None:
@@ -2547,13 +2566,7 @@ class RSLTXVGenerate:
         """
         import torch.nn.functional as F
 
-        if mask.ndim == 2:
-            m = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.ndim == 3:
-            m = mask[:1].unsqueeze(0)
-        else:
-            m = mask
-        m = m.float()
+        m = RSLTXVGenerate._mask_to_hw(mask)
         m = F.interpolate(m, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
 
         # Grow (dilate) so the FG pass slightly overshoots the subject edge,
