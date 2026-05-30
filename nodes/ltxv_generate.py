@@ -2588,18 +2588,19 @@ class RSLTXVGenerate:
 
     @staticmethod
     def _feather_mask(mask, latent_t, latent_h, latent_w, device, dtype):
-        """Resize a subject mask to latent dims (per-frame). Straight mask —
-        no dilation, no feathering. Returns [1, 1, latent_t, latent_h,
-        latent_w] in [0,1]. Animated masks track per-frame; static masks
-        repeat across all frames. 1 = foreground, 0 = background.
+        """Resize a subject mask to latent dims (per-frame). Light feather
+        only — NO dilation. Returns [1, 1, latent_t, latent_h, latent_w]
+        in [0,1]. Animated masks track per-frame; static masks repeat
+        across all frames. 1 = foreground, 0 = background.
 
-        Feather/dilate was removed because it produced visible artifacts at
-        the FG/BG boundary in the two-pass rediffusion.
+        Dilation was removed because growing the mask over the boundary
+        caused visible edge artifacts in the two-pass rediffusion. Light
+        blur is kept so the FG/BG passes don't show a hard seam.
         """
         m_thw = RSLTXVGenerate._mask_to_thw(mask)
         return RSLTXVGenerate._resize_mask_to_latent(
             m_thw, latent_t, latent_h, latent_w, device, dtype,
-            dilate=0, blur=0,
+            dilate=0, blur=3,
         )
 
     def _free_vram(self):
