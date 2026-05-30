@@ -478,6 +478,29 @@ COMFY_REQ="/workspace/ComfyUI/requirements.txt"
 COMFY_VENV_PY="/workspace/.venv/bin/python"
 COMFY_VENV_PIP="/workspace/.venv/bin/pip"
 if [ -f "$COMFY_REQ" ] && [ -x "$COMFY_VENV_PY" ] && [ -x "$COMFY_VENV_PIP" ]; then
+    # Numpy/scipy ABI mismatch pre-flight. When pip upgrades scipy past a
+    # major-numpy boundary (e.g. scipy 1.17 needs numpy 2.x) but numpy
+    # stays back at 1.x — typically because a previous bootstrap was
+    # interrupted mid-pip-install — scipy.ndimage fails to import with:
+    #   "ImportError: numpy._core.multiarray failed to import"
+    # ComfyUI's main.py imports scipy.ndimage transitively, so the
+    # container boot-loops on every restart. The standard 'pip install
+    # -r requirements.txt' heal below sees everything as "already
+    # satisfied" and doesn't bump numpy. Fix it explicitly here.
+    if ! ( "$COMFY_VENV_PY" -c "import scipy.ndimage" 2>/dev/null ); then
+        echo "[init] scipy.ndimage import failing — likely numpy/scipy ABI mismatch from an interrupted bootstrap"
+        echo "[init] Forcing numpy>=2.1 to match modern scipy ABI..."
+        if "$COMFY_VENV_PIP" install --upgrade "numpy>=2.1,<3" 2>&1 | sed 's/^/[numpy-fix] /'; then
+            if "$COMFY_VENV_PY" -c "import scipy.ndimage" 2>/dev/null; then
+                echo "[init] scipy.ndimage now imports cleanly — boot loop should clear on next launch."
+            else
+                echo "[init] WARN: scipy.ndimage still failing after numpy bump. May need full bootstrap."
+            fi
+        else
+            echo "[init] WARN: numpy upgrade failed — check network / pip."
+        fi
+    fi
+
     if ! ( cd /workspace/ComfyUI && "$COMFY_VENV_PY" -c "
 import sys
 sys.path.insert(0, '/workspace/ComfyUI')
