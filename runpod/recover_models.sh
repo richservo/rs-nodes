@@ -236,6 +236,7 @@ MODELS=(
     # === IC-LoRAs ===
     "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|550"
     "loras|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control|ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors|280"
+    "loras|ltx-2-19b-ic-lora-detailer.safetensors|Lightricks/LTX-2-19b-IC-LoRA-Detailer|ltx-2-19b-ic-lora-detailer.safetensors|250"
 
     # === Add more here as needed. Examples (uncomment + verify repo paths + sizes) ===
     # "loras|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-HDR|ltx-2.3-22b-ic-lora-hdr-0.9.safetensors|550"

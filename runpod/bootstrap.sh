@@ -442,6 +442,7 @@ MODELS=(
     "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
     "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
     "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+    "loras|ltx-2-19b-ic-lora-detailer.safetensors|Lightricks/LTX-2-19b-IC-LoRA-Detailer|ltx-2-19b-ic-lora-detailer.safetensors"
 )
 if [ "${RS_LTX_BF16:-1}" = "1" ]; then
     MODELS+=("checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors")
