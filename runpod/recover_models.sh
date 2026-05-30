@@ -110,7 +110,11 @@ fi
 
 echo "=== Phase 0: ComfyUI core ==="
 
-# Clone ComfyUI if missing
+# Clone OR git-pull ComfyUI. Missing → clone. Present → pull latest.
+# Pulling ALWAYS matters: custom node packs (ComfyUI-LTXVideo etc.) get
+# updated more frequently than the user runs SETUP=TRUE, and they expect
+# constants / API surface that older ComfyUI commits don't export. The
+# ADALN_BASE_PARAMS_COUNT ImportError is exactly this scenario.
 if [ ! -d "$COMFY_DIR/.git" ]; then
     echo "→ ComfyUI missing — cloning to $COMFY_DIR"
     if git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"; then
@@ -120,26 +124,49 @@ if [ ! -d "$COMFY_DIR/.git" ]; then
         exit 1
     fi
 else
-    echo "  OK   ComfyUI present at $COMFY_DIR"
+    echo "→ ComfyUI present — pulling latest"
+    pre=$(git -C "$COMFY_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")
+    if git -C "$COMFY_DIR" pull --ff-only 2>&1 | sed 's/^/    /'; then
+        post=$(git -C "$COMFY_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")
+        if [ "$pre" = "$post" ]; then
+            echo "  OK   already at latest ($post)"
+        else
+            echo "  ✓ updated $pre → $post"
+        fi
+    else
+        echo "  WARN: git pull failed (local changes / conflict?). Continuing with current HEAD."
+    fi
 fi
 
-# Clone rs-nodes if missing
+# Clone OR git-pull rs-nodes. Same idea.
 if [ ! -d "$RS_NODES_DIR/.git" ]; then
     echo "→ rs-nodes missing — cloning"
     if git clone https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"; then
-        # submodule (LTX-2)
         git -C "$RS_NODES_DIR" submodule update --init --recursive 2>&1 | sed 's/^/    /' || true
         echo "  ✓ cloned"
     else
         echo "  ✗ git clone failed for rs-nodes — continuing without it"
     fi
 else
-    echo "  OK   rs-nodes present"
+    echo "→ rs-nodes present — pulling latest"
+    pre=$(git -C "$RS_NODES_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")
+    if git -C "$RS_NODES_DIR" pull --ff-only 2>&1 | sed 's/^/    /'; then
+        post=$(git -C "$RS_NODES_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")
+        if [ "$pre" = "$post" ]; then
+            echo "  OK   already at latest ($post)"
+        else
+            echo "  ✓ updated $pre → $post"
+        fi
+        git -C "$RS_NODES_DIR" submodule update --init --recursive 2>&1 | sed 's/^/    /' || true
+    else
+        echo "  WARN: git pull failed for rs-nodes. Continuing with current HEAD."
+    fi
 fi
 
 # Verify ComfyUI imports work; if not, run pip install -r requirements.txt.
-# This catches the case where ComfyUI updated but the venv didn't get the
-# new small deps (comfyui_workflow_templates, etc.).
+# After a git pull this catches cases where ComfyUI added new pip deps
+# (comfyui_workflow_templates, comfyui_frontend_package, etc.) that the
+# venv doesn't have yet.
 echo "→ Checking ComfyUI imports..."
 if ( cd "$COMFY_DIR" && "$VENV_PY" -c "
 import sys
@@ -324,7 +351,6 @@ NODE_PACKS=(
     # === Preprocessors / control inputs ===
     "comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
     "ComfyUI-Video-Depth-Anything|https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything.git"
-    "ComfyUI-DepthAnythingV2|https://github.com/kijai/ComfyUI-DepthAnythingV2.git"
 
     # === Wan family (you had these per earlier logs) ===
     "ComfyUI-WanVideoWrapper|https://github.com/kijai/ComfyUI-WanVideoWrapper.git"

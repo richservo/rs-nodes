@@ -12,7 +12,7 @@
 #   RS_INSTALL_OLLAMA — set to "0" to skip Ollama (default: "1")
 #   RS_LAUNCH_COMFY   — set to "0" to skip the final ComfyUI launch (default: "1")
 #   RS_NODE_PACKS     — space-separated key list for install_extras pack set
-#                       (default: "vhs controlnet_aux essentials ltxvideo sam3")
+#                       (default: "vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf video_depth_anything")
 #
 # Examples:
 #   bash /workspace/bootstrap.sh
@@ -39,7 +39,7 @@ OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
 NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
 RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
 RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
-RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf}"
+RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf video_depth_anything}"
 
 export OLLAMA_MODELS OLLAMA_HOST NVIDIA_VISIBLE_DEVICES
 
@@ -347,6 +347,7 @@ declare -A NODE_PACKS=(
     [ltxvideo]="ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
     [seedvr2]="ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
     [res4lyf]="RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
+    [video_depth_anything]="ComfyUI-Video-Depth-Anything|https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything.git"
 )
 
 CUSTOM_NODES_DIR="$COMFY_DIR/custom_nodes"
