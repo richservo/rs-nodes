@@ -2587,20 +2587,19 @@ class RSLTXVGenerate:
         return noise_mask * m
 
     @staticmethod
-    def _feather_mask(mask, latent_t, latent_h, latent_w, device, dtype, dilate=2, blur=3):
-        """Resize a subject mask to latent dims (per-frame), grow it slightly,
-        and feather the edge so the two-pass FG/BG rediffusion has no hard seam.
+    def _feather_mask(mask, latent_t, latent_h, latent_w, device, dtype):
+        """Resize a subject mask to latent dims (per-frame). Straight mask —
+        no dilation, no feathering. Returns [1, 1, latent_t, latent_h,
+        latent_w] in [0,1]. Animated masks track per-frame; static masks
+        repeat across all frames. 1 = foreground, 0 = background.
 
-        Returns [1, 1, latent_t, latent_h, latent_w] in [0,1]. Animated masks
-        track per-frame (each latent frame gets its own mask slice); a static
-        single-frame mask repeats across all frames. 1 = foreground, 0 =
-        background, fractional at the feathered boundary so the FG and BG
-        passes blend across it.
+        Feather/dilate was removed because it produced visible artifacts at
+        the FG/BG boundary in the two-pass rediffusion.
         """
         m_thw = RSLTXVGenerate._mask_to_thw(mask)
         return RSLTXVGenerate._resize_mask_to_latent(
             m_thw, latent_t, latent_h, latent_w, device, dtype,
-            dilate=dilate, blur=blur,
+            dilate=0, blur=0,
         )
 
     def _free_vram(self):
