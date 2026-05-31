@@ -1025,27 +1025,35 @@ class ICLoRAGuider(MultimodalGuider):
             images = self._control_pixels
             num_frames_to_keep = ((images.shape[0] - 1) // time_sf) * time_sf + 1
             images = images[:num_frames_to_keep]
-            causal_fix = self._guide_frame_idx == 0 or num_frames_to_keep == 1
-            if not causal_fix:
-                images = torch.cat([images[:1], images], dim=0)
+            causal_fix = True  # per-frame: each frame is its own latent, no causal prepend needed
 
-            # --- Encode at reduced resolution (matches official iclora.py:174-185) ---
-            # The official IC-LoRA encode computes:
-            #   target = int(latent_dim * scale_factor / dsf)
-            # We pass latent_dim/dsf to base LTXVAddGuide.encode which multiplies
-            # by scale_factor internally, producing the same pixel resolution.
+            # --- PER-FRAME encode: one VAE pass per pixel frame, so the
+            # guide latent has one slot per pixel frame instead of one
+            # slot per 8 pixel frames. The causal VAE's normal 8:1 temporal
+            # compression averages 8 consecutive frames into one latent,
+            # which is why motion from a control video reads as "off by
+            # a few frames" -- the latent center is in the middle of an
+            # 8-frame averaging window. Per-frame encode gives the LoRA
+            # access to every pixel frame's content separately so motion
+            # can be tracked at full granularity.
+            # Trade-off: ~8x more tokens during sampling (slower, more
+            # VRAM). If the LoRA produces worse output because this is
+            # outside its training distribution, revert this block.
             enc_w = latent_w // dsf if dsf > 1 else latent_w
             enc_h = latent_h // dsf if dsf > 1 else latent_h
-            _, guide_latent = LTXVAddGuide.encode(
-                self._vae, enc_w, enc_h, images, scale_factors
+            frame_latents = []
+            for fi in range(images.shape[0]):
+                single = images[fi:fi + 1]
+                _, fl = LTXVAddGuide.encode(
+                    self._vae, enc_w, enc_h, single, scale_factors
+                )
+                frame_latents.append(fl)
+            guide_latent = torch.cat(frame_latents, dim=2)
+
+            logger.info(
+                f"Encoded guide latent (PER-FRAME): {list(guide_latent.shape)} "
+                f"from {images.shape[0]} pixel frames"
             )
-
-            # Strip prepended causal frame
-            if not causal_fix:
-                guide_latent = guide_latent[:, :, 1:, :, :]
-                images = images[1:]
-
-            logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
 
         # --- Sparse dilation (matches official LTXVDilateLatent exactly) ---
         guide_mask = None
