@@ -891,7 +891,6 @@ class ICLoRAGuider(MultimodalGuider):
         iclora_none_mode=False,
         free_mask=None,
         control_latent=None,
-        per_frame_control_encode=False,
         **kwargs,
     ):
         super().__init__(model, positive, negative, **kwargs)
@@ -903,13 +902,6 @@ class ICLoRAGuider(MultimodalGuider):
         self._free_mask = free_mask  # optional per-frame mask: 1=free from IC-LoRA, 0=locked
         self._max_shift = max_shift
         self._base_shift = base_shift
-        # Per-frame control encode: when True, encode each control pixel
-        # frame as its own single-frame latent (instead of bulk-encoding
-        # the whole video with the VAE's 8:1 temporal compression). Outside
-        # the LoRA's training distribution -- can produce smoother motion
-        # at the cost of temporal alignment drift in the middle of the
-        # clip. Off by default; use as an experimental opt-in.
-        self._per_frame_control_encode = per_frame_control_encode
         # Pre-encoded guide latent. When set, _encode_and_inject_guide skips
         # the VAE encode and uses this directly. Used by the chained LoRA-2
         # path to feed Pass A's output back in as Pass B's guide without a
@@ -1037,41 +1029,23 @@ class ICLoRAGuider(MultimodalGuider):
             if not causal_fix:
                 images = torch.cat([images[:1], images], dim=0)
 
-            # Encode resolution: official IC-LoRA scales by (latent_dim / dsf).
+            # --- Encode at reduced resolution (matches official iclora.py:174-185) ---
+            # The official IC-LoRA encode computes:
+            #   target = int(latent_dim * scale_factor / dsf)
+            # We pass latent_dim/dsf to base LTXVAddGuide.encode which multiplies
+            # by scale_factor internally, producing the same pixel resolution.
             enc_w = latent_w // dsf if dsf > 1 else latent_w
             enc_h = latent_h // dsf if dsf > 1 else latent_h
-
-            if self._per_frame_control_encode:
-                # Experimental: per-frame VAE encode. Each pixel frame
-                # becomes its own single-frame latent. ~8x more guide
-                # tokens during sampling. Outside the LoRA's training
-                # distribution -- expect smoother motion content but
-                # temporal alignment drift in the middle of the clip
-                # (start/end are still positionally anchored). Use with
-                # dense guide_video keyframes to anchor the timeline.
-                frame_latents = []
-                for fi in range(images.shape[0]):
-                    single = images[fi:fi + 1]
-                    _, fl = LTXVAddGuide.encode(
-                        self._vae, enc_w, enc_h, single, scale_factors
-                    )
-                    frame_latents.append(fl)
-                guide_latent = torch.cat(frame_latents, dim=2)
-                logger.info(
-                    f"Encoded guide latent (PER-FRAME, experimental): "
-                    f"{list(guide_latent.shape)} from {images.shape[0]} pixel frames"
-                )
-            else:
-                # Standard bulk encode -- the LoRA's trained format.
-                _, guide_latent = LTXVAddGuide.encode(
-                    self._vae, enc_w, enc_h, images, scale_factors
-                )
-                logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
+            _, guide_latent = LTXVAddGuide.encode(
+                self._vae, enc_w, enc_h, images, scale_factors
+            )
 
             # Strip prepended causal frame
             if not causal_fix:
                 guide_latent = guide_latent[:, :, 1:, :, :]
                 images = images[1:]
+
+            logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
 
         # --- Sparse dilation (matches official LTXVDilateLatent exactly) ---
         guide_mask = None
