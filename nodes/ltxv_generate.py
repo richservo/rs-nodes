@@ -534,25 +534,28 @@ class RSLTXVGenerate:
             else:
                 indices = list(range(0, num_video_frames, guide_every_nth))
 
-            # Encode entire guide video in one VAE pass
+            # FRAME-ACCURATE: encode each requested frame INDIVIDUALLY as
+            # its own single-frame latent. The previous implementation
+            # encoded the whole guide_video once and sliced a latent slot,
+            # but LTX's causal VAE blends 8 consecutive pixel frames into
+            # each latent slot (slot 0 = pixel 0; slot k>0 = pixels
+            # (k-1)*8+1..k*8). That meant asking for frame 8 actually
+            # returned a latent representing frames 1-8 temporally
+            # averaged -- visibly the wrong content. Per-frame encoding
+            # gives the exact visual content of the requested frame.
             scale_factors = vae.downscale_index_formula
-            time_sf = scale_factors[0]
             _, _, _, latent_height, latent_width = latent_dict["samples"].shape
-            _, guide_video_latent = LTXVAddGuide.encode(
-                vae, latent_width, latent_height, guide_video, scale_factors
-            )
-            logger.info(f"Video guide: encoded {num_video_frames} frames → latent {list(guide_video_latent.shape)}")
-
-            # Map pixel indices to latent frame indices and slice
+            guide_video_latent = "per_frame"  # marker so downstream uses len=1 path
             for i in indices:
-                if i == 0:
-                    lat_idx = 0
-                else:
-                    lat_idx = (i - 1) // time_sf + 1
-                lat_idx = min(lat_idx, guide_video_latent.shape[2] - 1)
-                guide_slice = guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
-                guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
-            logger.info(f"Video-to-video: {len(guides)} guide latent slices at pixel indices {indices}")
+                single_frame = guide_video[i:i+1]      # [1, H, W, C]
+                _, single_latent = LTXVAddGuide.encode(
+                    vae, latent_width, latent_height, single_frame, scale_factors
+                )
+                guides.append((single_latent, i, guide_strength, f"v2v_{i}"))
+            logger.info(
+                f"Video-to-video: {len(guides)} guide frames at pixel indices {indices} "
+                f"(per-frame encoded for exact content)"
+            )
         else:
             if first_image is not None:
                 guides.append((first_image, 0, first_strength, "first"))
@@ -857,15 +860,22 @@ class RSLTXVGenerate:
                         else:
                             rd_indices = list(range(0, num_video_frames, guide_every_nth))
 
-                        _, rd_guide_video_latent = RdGuide.encode(
-                            vae, rd_lw, rd_lh, guide_video, rd_scale_factors
-                        )
-                        time_sf = rd_scale_factors[0]
+                        # FRAME-ACCURATE: per-frame encode (see notes in
+                        # base-sample guide-video path above). Each
+                        # requested pixel frame becomes its own 1-frame
+                        # latent so the content is exactly that frame, not
+                        # a causal-VAE blend of 8 consecutive frames.
+                        rd_guide_video_latent = "per_frame"  # marker for downstream len=1 path
                         for i in rd_indices:
-                            lat_idx = 0 if i == 0 else (i - 1) // time_sf + 1
-                            lat_idx = min(lat_idx, rd_guide_video_latent.shape[2] - 1)
-                            guide_slice = rd_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
-                            rd_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+                            single_frame = guide_video[i:i+1]
+                            _, single_latent = RdGuide.encode(
+                                vae, rd_lw, rd_lh, single_frame, rd_scale_factors
+                            )
+                            rd_guides.append((single_latent, i, guide_strength, f"v2v_{i}"))
+                        logger.info(
+                            f"Rediff video-to-video: {len(rd_guides)} guide frames at "
+                            f"pixel indices {rd_indices} (per-frame encoded for exact content)"
+                        )
                     else:
                         if first_image is not None:
                             rd_guides.append((first_image, 0, first_strength, "first"))
@@ -1322,20 +1332,22 @@ class RSLTXVGenerate:
                         else:
                             up_indices = list(range(0, num_video_frames, guide_every_nth))
 
-                        # Encode entire guide video in one VAE pass at upscale resolution
+                        # FRAME-ACCURATE: per-frame encode at upscale resolution
+                        # (see base-sample path notes — causal VAE blends 8
+                        # frames per latent slot, so bulk-encode + slice was
+                        # pulling temporally-averaged content).
                         _, _, _, up_lat_h, up_lat_w = upsampled.shape
-                        _, up_guide_video_latent = UpGuide.encode(
-                            vae, up_lat_w, up_lat_h, guide_video, up_scale_factors
-                        )
-                        time_sf = up_scale_factors[0]
+                        up_guide_video_latent = "per_frame"  # marker for downstream len=1 path
                         for i in up_indices:
-                            if i == 0:
-                                lat_idx = 0
-                            else:
-                                lat_idx = (i - 1) // time_sf + 1
-                            lat_idx = min(lat_idx, up_guide_video_latent.shape[2] - 1)
-                            guide_slice = up_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
-                            up_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+                            single_frame = guide_video[i:i+1]
+                            _, single_latent = UpGuide.encode(
+                                vae, up_lat_w, up_lat_h, single_frame, up_scale_factors
+                            )
+                            up_guides.append((single_latent, i, guide_strength, f"v2v_{i}"))
+                        logger.info(
+                            f"Upscale rediff video-to-video: {len(up_guides)} guide frames at "
+                            f"pixel indices {up_indices} (per-frame encoded for exact content)"
+                        )
                     else:
                         if first_image is not None:
                             up_guides.append((first_image, 0, first_strength, "first"))
@@ -2216,20 +2228,23 @@ class RSLTXVGenerate:
                 else:
                     rd_indices = list(range(0, num_video_frames, guide_every_nth))
 
+                # FRAME-ACCURATE: per-frame encode (causal VAE blends 8
+                # frames per latent slot, so bulk-encode + slice was
+                # pulling temporally-averaged content instead of the
+                # exact requested frame).
                 rd_scale_factors = vae.downscale_index_formula
                 _, _, _, rd_lat_h, rd_lat_w = rd_latent.shape
-                _, rd_guide_video_latent = RdGuide.encode(
-                    vae, rd_lat_w, rd_lat_h, guide_video, rd_scale_factors
-                )
-                time_sf = rd_scale_factors[0]
+                rd_guide_video_latent = "per_frame"  # marker for downstream len=1 path
                 for i in rd_indices:
-                    if i == 0:
-                        lat_idx = 0
-                    else:
-                        lat_idx = (i - 1) // time_sf + 1
-                    lat_idx = min(lat_idx, rd_guide_video_latent.shape[2] - 1)
-                    guide_slice = rd_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
-                    rd_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+                    single_frame = guide_video[i:i+1]
+                    _, single_latent = RdGuide.encode(
+                        vae, rd_lat_w, rd_lat_h, single_frame, rd_scale_factors
+                    )
+                    rd_guides.append((single_latent, i, guide_strength, f"v2v_{i}"))
+                logger.info(
+                    f"Masked rediff video-to-video: {len(rd_guides)} guide frames at "
+                    f"pixel indices {rd_indices} (per-frame encoded for exact content)"
+                )
             else:
                 if first_image is not None:
                     rd_guides.append((first_image, 0, first_strength, "first"))
