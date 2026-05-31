@@ -1027,23 +1027,38 @@ class ICLoRAGuider(MultimodalGuider):
             images = images[:num_frames_to_keep]
             causal_fix = True  # per-frame: each frame is its own latent, no causal prepend needed
 
-            # --- PER-FRAME encode: one VAE pass per pixel frame, so the
-            # guide latent has one slot per pixel frame instead of one
-            # slot per 8 pixel frames. The causal VAE's normal 8:1 temporal
-            # compression averages 8 consecutive frames into one latent,
-            # which is why motion from a control video reads as "off by
-            # a few frames" -- the latent center is in the middle of an
-            # 8-frame averaging window. Per-frame encode gives the LoRA
-            # access to every pixel frame's content separately so motion
-            # can be tracked at full granularity.
-            # Trade-off: ~8x more tokens during sampling (slower, more
-            # VRAM). If the LoRA produces worse output because this is
-            # outside its training distribution, revert this block.
+            # --- CHUNK-REPRESENTATIVE per-frame encode.
+            # Bulk-encoding the whole control video temporally averages
+            # every 8 pixel frames into one latent slot, which smears
+            # motion (each slot's "perceived time" is the chunk center,
+            # ~midpoint of the 8-frame window).
+            # Full per-frame encoding (every pixel frame -> latent frame)
+            # gives clean content but breaks the LoRA's trained temporal
+            # mapping: it expects source-latent-T == output-latent-T and
+            # 8x more source frames produced visible slow-motion in the
+            # output.
+            # Compromise: pick ONE pixel frame per chunk (the chunk
+            # center, matching the LoRA's trained "perceived time") and
+            # per-frame encode just those. Same latent count as the bulk
+            # encode -> LoRA's temporal correspondence preserved. Each
+            # slot is now a clean single frame instead of an 8-frame
+            # average -> sharper motion content without timing drift.
             enc_w = latent_w // dsf if dsf > 1 else latent_w
             enc_h = latent_h // dsf if dsf > 1 else latent_h
+
+            T_pixel = images.shape[0]
+            # Match the bulk-encode latent count: latent 0 == pixel 0,
+            # then one slot per 8-pixel-frame chunk.
+            num_target_latents = (T_pixel - 1) // time_sf + 1
+            chunk_indices = [0]
+            for k in range(1, num_target_latents):
+                # Center of the kth chunk (pixels (k-1)*time_sf+1 .. k*time_sf)
+                center_pixel = (k - 1) * time_sf + time_sf // 2
+                chunk_indices.append(min(center_pixel, T_pixel - 1))
+
             frame_latents = []
-            for fi in range(images.shape[0]):
-                single = images[fi:fi + 1]
+            for ci in chunk_indices:
+                single = images[ci:ci + 1]
                 _, fl = LTXVAddGuide.encode(
                     self._vae, enc_w, enc_h, single, scale_factors
                 )
@@ -1051,8 +1066,9 @@ class ICLoRAGuider(MultimodalGuider):
             guide_latent = torch.cat(frame_latents, dim=2)
 
             logger.info(
-                f"Encoded guide latent (PER-FRAME): {list(guide_latent.shape)} "
-                f"from {images.shape[0]} pixel frames"
+                f"Encoded guide latent (CHUNK-CENTER per-frame): "
+                f"{list(guide_latent.shape)} from {T_pixel} pixel frames, "
+                f"picked indices {chunk_indices}"
             )
 
         # --- Sparse dilation (matches official LTXVDilateLatent exactly) ---
