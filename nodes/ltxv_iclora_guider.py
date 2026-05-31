@@ -97,6 +97,8 @@ class RSLTXVICLoRAGuider:
                 "distilled_lora":    (["none"] + folder_paths.get_filename_list("loras"),
                                       {"tooltip": "Distilled LoRA to apply when running distilled sigmas (cfg=1.0)."}),
                 "distilled_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "per_frame_control_encode": ("BOOLEAN", {"default": False,
+                                                          "tooltip": "EXPERIMENTAL. Encode each control pixel frame as its own single-frame latent instead of bulk-encoding with the VAE's 8:1 temporal compression. Outside the LoRA's training distribution -- typically produces smoother motion content but temporal alignment drifts in the middle of the clip (start/end stay anchored). ~8x more guide tokens (slower, more VRAM). Pair with dense guide_video keyframes to anchor mid-clip timing."}),
             },
         }
 
@@ -121,6 +123,7 @@ class RSLTXVICLoRAGuider:
         distilled_lora="none", distilled_lora_strength=1.0,
         scene_embed="none", scene_embed_strength=1.0,
         lora_name_2="none", lora_strength_2=1.0,
+        per_frame_control_encode=False,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -382,6 +385,7 @@ class RSLTXVICLoRAGuider:
             "_distilled_lora": distilled_lora,
             "_distilled_lora_strength": distilled_lora_strength,
             "_chained_lora_2": chained_lora_2,
+            "per_frame_control_encode": per_frame_control_encode,
         }
 
         # --- Create ICLoRAGuider (deferred encoding at sample() time) ---
@@ -411,6 +415,7 @@ class RSLTXVICLoRAGuider:
             video_modality_scale=video_modality_scale,
             audio_modality_scale=audio_modality_scale,
             video_attn_scale=video_attn_scale,
+            per_frame_control_encode=per_frame_control_encode,
         )
 
         # Attach control_info for upscale rebuild

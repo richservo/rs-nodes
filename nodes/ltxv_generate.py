@@ -2501,6 +2501,7 @@ class RSLTXVGenerate:
             video_modality_scale=ci.get("video_modality_scale", 0.0),
             audio_modality_scale=ci.get("audio_modality_scale", 3.0),
             video_attn_scale=ci.get("video_attn_scale", 1.03),
+            per_frame_control_encode=ci.get("per_frame_control_encode", False),
         )
         up_guider.control_info = ci
         up_guider.ic_lora_sampler = ci.get("_ic_lora_sampler", None)
