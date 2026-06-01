@@ -171,19 +171,17 @@ the AMF extraction is broken.
 **V2V test (gate):**
 Run with the user's actual problem case (the gesture-occlusion clip
 that motivated this whole exercise). Compare:
-- Existing IC-LoRA bulk encode (current baseline)
-- AMF guidance, no IC-LoRA
-- IC-LoRA Union + AMF guidance (augment)
+- Existing IC-LoRA Union bulk encode (current baseline)
+- Pure motion-locked V2V (AMF guidance + reference image, no IC-LoRA)
 
-User decides which produces motion closest to source.
+User judges which produces motion closest to source AND comparable
+appearance quality.
 
 ### Phase 3 — Reference appearance conditioning (1-2 hrs me)
 
-If Phase 2 V2V test went pure-V2V (no IC-LoRA), we need a different
-appearance pathway. If we kept IC-LoRA Union, this phase may be
-mostly redundant.
-
-Decision deferred to Phase 2 output. If pure-V2V path wins:
+Pure V2V path (no IC-LoRA, no control video preprocessing).
+Appearance comes entirely from the reference image via LTX's I2V
+cross-attention conditioning pathway.
 
 1. Encode reference frame via LTX image VAE (already exists in
    ComfyUI's LTX implementation).
@@ -213,10 +211,12 @@ this stage to "high-VRAM mode only" is acceptable for v1.
 
 Wrap the working pipeline as a node:
 
-`RSLTXVMotionLock` in `nodes/ltxv_motion_lock.py`. Inputs:
+`RSLTXVMotionLock` in `nodes/ltxv_motion_lock.py`. Standalone — does
+NOT chain with IC-LoRA. Inputs:
 
 - `model`, `positive`, `negative`, `vae` (standard)
-- `source_video` (IMAGE batch — pixel frames of the source)
+- `source_video` (IMAGE batch — raw pixel frames of source, no
+  preprocessing required)
 - `reference_image` (IMAGE — single appearance reference)
 - `amf_block_idx` (INT — chosen primary block from Phase 1)
 - `amf_block_idx_2` (INT, optional — secondary block for weighted combo)
@@ -224,7 +224,6 @@ Wrap the working pipeline as a node:
 - `amf_guide_window` (FLOAT — fraction of steps guided, 0-1)
 - `amf_lr_start`, `amf_lr_end` (FLOAT — LR schedule endpoints)
 - `enable_rope_opt` (BOOLEAN — Phase 4 toggle)
-- `iclora_guider` (GUIDER, optional — augment mode)
 
 Output: GUIDER (plugs into `RSLTXVGenerate.guider`).
 
@@ -233,21 +232,32 @@ the wrapper shape.
 
 ---
 
-## IC-LoRA architectural decision
+## IC-LoRA: not in the loop
 
-**Defer to Phase 2 V2V test data.** Two options:
+**Pure motion-locked V2V — no IC-LoRA, no control video preprocessing.**
 
+Union/Motion-Track/any IC-LoRA conditions on VAE-encoded control
+video, which is exactly the path that produces the inter-latent drift
+we're trying to eliminate. Stacking AMF on top of Union just compounds
+signals that fight each other.
+
+The user's goal is explicit: leverage LTX's generative physics on
+RAW footage as source with frame-accurate motion. No canny/depth/pose,
+no Union, no Motion-Track. AMF guidance + reference appearance, full
+stop.
+
+Historical context (kept for reference):
 1. **Replace** — Pure V2V. AMF guidance + reference appearance, no
-   IC-LoRA in the loop. Simpler architecture, matches the spec exactly.
-   Loses Union's style/structural priors.
+   IC-LoRA in the loop. **THIS IS THE PATH.** Matches the user's
+   actual goal: raw footage in, motion-locked physics-aware regen out.
 
 2. **Augment** — IC-LoRA Union runs as today; AMF guidance adds on
    top. IC-LoRA controls appearance/structure via its trained
    pathway; AMF controls motion trajectory. Conceptually
    orthogonal. Risk: they fight each other.
 
-Recommendation: implement augment first (lower disruption to working
-pipeline). If they fight, fall back to replace mode.
+Decision: replace, full stop. The augment path was considered and
+ruled out — the user wants to BEAT Union, not stack on top of it.
 
 ---
 
