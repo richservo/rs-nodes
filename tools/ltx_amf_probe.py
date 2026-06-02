@@ -513,12 +513,23 @@ def main():
     block_indices = args.blocks if args.blocks else list(range(len(all_blocks)))
     log.info(f"Probing {len(block_indices)} blocks of {len(all_blocks)} total")
 
-    # Patch grid resolution
-    patch_size = 32  # LTX standard (width/height step is 32)
-    h_patches = args.height // patch_size
-    w_patches = args.width // patch_size
-    n_latent_frames = (args.num_frames - 1) // ctx.time_sf + 1
-    log.info(f"Latent grid: {n_latent_frames} frames x {h_patches}x{w_patches} patches")
+    # Patch grid resolution.
+    # The VAE has temporal scale_factor=8 and spatial scale_factor=32, giving
+    # us latent dims [T_lat, H_lat, W_lat]. The DiT's patchifier then further
+    # sub-patches the latent grid with patch_size=(1, p, p). The actual DiT
+    # sequence length is T_lat * (H_lat//p) * (W_lat//p). Introspect p from
+    # the model so we don't have to guess.
+    patchifier_p = ctx.diffusion_model.patchifier.patch_size[1]
+    vae_spatial = 32  # LTX video VAE spatial scale factor
+    vae_temporal = ctx.time_sf  # 8
+    latent_h = args.height // vae_spatial
+    latent_w = args.width // vae_spatial
+    h_patches = latent_h // patchifier_p
+    w_patches = latent_w // patchifier_p
+    n_latent_frames = (args.num_frames - 1) // vae_temporal + 1
+    log.info(f"VAE latent: {n_latent_frames}x{latent_h}x{latent_w}, "
+             f"patchifier p={patchifier_p} -> patch grid "
+             f"{n_latent_frames} frames x {h_patches}x{w_patches}")
 
     # Results accumulator: list of dicts
     rows = []
@@ -536,7 +547,9 @@ def main():
         # VAE encode
         with torch.no_grad():
             source_latent = vae_encode_video(ctx.vae, pixel_frames)
-        log.info(f"Source latent: {tuple(source_latent.shape)}")
+        # ComfyUI's VAE may return latents on CPU after offloading. Force device.
+        source_latent = source_latent.to(device)
+        log.info(f"Source latent: {tuple(source_latent.shape)} on {source_latent.device}")
 
         # RAFT ground truth
         log.info("Computing RAFT optical flow (ground truth)...")
