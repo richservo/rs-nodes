@@ -547,9 +547,11 @@ def main():
         # VAE encode
         with torch.no_grad():
             source_latent = vae_encode_video(ctx.vae, pixel_frames)
-        # ComfyUI's VAE may return latents on CPU after offloading. Force device.
-        source_latent = source_latent.to(device)
-        log.info(f"Source latent: {tuple(source_latent.shape)} on {source_latent.device}")
+        # ComfyUI's VAE may return latents on CPU and in float32 even when the
+        # DiT runs in bfloat16. Force both device and dtype to match the DiT.
+        model_dtype = next(ctx.diffusion_model.parameters()).dtype
+        source_latent = source_latent.to(device=device, dtype=model_dtype)
+        log.info(f"Source latent: {tuple(source_latent.shape)} on {source_latent.device} dtype={source_latent.dtype}")
 
         # RAFT ground truth
         log.info("Computing RAFT optical flow (ground truth)...")
