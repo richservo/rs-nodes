@@ -357,9 +357,18 @@ def load_ltx(model_path: str, device: torch.device) -> ProbeContext:
         tokens = clip.tokenize("")
         cond, _pooled = clip.encode_from_tokens(tokens, return_pooled=True)
     else:
-        # Introspect cross-attention input dim from the first block's attn2.to_k
-        first_block = diffusion_model.transformer_blocks[0]
-        ctx_dim = first_block.attn2.to_k.in_features
+        # LTX 2.3 AV expects context of dim (cross_attention_dim + audio_cross_attention_dim).
+        # The first half is video/text context (cross_attention_dim=4096 for 22B);
+        # the second half is audio context (audio_cross_attention_dim=2048).
+        # preprocess_text_embeds passes through unchanged if context.shape[-1]
+        # matches this sum (line 567 in av_model.py).
+        if hasattr(diffusion_model, "audio_cross_attention_dim"):
+            ctx_dim = diffusion_model.cross_attention_dim + diffusion_model.audio_cross_attention_dim
+            log.info(f"AV model detected; ctx_dim = {diffusion_model.cross_attention_dim} "
+                     f"(video) + {diffusion_model.audio_cross_attention_dim} (audio) = {ctx_dim}")
+        else:
+            first_block = diffusion_model.transformer_blocks[0]
+            ctx_dim = first_block.attn2.to_k.in_features
         # Get model dtype from a weight
         any_param = next(diffusion_model.parameters())
         dtype = any_param.dtype
