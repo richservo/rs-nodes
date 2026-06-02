@@ -329,10 +329,14 @@ class ProbeContext:
     time_sf: int = 8
 
 
-def load_ltx(model_path: str, device: torch.device) -> ProbeContext:
+def load_ltx(model_path: str, device: torch.device,
+             gemma_path: Optional[str] = None,
+             t5_path: Optional[str] = None) -> ProbeContext:
     """Load LTX 2.3 checkpoint via ComfyUI's loader.
 
     Returns a ProbeContext with everything needed for the probe.
+    Text encoders are loaded separately if provided (LTX 2.3 ships them
+    as separate files, not bundled in the DiT checkpoint).
     """
     import comfy.sd
     import comfy.utils
@@ -348,6 +352,16 @@ def load_ltx(model_path: str, device: torch.device) -> ProbeContext:
     model_patcher = out[0]
     clip = out[1]
     vae = out[2]
+
+    # If checkpoint didn't include the text encoder (typical for LTX 2.3)
+    # and the user provided gemma/t5 paths, load them via comfy.sd.load_clip.
+    if clip is None and gemma_path and t5_path:
+        log.info(f"Loading text encoders separately: gemma={gemma_path}, t5={t5_path}")
+        clip = comfy.sd.load_clip(
+            ckpt_paths=[gemma_path, t5_path],
+            embedding_directory=None,
+            clip_type=comfy.sd.CLIPType.LTXV,
+        )
     log.info(f"Loaded: model={type(model_patcher).__name__}, vae={type(vae).__name__}")
 
     # Move model onto device
@@ -380,8 +394,13 @@ def load_ltx(model_path: str, device: torch.device) -> ProbeContext:
         # Get model dtype from a weight
         any_param = next(diffusion_model.parameters())
         dtype = any_param.dtype
-        log.info(f"No text encoder available; using zero context tensor "
-                 f"shape=[1, 256, {ctx_dim}] dtype={dtype}")
+        log.warning("=" * 70)
+        log.warning("NO TEXT ENCODER LOADED — using zero context tensor.")
+        log.warning("This is OUT-OF-DISTRIBUTION for the model and will likely")
+        log.warning("produce near-noise AMF correlations. To fix: pass real")
+        log.warning("text encoders via --gemma-path and --t5-path.")
+        log.warning(f"ctx tensor: shape=[1, 256, {ctx_dim}] dtype={dtype}")
+        log.warning("=" * 70)
         cond = torch.zeros(1, 256, ctx_dim, device=device, dtype=dtype)
 
     return ProbeContext(
@@ -482,8 +501,17 @@ def main():
                    help="Source clip paths. Accepts individual files OR a directory "
                         "containing video files (mp4/mov/mkv/webm).")
     p.add_argument("--timesteps", type=float, nargs="+",
-                   default=[0.4, 0.5, 0.6, 0.7, 0.8],
-                   help="Sigma values to probe at (rectified flow normalized 0-1)")
+                   default=[0.0, 0.05, 0.1, 0.2, 0.3],
+                   help="Sigma values to probe at (rectified flow normalized 0-1). "
+                        "DiTFlow extracts AMF on CLEAN latents (sigma=0). Higher noise "
+                        "degrades motion signal. Defaults span clean to lightly-noised.")
+    p.add_argument("--gemma-path", default=None,
+                   help="Path to Gemma3 text encoder (.safetensors/.gguf). If provided "
+                        "together with --t5-path, real text conditioning is used. Without "
+                        "this, zero context is used, which is OUT-OF-DISTRIBUTION for the "
+                        "model and produces near-noise AMF correlations.")
+    p.add_argument("--t5-path", default=None,
+                   help="Path to T5-XXL text encoder (.safetensors).")
     p.add_argument("--width", type=int, default=768)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--num-frames", type=int, default=73,
@@ -523,7 +551,8 @@ def main():
     args.clips = expanded_clips
     log.info(f"Probing {len(args.clips)} clip(s): {[Path(c).name for c in args.clips]}")
 
-    ctx = load_ltx(args.model_path, device)
+    ctx = load_ltx(args.model_path, device,
+                   gemma_path=args.gemma_path, t5_path=args.t5_path)
 
     # Determine which blocks to probe
     all_blocks = list(ctx.diffusion_model.transformer_blocks)
