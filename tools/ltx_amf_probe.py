@@ -353,12 +353,15 @@ def load_ltx(model_path: str, device: torch.device,
     clip = out[1]
     vae = out[2]
 
-    # If checkpoint didn't include the text encoder (typical for LTX 2.3)
-    # and the user provided gemma/t5 paths, load them via comfy.sd.load_clip.
-    if clip is None and gemma_path and t5_path:
-        log.info(f"Loading text encoders separately: gemma={gemma_path}, t5={t5_path}")
+    # If checkpoint didn't include the text encoder (typical for LTX 2.3) and
+    # the user provided gemma path, load it via comfy.sd.load_clip.
+    # LTX 2.3 AV uses Gemma3 only -- no T5. The CLIPType.LTXV branch with a
+    # single Gemma3 .safetensors triggers LTXAVTEModel (gemma3_12b only).
+    if clip is None and gemma_path:
+        clip_paths = [gemma_path] + ([t5_path] if t5_path else [])
+        log.info(f"Loading text encoder(s) separately: {clip_paths}")
         clip = comfy.sd.load_clip(
-            ckpt_paths=[gemma_path, t5_path],
+            ckpt_paths=clip_paths,
             embedding_directory=None,
             clip_type=comfy.sd.CLIPType.LTXV,
         )
