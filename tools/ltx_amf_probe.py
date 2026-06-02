@@ -327,6 +327,7 @@ class ProbeContext:
     text_cond: torch.Tensor
     device: torch.device
     time_sf: int = 8
+    unprocessed_ltxav_embeds: bool = False
 
 
 def load_ltx(model_path: str, device: torch.device,
@@ -380,7 +381,18 @@ def load_ltx(model_path: str, device: torch.device,
     if clip is not None:
         log.info("Using real text encoder from checkpoint")
         tokens = clip.tokenize("")
-        cond, _pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+        encode_result = clip.encode_from_tokens(tokens, return_dict=True)
+        cond = encode_result["cond"]
+        # LTX 2.3 AV text encoder signals 'unprocessed_ltxav_embeds=True' in
+        # extra dict. Track it so we call preprocess_text_embeds correctly.
+        unprocessed_flag = bool(encode_result.get("unprocessed_ltxav_embeds", False))
+        log.info(f"Encoded cond: shape={tuple(cond.shape)} dtype={cond.dtype} "
+                 f"unprocessed_ltxav_embeds={unprocessed_flag}")
+        # If a 4D tensor came back (e.g. layer dim survived), squeeze or reduce
+        if cond.dim() == 4:
+            log.warning(f"4D cond detected; taking last-layer slice (was {tuple(cond.shape)})")
+            cond = cond[:, -1] if cond.shape[1] > 1 else cond.squeeze(1)
+            log.info(f"After 4D -> 3D: shape={tuple(cond.shape)}")
     else:
         # LTX 2.3 AV expects context of dim (cross_attention_dim + audio_cross_attention_dim).
         # The first half is video/text context (cross_attention_dim=4096 for 22B);
@@ -412,6 +424,7 @@ def load_ltx(model_path: str, device: torch.device,
         vae=vae,
         text_cond=cond,
         device=device,
+        unprocessed_ltxav_embeds=(clip is not None and unprocessed_flag),
     )
 
 
@@ -479,13 +492,14 @@ def run_dit_forward_with_capture(
     context = ctx.text_cond.to(ctx.device, dtype=noised_latent.dtype)
 
     # In normal ComfyUI sampling, model_base.py calls preprocess_text_embeds
-    # on the raw text-encoder output before the DiT forward (raw Gemma3 = 3840
-    # dim -> processed = cross_attention_dim + audio_cross_attention_dim).
-    # Since we're calling the DiT directly we bypass that step -- apply it
-    # manually here when the method exists.
+    # with the unprocessed_ltxav_embeds flag from the text encoder's `extra`
+    # dict. We capture that flag at load time and pass it through here.
     if hasattr(ctx.diffusion_model, "preprocess_text_embeds"):
         with torch.no_grad():
-            context = ctx.diffusion_model.preprocess_text_embeds(context)
+            context = ctx.diffusion_model.preprocess_text_embeds(
+                context, unprocessed=ctx.unprocessed_ltxav_embeds,
+            )
+        log.debug(f"context after preprocess_text_embeds: {tuple(context.shape)}")
 
     try:
         with torch.no_grad():
