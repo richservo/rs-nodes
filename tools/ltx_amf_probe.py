@@ -346,11 +346,26 @@ def load_ltx(model_path: str, device: torch.device) -> ProbeContext:
     mm.load_models_gpu([model_patcher])
     diffusion_model = model_patcher.model.diffusion_model
 
-    # Build empty text conditioning (probe doesn't need a real prompt)
-    if clip is None:
-        raise RuntimeError("No CLIP/text encoder loaded from checkpoint; cannot build text conditioning.")
-    tokens = clip.tokenize("")
-    cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+    # Build text conditioning. LTX 2.3 checkpoints don't bundle the text
+    # encoder (Gemma3+T5 are separate files), so clip is usually None when
+    # loading just the DiT checkpoint. For the probe we don't need real text:
+    # we're measuring self-attention motion signal, not generating output.
+    # Cross-attention to a zero context contributes ~zero to the residual
+    # stream, leaving self-attention to see visual content cleanly.
+    if clip is not None:
+        log.info("Using real text encoder from checkpoint")
+        tokens = clip.tokenize("")
+        cond, _pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+    else:
+        # Introspect cross-attention input dim from the first block's attn2.to_k
+        first_block = diffusion_model.transformer_blocks[0]
+        ctx_dim = first_block.attn2.to_k.in_features
+        # Get model dtype from a weight
+        any_param = next(diffusion_model.parameters())
+        dtype = any_param.dtype
+        log.info(f"No text encoder available; using zero context tensor "
+                 f"shape=[1, 256, {ctx_dim}] dtype={dtype}")
+        cond = torch.zeros(1, 256, ctx_dim, device=device, dtype=dtype)
 
     return ProbeContext(
         model_patcher=model_patcher,
@@ -417,16 +432,17 @@ def run_dit_forward_with_capture(
     The exact forward signature is LTX-AV-model-specific. If this errors,
     inspect comfy/ldm/lightricks/av_model.py's main forward() and adjust.
     """
-    # Build inputs the way LTX expects
+    # Build inputs the way LTX AV expects.
+    # The AV model's forward separates audio from video via:
+    #   vx = x[0]; ax = x[1] if len(x) > 1 else zeros(...)
+    # So x MUST be a list/tuple [video_latent] (or [video, audio]).
     timestep = torch.tensor([sigma], device=ctx.device, dtype=noised_latent.dtype)
     context = ctx.text_cond.to(ctx.device, dtype=noised_latent.dtype)
 
-    # Most LTX DiT forward signatures accept (x, timestep, context, **kwargs).
-    # If the AV model requires extra audio kwargs, pass zero audio.
     try:
         with torch.no_grad():
             ctx.diffusion_model(
-                x=noised_latent,
+                x=[noised_latent],
                 timestep=timestep,
                 context=context,
             )
