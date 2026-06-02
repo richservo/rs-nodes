@@ -152,8 +152,10 @@ class QKCapture:
 
     Replaces the instance's forward with a re-implementation that captures
     q, k after q_norm/k_norm and RoPE, just before the optimized_attention
-    call. Limitation: skips gated attention blocks (would need to replicate
-    gating math here; not worth the complexity for a probe).
+    call. Also implements per-head output gating (`to_gate_logits`) so the
+    block's behavior is identical to the original — important because LTX
+    2.3 22B uses gating on every block. Gating only affects the attention
+    output (post Q/K), so AMF extraction is unaffected.
     """
 
     def __init__(self, attn_module):
@@ -161,12 +163,10 @@ class QKCapture:
         self.q: Optional[torch.Tensor] = None
         self.k: Optional[torch.Tensor] = None
         self._original_forward = attn_module.forward
-        self.supports_capture = attn_module.to_gate_logits is None
+        # All blocks supported now; flag retained for compatibility.
+        self.supports_capture = True
 
     def install(self):
-        if not self.supports_capture:
-            return  # skip — original forward is preserved
-
         # Lazy imports inside the closure so install happens before sys.path is final
         import comfy.ldm.modules.attention as comfy_attn
         from comfy.ldm.lightricks.model import apply_rotary_emb
@@ -199,6 +199,14 @@ class QKCapture:
                     attn_precision=attn.attn_precision,
                     transformer_options=transformer_options,
                 )
+            # Per-head output gating (LTX 2.3 22B uses this on every block)
+            if attn.to_gate_logits is not None:
+                gate_logits = attn.to_gate_logits(x)  # (B, T, H)
+                b, t, _ = out.shape
+                out = out.view(b, t, attn.heads, attn.dim_head)
+                gates = 2.0 * torch.sigmoid(gate_logits)
+                out = out * gates.unsqueeze(-1)
+                out = out.view(b, t, attn.heads * attn.dim_head)
             return attn.to_out(out)
 
         attn.forward = probed_forward
@@ -679,26 +687,33 @@ def main():
     lines.append("")
     lines.append(f"## Gate decision")
     lines.append("")
-    lines.append(f"**Best avg |correlation|: {abs(best_corr):.4f} (block {block_avg[0][0]})**")
-    lines.append("")
-    lines.append(f"**Verdict: {gate}**")
-    lines.append("")
-    lines.append("## Top 10 blocks by avg |correlation|")
-    lines.append("")
-    lines.append("| Rank | Block | Avg corr | Best sigma |")
-    lines.append("|------|-------|----------|------------|")
-    for rank, (bi, avg) in enumerate(block_avg[:10], start=1):
-        # Find best sigma for this block
-        per_sig = {sig: c for (b, sig), corrs in per_block_sigma.items()
-                   if b == bi for c in [sum(corrs) / len(corrs)]}
-        best_sig = max(per_sig.items(), key=lambda x: abs(x[1])) if per_sig else (None, 0.0)
-        lines.append(f"| {rank} | {bi} | {avg:+.4f} | sigma={best_sig[0]}: {best_sig[1]:+.4f} |")
+    if not block_avg:
+        lines.append("**No measurements recorded.** Every block was skipped — check the "
+                     "log above for the reason (gated attention, seq-len mismatch, etc).")
+        lines.append("")
+        lines.append("**Verdict: INDETERMINATE — fix the probe and re-run.**")
+    else:
+        lines.append(f"**Best avg |correlation|: {abs(best_corr):.4f} (block {block_avg[0][0]})**")
+        lines.append("")
+        lines.append(f"**Verdict: {gate}**")
+        lines.append("")
+        lines.append("## Top 10 blocks by avg |correlation|")
+        lines.append("")
+        lines.append("| Rank | Block | Avg corr | Best sigma |")
+        lines.append("|------|-------|----------|------------|")
+        for rank, (bi, avg) in enumerate(block_avg[:10], start=1):
+            # Find best sigma for this block
+            per_sig = {sig: c for (b, sig), corrs in per_block_sigma.items()
+                       if b == bi for c in [sum(corrs) / len(corrs)]}
+            best_sig = max(per_sig.items(), key=lambda x: abs(x[1])) if per_sig else (None, 0.0)
+            lines.append(f"| {rank} | {bi} | {avg:+.4f} | sigma={best_sig[0]}: {best_sig[1]:+.4f} |")
 
     with open(out_md, "w") as f:
         f.write("\n".join(lines) + "\n")
     log.info(f"Wrote summary to {out_md}")
     log.info(f"Gate verdict: {gate}")
-    log.info(f"Best block: {block_avg[0][0]} (avg corr {block_avg[0][1]:+.4f})")
+    if block_avg:
+        log.info(f"Best block: {block_avg[0][0]} (avg corr {block_avg[0][1]:+.4f})")
 
 
 if __name__ == "__main__":
