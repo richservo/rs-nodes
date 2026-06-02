@@ -379,7 +379,14 @@ def load_ltx(model_path: str, device: torch.device,
     # Cross-attention to a zero context contributes ~zero to the residual
     # stream, leaving self-attention to see visual content cleanly.
     if clip is not None:
-        log.info("Using real text encoder from checkpoint")
+        log.info(f"Using real text encoder. clip.cond_stage_model type = "
+                 f"{type(clip.cond_stage_model).__name__}")
+        log.info(f"clip.tokenizer type = {type(clip.tokenizer).__name__}")
+        if hasattr(clip.cond_stage_model, "text_projection_type"):
+            log.info(f"text_projection_type = {clip.cond_stage_model.text_projection_type}")
+        if hasattr(clip.cond_stage_model, "text_embedding_projection"):
+            tep = clip.cond_stage_model.text_embedding_projection
+            log.info(f"text_embedding_projection: {tep}")
         tokens = clip.tokenize("")
         encode_result = clip.encode_from_tokens(tokens, return_dict=True)
         cond = encode_result["cond"]
