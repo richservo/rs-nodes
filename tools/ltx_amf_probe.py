@@ -445,7 +445,9 @@ log = logging.getLogger("ltx_amf_probe")
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", required=True, help="Path to LTX 2.3 checkpoint")
-    p.add_argument("--clips", required=True, nargs="+", help="Source clip MP4s")
+    p.add_argument("--clips", required=True, nargs="+",
+                   help="Source clip paths. Accepts individual files OR a directory "
+                        "containing video files (mp4/mov/mkv/webm).")
     p.add_argument("--timesteps", type=float, nargs="+",
                    default=[0.4, 0.5, 0.6, 0.7, 0.8],
                    help="Sigma values to probe at (rectified flow normalized 0-1)")
@@ -466,6 +468,27 @@ def main():
     root = _setup_imports(args.comfyui_root)
     log.info(f"ComfyUI root: {root}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Expand --clips: a directory becomes all video files inside it
+    VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+    expanded_clips = []
+    for clip_arg in args.clips:
+        clip_path = Path(clip_arg)
+        if clip_path.is_dir():
+            found = sorted([p for p in clip_path.iterdir()
+                            if p.is_file() and p.suffix.lower() in VIDEO_EXTS])
+            if not found:
+                log.warning(f"No video files in directory: {clip_path}")
+            expanded_clips.extend(str(p) for p in found)
+        elif clip_path.is_file():
+            expanded_clips.append(str(clip_path))
+        else:
+            log.warning(f"Skipping (not a file or directory): {clip_arg}")
+    if not expanded_clips:
+        log.error("No clips found after expansion. Aborting.")
+        return
+    args.clips = expanded_clips
+    log.info(f"Probing {len(args.clips)} clip(s): {[Path(c).name for c in args.clips]}")
 
     ctx = load_ltx(args.model_path, device)
 
