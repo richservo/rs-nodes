@@ -378,29 +378,28 @@ def load_ltx(model_path: str, device: torch.device,
     # we're measuring self-attention motion signal, not generating output.
     # Cross-attention to a zero context contributes ~zero to the residual
     # stream, leaving self-attention to see visual content cleanly.
+    # LTX 2.3 AV text encoding has an annoying split: the official path
+    # needs Gemma3 + a separate LTX-side projection file, with both loaded
+    # together to build a proper LTXAVTEModel. With only Gemma3 (no
+    # projection file), ComfyUI's CLIP loader returns a standalone
+    # Gemma3_12BModel that outputs 4D [B, layers, seq, dim] -- and the DiT's
+    # preprocess_text_embeds can't consume it (caption_proj + connectors fail
+    # on dim mismatch).
+    #
+    # Pragmatic workaround for the PROBE: construct a context tensor in the
+    # "already preprocessed" shape [B, seq, cross_attn_dim + audio_cross_attn_dim].
+    # preprocess_text_embeds passes that through unchanged (line 567 in
+    # av_model.py). The probe measures self-attention motion signal which is
+    # only weakly text-dependent. We're NOT generating output here -- just
+    # asking "does the model's self-attn carry motion info?". Zero context is
+    # OOD but tractable for the gate decision.
+    unprocessed_flag = False
     if clip is not None:
-        log.info(f"Using real text encoder. clip.cond_stage_model type = "
-                 f"{type(clip.cond_stage_model).__name__}")
-        log.info(f"clip.tokenizer type = {type(clip.tokenizer).__name__}")
-        if hasattr(clip.cond_stage_model, "text_projection_type"):
-            log.info(f"text_projection_type = {clip.cond_stage_model.text_projection_type}")
-        if hasattr(clip.cond_stage_model, "text_embedding_projection"):
-            tep = clip.cond_stage_model.text_embedding_projection
-            log.info(f"text_embedding_projection: {tep}")
-        tokens = clip.tokenize("")
-        encode_result = clip.encode_from_tokens(tokens, return_dict=True)
-        cond = encode_result["cond"]
-        # LTX 2.3 AV text encoder signals 'unprocessed_ltxav_embeds=True' in
-        # extra dict. Track it so we call preprocess_text_embeds correctly.
-        unprocessed_flag = bool(encode_result.get("unprocessed_ltxav_embeds", False))
-        log.info(f"Encoded cond: shape={tuple(cond.shape)} dtype={cond.dtype} "
-                 f"unprocessed_ltxav_embeds={unprocessed_flag}")
-        # If a 4D tensor came back (e.g. layer dim survived), squeeze or reduce
-        if cond.dim() == 4:
-            log.warning(f"4D cond detected; taking last-layer slice (was {tuple(cond.shape)})")
-            cond = cond[:, -1] if cond.shape[1] > 1 else cond.squeeze(1)
-            log.info(f"After 4D -> 3D: shape={tuple(cond.shape)}")
-    else:
+        log.info(f"clip.cond_stage_model type = {type(clip.cond_stage_model).__name__}")
+        log.info("Skipping clip encode path; using pre-processed zero context "
+                 "(bypasses LTXAVTEModel/projection mismatch on single-file Gemma3 load).")
+        clip = None  # fall through to zero-context path
+    if True:
         # LTX 2.3 AV expects context of dim (cross_attention_dim + audio_cross_attention_dim).
         # The first half is video/text context (cross_attention_dim=4096 for 22B);
         # the second half is audio context (audio_cross_attention_dim=2048).
