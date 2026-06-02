@@ -478,6 +478,15 @@ def run_dit_forward_with_capture(
     timestep = torch.tensor([sigma], device=ctx.device, dtype=noised_latent.dtype)
     context = ctx.text_cond.to(ctx.device, dtype=noised_latent.dtype)
 
+    # In normal ComfyUI sampling, model_base.py calls preprocess_text_embeds
+    # on the raw text-encoder output before the DiT forward (raw Gemma3 = 3840
+    # dim -> processed = cross_attention_dim + audio_cross_attention_dim).
+    # Since we're calling the DiT directly we bypass that step -- apply it
+    # manually here when the method exists.
+    if hasattr(ctx.diffusion_model, "preprocess_text_embeds"):
+        with torch.no_grad():
+            context = ctx.diffusion_model.preprocess_text_embeds(context)
+
     try:
         with torch.no_grad():
             ctx.diffusion_model(
