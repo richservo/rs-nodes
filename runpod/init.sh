@@ -15,6 +15,9 @@
 #   OLLAMA_MODEL      — Ollama model(s), space-separated (default: gemma4:31b gemma4:26b)
 #   RS_INSTALL_OLLAMA — "0" to skip Ollama (default "1")
 #   RS_NODE_PACKS     — custom-node pack keys (default: full set)
+#   NO_COMFY          — "TRUE" for a BARE pod: NO ComfyUI, NO Ollama — just SSH +
+#                       sftp so the rs-studio app can provision its own tools
+#                       (e.g. VACE) onto /workspace. Nothing else runs.
 
 set -e
 
@@ -290,6 +293,38 @@ if ! pgrep -x sshd >/dev/null 2>&1; then
         /usr/sbin/sshd
     fi
 fi
+
+# -----------------------------------------------------------------------------
+# NO_COMFY mode — a BARE pod for the rs-studio app only (VACE, etc). Skips
+# ComfyUI AND Ollama entirely; the app SSHes in and provisions its own tools
+# onto /workspace. sshd + sftp are already up above, so the app can connect.
+# Keep PID 1 alive so RunPod doesn't restart the container. Runs BEFORE the
+# Ollama block + the SETUP/startup dispatch, so nothing Comfy/Ollama touches
+# the disk on a clean bare pod.
+# -----------------------------------------------------------------------------
+case "${NO_COMFY,,}" in
+    true|1|yes|on)
+        echo "[init] NO_COMFY=TRUE — bare pod mode: no ComfyUI, no Ollama."
+        echo "[init] SSH + sftp are up; the rs-studio app provisions its own tools on /workspace."
+        echo
+        echo "[init] =========================================================="
+        echo "[init]  Connection info for this pod"
+        echo "[init] =========================================================="
+        [ -n "${RUNPOD_POD_ID:-}" ] && echo "[init]  Pod ID:        $RUNPOD_POD_ID"
+        if [ -n "${RUNPOD_PUBLIC_IP:-}" ] && [ -n "${RUNPOD_TCP_PORT_22:-}" ]; then
+            echo "[init]  TCP SSH:       ssh root@$RUNPOD_PUBLIC_IP -p $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519"
+            echo "[init]  TCP scp/sftp:  scp -P $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519 <file> root@$RUNPOD_PUBLIC_IP:<remote>"
+        else
+            echo "[init]  TCP SSH:       NOT EXPOSED — enable TCP port 22 in pod settings so"
+            echo "[init]                 rs-studio's file panel (scp/sftp) works."
+        fi
+        [ -n "${RUNPOD_POD_ID:-}" ] && echo "[init]  Proxy SSH:     ssh ${RUNPOD_POD_ID}-${RUNPOD_POD_HOSTNAME:-$(hostname)}@ssh.runpod.io -i ~/.ssh/id_ed25519"
+        echo "[init] =========================================================="
+        echo
+        echo "[init] Bare pod ready. Container stays alive until you stop it."
+        exec tail -f /dev/null
+        ;;
+esac
 
 # -----------------------------------------------------------------------------
 # Ollama install + start. Lives here in init.sh (fetched fresh from GitHub
