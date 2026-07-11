@@ -15,9 +15,12 @@
 #   OLLAMA_MODEL      — Ollama model(s), space-separated (default: gemma4:31b gemma4:26b)
 #   RS_INSTALL_OLLAMA — "0" to skip Ollama (default "1")
 #   RS_NODE_PACKS     — custom-node pack keys (default: full set)
-#   NO_COMFY          — "TRUE" for a BARE pod: NO ComfyUI, NO Ollama — just SSH +
-#                       sftp so the rs-studio app can provision its own tools
-#                       (e.g. VACE) onto /workspace. Nothing else runs.
+#   NO_COMFY          — "TRUE" for a BARE pod: SSH only, NO ComfyUI, NO Ollama,
+#                       NO bootstrap. The rs-studio app SSHes in and provisions
+#                       its own tools (e.g. VACE) onto /workspace. Routes into
+#                       the SAME maintenance-mode body below (persistent host
+#                       keys + real sshd restart), so the app's pubkey auth
+#                       works exactly as on a normal pod. Honored WITH a GPU.
 
 set -e
 
@@ -157,16 +160,45 @@ if [ -f "$SSHD_CONFIG" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# GPU check / maintenance mode
+# Bare-pod / maintenance mode.
+#
+# TWO ways in, ONE shared body (the proven sshd bring-up below: persistent
+# host keys on /workspace + a real `pkill sshd` && restart). The restart is
+# the whole point — RunPod's container may already be running a stock sshd
+# with EPHEMERAL host keys that change every restart; the app's
+# StrictHostKeyChecking=accept-new silently REJECTS a changed host key, which
+# is the "app can't connect / public key" failure. Restarting sshd against the
+# persisted host keys makes them stable, so app pubkey auth works reliably.
+#
+#   1. NO_COMFY=TRUE  — user wants a bare pod: SSH only, no ComfyUI/Ollama/
+#                       bootstrap. App provisions its own tools (VACE, etc)
+#                       onto /workspace. Honored even WITH a GPU present.
+#   2. No GPU detected — almost certainly a CPU maintenance pod; CUDA work
+#                       can't run, so idle with SSH up.
+#
+# NO_COMFY wins even over RS_FORCE_BOOTSTRAP — an explicit bare-pod request is
+# unambiguous.
 # -----------------------------------------------------------------------------
-if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
-    echo "[init] No GPU detected — entering MAINTENANCE MODE."
-    echo "[init] Full pod access except ComfyUI / CUDA-dependent work:"
-    echo "[init]   * SSH (interactive + scp + sftp)"
-    echo "[init]   * Network volume read/write"
-    echo "[init]   * rclone / B2 sync (if B2_KEY_ID + B2_APP_KEY env vars set)"
-    echo "[init]   * pip / apt / git / everything else"
-    echo "[init] Set RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap."
+NO_COMFY_ON=0
+case "${NO_COMFY,,}" in true|1|yes|on) NO_COMFY_ON=1 ;; esac
+
+if [ "$NO_COMFY_ON" = "1" ] || { [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; }; then
+    if [ "$NO_COMFY_ON" = "1" ]; then
+        echo "[init] NO_COMFY=TRUE — BARE POD MODE (SSH only; no ComfyUI, no Ollama, no bootstrap)."
+        echo "[init] The rs-studio app SSHes in and provisions its own tools onto /workspace:"
+        echo "[init]   * SSH (interactive + scp + sftp)"
+        echo "[init]   * GPU / CUDA fully available for app-provisioned tools (e.g. VACE)"
+        echo "[init]   * Network volume read/write"
+        echo "[init]   * rclone / B2 sync (if B2_KEY_ID + B2_APP_KEY env vars set)"
+    else
+        echo "[init] No GPU detected — entering MAINTENANCE MODE."
+        echo "[init] Full pod access except ComfyUI / CUDA-dependent work:"
+        echo "[init]   * SSH (interactive + scp + sftp)"
+        echo "[init]   * Network volume read/write"
+        echo "[init]   * rclone / B2 sync (if B2_KEY_ID + B2_APP_KEY env vars set)"
+        echo "[init]   * pip / apt / git / everything else"
+        echo "[init] Set RS_FORCE_BOOTSTRAP=1 to override and run normal bootstrap."
+    fi
 
     # Generate or restore sshd host keys BEFORE starting sshd. Without
     # this, sshd exits immediately with "no hostkeys available --
@@ -262,7 +294,11 @@ if [ "${RS_FORCE_BOOTSTRAP:-0}" != "1" ] && ! nvidia-smi >/dev/null 2>&1; then
     fi
     echo "[init] =========================================================="
     echo
-    echo "[init] Maintenance mode ready. Container will stay alive until you stop it."
+    if [ "$NO_COMFY_ON" = "1" ]; then
+        echo "[init] Bare pod ready. Container will stay alive until you stop it."
+    else
+        echo "[init] Maintenance mode ready. Container will stay alive until you stop it."
+    fi
     # Keep PID 1 alive so RunPod doesn't auto-restart the container.
     exec tail -f /dev/null
 fi
@@ -293,67 +329,6 @@ if ! pgrep -x sshd >/dev/null 2>&1; then
         /usr/sbin/sshd
     fi
 fi
-
-# -----------------------------------------------------------------------------
-# NO_COMFY mode — a BARE pod for the rs-studio app only (VACE, etc). Skips
-# ComfyUI AND Ollama entirely; the app SSHes in and provisions its own tools
-# onto /workspace. sshd + sftp are already up above, so the app can connect.
-# Keep PID 1 alive so RunPod doesn't restart the container. Runs BEFORE the
-# Ollama block + the SETUP/startup dispatch, so nothing Comfy/Ollama touches
-# the disk on a clean bare pod.
-# -----------------------------------------------------------------------------
-case "${NO_COMFY,,}" in
-    true|1|yes|on)
-        echo "[init] NO_COMFY=TRUE — bare pod mode: no ComfyUI, no Ollama."
-        # RESTART sshd — this is the critical bit the Comfy path (bootstrap.sh
-        # Phase 0.5) does that the bare path was missing. On a fresh pod RunPod's
-        # container starts its OWN sshd BEFORE init.sh writes the app's key +
-        # persistent host keys, and merely "start if not running" leaves that
-        # stale daemon serving — so the app's pubkey auth fails (you can still log
-        # in on your account key from PowerShell). Killing + restarting sshd makes
-        # it re-read /root/.ssh/authorized_keys + the fresh host keys.
-        mkdir -p /run/sshd; chmod 755 /run/sshd
-        if [ ! -x /usr/sbin/sshd ] && command -v apt-get >/dev/null 2>&1; then
-            echo "[init] Installing openssh-server..."
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null 2>&1 || true
-        fi
-        if command -v service >/dev/null 2>&1; then
-            service ssh restart 2>&1 | sed 's/^/[sshd] /' || true
-        fi
-        # Also force a direct restart in case `service ssh restart` is a no-op on
-        # this base image (some minimal images), so the daemon really is fresh.
-        if [ -x /usr/sbin/sshd ]; then
-            pkill -x sshd 2>/dev/null || true
-            sleep 0.3
-            /usr/sbin/sshd 2>&1 | sed 's/^/[sshd] /' || true
-        fi
-        for _i in 1 2 3 4 5 6; do pgrep -x sshd >/dev/null 2>&1 && break; sleep 0.5; done
-        if pgrep -x sshd >/dev/null 2>&1; then
-            echo "[init] sshd (re)started — reading fresh authorized_keys + host keys"
-        else
-            echo "[init] WARN: sshd not running — the app won't be able to connect."
-        fi
-        echo "[init] SSH + sftp are up; the rs-studio app provisions its own tools on /workspace."
-        echo
-        echo "[init] =========================================================="
-        echo "[init]  Connection info for this pod"
-        echo "[init] =========================================================="
-        [ -n "${RUNPOD_POD_ID:-}" ] && echo "[init]  Pod ID:        $RUNPOD_POD_ID"
-        if [ -n "${RUNPOD_PUBLIC_IP:-}" ] && [ -n "${RUNPOD_TCP_PORT_22:-}" ]; then
-            echo "[init]  TCP SSH:       ssh root@$RUNPOD_PUBLIC_IP -p $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519"
-            echo "[init]  TCP scp/sftp:  scp -P $RUNPOD_TCP_PORT_22 -i ~/.ssh/id_ed25519 <file> root@$RUNPOD_PUBLIC_IP:<remote>"
-        else
-            echo "[init]  TCP SSH:       NOT EXPOSED — enable TCP port 22 in pod settings so"
-            echo "[init]                 rs-studio's file panel (scp/sftp) works."
-        fi
-        [ -n "${RUNPOD_POD_ID:-}" ] && echo "[init]  Proxy SSH:     ssh ${RUNPOD_POD_ID}-${RUNPOD_POD_HOSTNAME:-$(hostname)}@ssh.runpod.io -i ~/.ssh/id_ed25519"
-        echo "[init] =========================================================="
-        echo
-        echo "[init] Bare pod ready. Container stays alive until you stop it."
-        exec tail -f /dev/null
-        ;;
-esac
 
 # -----------------------------------------------------------------------------
 # Ollama install + start. Lives here in init.sh (fetched fresh from GitHub
