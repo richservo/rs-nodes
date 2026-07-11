@@ -305,6 +305,35 @@ fi
 case "${NO_COMFY,,}" in
     true|1|yes|on)
         echo "[init] NO_COMFY=TRUE — bare pod mode: no ComfyUI, no Ollama."
+        # RESTART sshd — this is the critical bit the Comfy path (bootstrap.sh
+        # Phase 0.5) does that the bare path was missing. On a fresh pod RunPod's
+        # container starts its OWN sshd BEFORE init.sh writes the app's key +
+        # persistent host keys, and merely "start if not running" leaves that
+        # stale daemon serving — so the app's pubkey auth fails (you can still log
+        # in on your account key from PowerShell). Killing + restarting sshd makes
+        # it re-read /root/.ssh/authorized_keys + the fresh host keys.
+        mkdir -p /run/sshd; chmod 755 /run/sshd
+        if [ ! -x /usr/sbin/sshd ] && command -v apt-get >/dev/null 2>&1; then
+            echo "[init] Installing openssh-server..."
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null 2>&1 || true
+        fi
+        if command -v service >/dev/null 2>&1; then
+            service ssh restart 2>&1 | sed 's/^/[sshd] /' || true
+        fi
+        # Also force a direct restart in case `service ssh restart` is a no-op on
+        # this base image (some minimal images), so the daemon really is fresh.
+        if [ -x /usr/sbin/sshd ]; then
+            pkill -x sshd 2>/dev/null || true
+            sleep 0.3
+            /usr/sbin/sshd 2>&1 | sed 's/^/[sshd] /' || true
+        fi
+        for _i in 1 2 3 4 5 6; do pgrep -x sshd >/dev/null 2>&1 && break; sleep 0.5; done
+        if pgrep -x sshd >/dev/null 2>&1; then
+            echo "[init] sshd (re)started — reading fresh authorized_keys + host keys"
+        else
+            echo "[init] WARN: sshd not running — the app won't be able to connect."
+        fi
         echo "[init] SSH + sftp are up; the rs-studio app provisions its own tools on /workspace."
         echo
         echo "[init] =========================================================="
