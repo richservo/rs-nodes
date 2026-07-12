@@ -314,18 +314,33 @@ fi
 case "${NO_COMFY,,}" in
     true|1|yes|on)
         echo "[init] NO_COMFY=TRUE — bare pod (SSH only; no ComfyUI, no Ollama, no bootstrap)."
-        # Restore authorized_keys from the volume (mirror of bootstrap Phase 0.5)
-        # so the app's pubkey is present, then restart sshd the SAME way the
-        # working Comfy path does.
+        # Restore authorized_keys from the volume (top of init already rebuilt it).
         if [ -s /workspace/.ssh/authorized_keys ]; then
             cp /workspace/.ssh/authorized_keys /root/.ssh/authorized_keys
             chmod 600 /root/.ssh/authorized_keys
         fi
-        if command -v service >/dev/null 2>&1; then
-            service ssh restart 2>&1 | sed 's/^/[sshd] /' || true
-        elif [ -x /usr/sbin/sshd ]; then
-            pkill -f /usr/sbin/sshd 2>/dev/null || true
-            /usr/sbin/sshd
+        # ROBUST, SELF-VERIFYING sshd bring-up. `service ssh restart` silently
+        # no-ops on some minimal images (see the maintenance-mode note above), so
+        # a bare pod can be left with NOTHING listening on :22 — while the Comfy
+        # path's 30-min runtime hides it. Install openssh-server if missing, try
+        # service, fall back to a DIRECT /usr/sbin/sshd, then VERIFY it's actually
+        # listening and say so in the log.
+        mkdir -p /run/sshd; chmod 755 /run/sshd
+        if [ ! -x /usr/sbin/sshd ] && command -v apt-get >/dev/null 2>&1; then
+            echo "[init] Installing openssh-server..."
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null 2>&1 || true
+        fi
+        command -v service >/dev/null 2>&1 && (service ssh restart 2>&1 | sed 's/^/[sshd] /' || true)
+        if ! pgrep -x sshd >/dev/null 2>&1 && [ -x /usr/sbin/sshd ]; then
+            echo "[init] service didn't bring sshd up — starting /usr/sbin/sshd directly"
+            /usr/sbin/sshd 2>&1 | sed 's/^/[sshd] /' || true
+        fi
+        for _i in 1 2 3 4 5 6; do pgrep -x sshd >/dev/null 2>&1 && break; sleep 0.5; done
+        if pgrep -x sshd >/dev/null 2>&1; then
+            echo "[init] sshd IS listening (pid $(pgrep -x sshd | head -1)) — app can connect"
+        else
+            echo "[init] WARN: sshd is NOT running — the app cannot connect. Check openssh-server / host keys above."
         fi
         echo
         echo "[init] =========================================================="
