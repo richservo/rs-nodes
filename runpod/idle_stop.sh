@@ -4,7 +4,8 @@
 # after the GPUs have been idle for the set number of minutes, so a forgotten pod does not run
 # all night. Works with Frames closed - it runs on the pod.
 #
-# Limit (minutes, 0 = off):
+# Limit (minutes, 0 = off). Any write to the limit file (even the same value: Frames'
+# "Keep running") restarts the idle count.
 #   /workspace/.rs/idle_stop_min   - the live value; Frames writes it over SSH to change the timer
 #                                    without a restart (changing pod env vars restarts the pod)
 #   RS_IDLE_STOP_MIN               - env; seeds the file only when the file does not exist yet
@@ -53,7 +54,10 @@ stop_pod() {
 
 log "started (limit $(cat "$LIMIT_FILE" 2>/dev/null) min, idle at <= ${THRESH}% GPU)"
 idle=0
+limit_mtime=$(stat -c %Y "$LIMIT_FILE" 2>/dev/null || echo 0)
 while true; do
+    m=$(stat -c %Y "$LIMIT_FILE" 2>/dev/null || echo 0)
+    if [ "$m" != "$limit_mtime" ]; then limit_mtime=$m; idle=0; log "limit set to $(cat "$LIMIT_FILE" 2>/dev/null) min - idle count restarted"; fi
     limit=$(tr -dc '0-9' < "$LIMIT_FILE" 2>/dev/null)
     limit=${limit:-0}
     util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -dc '0-9\n' | sort -n | tail -1)

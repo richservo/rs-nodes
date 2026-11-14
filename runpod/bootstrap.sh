@@ -146,9 +146,17 @@ else
     git -C "$COMFY_DIR" pull --ff-only || log "WARN: ComfyUI pull failed"
 fi
 
+# RS_NODES_BRANCH (default master): the branch this pod runs - a test branch while a change
+# is proven on one pod, then back to master.
+RS_NODES_BRANCH="${RS_NODES_BRANCH:-master}"
 if [ ! -d "$RS_NODES_DIR/.git" ]; then
-    log "Cloning rs-nodes..."
-    git clone https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"
+    log "Cloning rs-nodes ($RS_NODES_BRANCH)..."
+    git clone -b "$RS_NODES_BRANCH" https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"
+elif [ "$(git -C "$RS_NODES_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" != "$RS_NODES_BRANCH" ]; then
+    log "rs-nodes present; switching to $RS_NODES_BRANCH..."
+    git -C "$RS_NODES_DIR" fetch origin "$RS_NODES_BRANCH" && \
+        git -C "$RS_NODES_DIR" checkout -B "$RS_NODES_BRANCH" "origin/$RS_NODES_BRANCH" || \
+        log "WARN: rs-nodes branch switch failed"
 else
     log "rs-nodes present; pulling..."
     git -C "$RS_NODES_DIR" pull --ff-only || log "WARN: rs-nodes pull failed"

@@ -23,7 +23,7 @@ RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
 VENV="$WORKSPACE/.venv"
 PORT="${COMFY_PORT:-8188}"
 LOG_FILE="${COMFY_LOG:-/workspace/comfyui.log}"
-BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/bootstrap.sh"
+BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH:-master}/runpod/bootstrap.sh"
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
 

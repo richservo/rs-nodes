@@ -24,14 +24,20 @@
 #   SETUP             - "TRUE" forces a full bootstrap (re-provision). "AUTO"
 #                       bootstraps only a never-provisioned pod, then boots
 #                       normally (the Frames deploy wizard sets AUTO).
+#   RS_NODES_BRANCH   - rs-nodes branch for the scripts and the node pack
+#                       (default master; a test branch while proving a change).
 #   RS_IDLE_STOP_MIN  - GPU idle auto-stop, minutes (0/unset = off). Seeds
 #                       /workspace/.rs/idle_stop_min, which Frames edits live.
 
 set -e
 
 WORKSPACE=/workspace
-BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/bootstrap.sh"
-IDLE_STOP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/idle_stop.sh"
+# Which rs-nodes branch this pod runs (scripts AND the cloned node pack). Default master; the
+# Frames deploy wizard sets a test branch while a change is being proven on one pod.
+RS_NODES_BRANCH="${RS_NODES_BRANCH:-master}"
+export RS_NODES_BRANCH
+BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH}/runpod/bootstrap.sh"
+IDLE_STOP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH}/runpod/idle_stop.sh"
 DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
@@ -545,7 +551,8 @@ case "${SETUP,,}" in
             echo "[init] SETUP=AUTO and /workspace/startup.sh missing — first boot: running full provision"
             curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
             chmod +x "$WORKSPACE/bootstrap.sh"
-            exec bash "$WORKSPACE/bootstrap.sh"
+            # Also to /workspace/bootstrap.log so Frames can show the install live.
+            exec bash "$WORKSPACE/bootstrap.sh" > >(tee -a "$WORKSPACE/bootstrap.log") 2>&1
         fi
         echo "[init] SETUP=AUTO — already provisioned, normal boot"
         ;;
@@ -570,7 +577,7 @@ case "${SETUP,,}" in
         fi
         curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
         chmod +x "$WORKSPACE/bootstrap.sh"
-        exec bash "$WORKSPACE/bootstrap.sh"
+        exec bash "$WORKSPACE/bootstrap.sh" > >(tee -a "$WORKSPACE/bootstrap.log") 2>&1
         ;;
 esac
 
