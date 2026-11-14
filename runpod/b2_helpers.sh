@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# NOTE: runpod/bucket_sync.sh supersedes this for bucket storage (installs rclone to
+# /workspace/.bin, restore/save of models+inputs+outputs). These helpers remain for ad-hoc use.
+#
 # Sourceable rclone wrappers for Backblaze B2 (and any other rclone
 # remote configured in /workspace/.rclone/rclone.conf).
 #
@@ -20,6 +23,7 @@
 # secrets — it just tells rclone where to find the config.
 
 # ---- Configuration --------------------------------------------------------
+export PATH="/workspace/.bin:$PATH"
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/workspace/.rclone/rclone.conf}"
 B2_REMOTE="${B2_REMOTE:-b2}"   # the [name] of the rclone remote stanza
 
@@ -81,7 +85,7 @@ b2_status() {
 # ---- Status / preflight ---------------------------------------------------
 b2_check() {
     if ! command -v rclone >/dev/null 2>&1; then
-        echo "ERR: rclone not installed. Run /workspace/install_rclone.sh"
+        echo "ERR: rclone not installed. Run: bash /workspace/.rs/bucket_sync.sh restore (installs rclone to /workspace/.bin) or add /workspace/.bin to PATH"
         return 1
     fi
     if [ ! -f "$RCLONE_CONFIG" ]; then

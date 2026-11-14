@@ -38,6 +38,7 @@ RS_NODES_BRANCH="${RS_NODES_BRANCH:-master}"
 export RS_NODES_BRANCH
 BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH}/runpod/bootstrap.sh"
 IDLE_STOP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH}/runpod/idle_stop.sh"
+BUCKET_SYNC_URL="https://raw.githubusercontent.com/richservo/rs-nodes/${RS_NODES_BRANCH}/runpod/bucket_sync.sh"
 DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
@@ -324,6 +325,28 @@ fi
 if [ -f "$WORKSPACE/.rs/idle_stop.sh" ]; then
     nohup bash "$WORKSPACE/.rs/idle_stop.sh" >/dev/null 2>&1 &
     echo "[init] GPU idle auto-stop running (limit: $(cat "$WORKSPACE/.rs/idle_stop_min" 2>/dev/null || echo "${RS_IDLE_STOP_MIN:-0}") min; 0 = off)"
+fi
+
+# -----------------------------------------------------------------------------
+# CLOUD BUCKET as pod storage (runpod/bucket_sync.sh) - only when RS_BUCKET_CONF is set.
+# No FUSE on pods, so: RESTORE (rclone copy, never delete) bucket -> /workspace in the
+# FOREGROUND before bootstrap/startup/ComfyUI (restored models also make bootstrap
+# downloads skip what exists), then a background daemon saves back every
+# RS_BUCKET_SAVE_MIN minutes (idle_stop.sh saves once more before stopping the pod).
+# Works for NO_COMFY pods too (the NO_COMFY branch below only keeps PID 1 alive).
+# Fetched the same way as idle_stop.sh; the cached copy is used when GitHub is unreachable.
+# -----------------------------------------------------------------------------
+if [ -n "${RS_BUCKET_CONF:-}" ]; then
+    if curl -fsSL "$BUCKET_SYNC_URL" -o "$WORKSPACE/.rs/bucket_sync.sh.new" 2>/dev/null; then
+        mv -f "$WORKSPACE/.rs/bucket_sync.sh.new" "$WORKSPACE/.rs/bucket_sync.sh"
+    fi
+    if [ -f "$WORKSPACE/.rs/bucket_sync.sh" ]; then
+        echo "[init] Cloud bucket configured - restoring into /workspace before ComfyUI starts..."
+        bash "$WORKSPACE/.rs/bucket_sync.sh" restore || echo "[init] WARN: bucket restore reported errors (see /workspace/.rs/bucket_sync.log)"
+        nohup bash "$WORKSPACE/.rs/bucket_sync.sh" daemon >/dev/null 2>&1 &
+    else
+        echo "[init] WARN: RS_BUCKET_CONF set but bucket_sync.sh could not be fetched"
+    fi
 fi
 
 # -----------------------------------------------------------------------------

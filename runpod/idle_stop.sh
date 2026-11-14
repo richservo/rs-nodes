@@ -38,6 +38,15 @@ log() { echo "[idle-stop $(date '+%F %T')] $*" >> "$LOG_FILE"; }
 
 stop_pod() {
     log "GPU idle for $1 min (limit $2) - stopping pod ${RUNPOD_POD_ID:-?}"
+    # Cloud bucket: save everything back first (up to 30 min); stop the pod even if the save fails.
+    if [ -n "${RS_BUCKET_CONF:-}" ] && [ -f "$STATE_DIR/bucket_sync.sh" ]; then
+        log "cloud bucket configured - saving before stop"
+        if timeout 1800 bash "$STATE_DIR/bucket_sync.sh" save >> "$LOG_FILE" 2>&1; then
+            log "bucket save finished"
+        else
+            log "bucket save FAILED or timed out - stopping the pod anyway"
+        fi
+    fi
     if [ -z "${RUNPOD_POD_ID:-}" ]; then log "RUNPOD_POD_ID not set - cannot stop"; return 1; fi
     if command -v runpodctl >/dev/null 2>&1; then
         runpodctl pod stop "$RUNPOD_POD_ID" >> "$LOG_FILE" 2>&1 && return 0
@@ -63,7 +72,7 @@ while true; do
     util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -dc '0-9\n' | sort -n | tail -1)
     util=${util:-0}
     busy=0
-    if pgrep -f "bootstrap.sh|install_extras.sh|download_models.sh|install_ollama.sh|redo_bootstrap.sh" >/dev/null 2>&1; then busy=1; fi
+    if pgrep -f "bootstrap.sh|install_extras.sh|download_models.sh|install_ollama.sh|redo_bootstrap.sh|bucket_sync.sh" >/dev/null 2>&1; then busy=1; fi
     if [ "$busy" = "1" ] || [ "$util" -gt "$THRESH" ]; then idle=0; else idle=$((idle + 1)); fi
     printf '{"idleMin": %d, "limitMin": %d, "gpuUtil": %d, "busy": %d, "updatedAt": %d}\n' \
         "$idle" "$limit" "$util" "$busy" "$(date +%s)" > "$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
