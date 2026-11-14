@@ -21,11 +21,17 @@
 #                       up with the SAME `service ssh restart` the Comfy path
 #                       uses (bootstrap Phase 0.5), so the app connects
 #                       identically. Honored on GPU pods.
+#   SETUP             - "TRUE" forces a full bootstrap (re-provision). "AUTO"
+#                       bootstraps only a never-provisioned pod, then boots
+#                       normally (the Frames deploy wizard sets AUTO).
+#   RS_IDLE_STOP_MIN  - GPU idle auto-stop, minutes (0/unset = off). Seeds
+#                       /workspace/.rs/idle_stop_min, which Frames edits live.
 
 set -e
 
 WORKSPACE=/workspace
 BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/bootstrap.sh"
+IDLE_STOP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/idle_stop.sh"
 DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
@@ -298,6 +304,23 @@ if ! pgrep -x sshd >/dev/null 2>&1; then
 fi
 
 # -----------------------------------------------------------------------------
+# GPU IDLE AUTO-STOP (runpod/idle_stop.sh) — every GPU pod, ComfyUI and NO_COMFY
+# alike. Stops (never terminates) the pod after the GPUs sit idle for
+# /workspace/.rs/idle_stop_min minutes (seeded from RS_IDLE_STOP_MIN; 0 = off).
+# Runs in the background; Frames shows the countdown and changes the limit live.
+# Fetched fresh each boot (a first boot has no /workspace copy yet); the last
+# copy is used when GitHub is unreachable.
+# -----------------------------------------------------------------------------
+mkdir -p "$WORKSPACE/.rs"
+if curl -fsSL "$IDLE_STOP_URL" -o "$WORKSPACE/.rs/idle_stop.sh.new" 2>/dev/null; then
+    mv -f "$WORKSPACE/.rs/idle_stop.sh.new" "$WORKSPACE/.rs/idle_stop.sh"
+fi
+if [ -f "$WORKSPACE/.rs/idle_stop.sh" ]; then
+    nohup bash "$WORKSPACE/.rs/idle_stop.sh" >/dev/null 2>&1 &
+    echo "[init] GPU idle auto-stop running (limit: $(cat "$WORKSPACE/.rs/idle_stop_min" 2>/dev/null || echo "${RS_IDLE_STOP_MIN:-0}") min; 0 = off)"
+fi
+
+# -----------------------------------------------------------------------------
 # NO_COMFY — bare pod for the rs-studio app ONLY (VACE, etc). SSH + sftp up;
 # NO ComfyUI, NO Ollama, NO bootstrap. The app provisions its own tools onto
 # /workspace. Placed AFTER the normal-mode sshd bring-up + BEFORE Ollama, so it
@@ -502,8 +525,11 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Dispatch: ONLY SETUP=TRUE triggers a full bootstrap. Anything else
-# (FALSE, unset, empty) runs startup.sh.
+# Dispatch: SETUP=TRUE triggers a full bootstrap (re-provision). SETUP=AUTO
+# bootstraps only a pod that was never provisioned (/workspace/startup.sh
+# missing) and boots normally after that — what the Frames deploy wizard sets,
+# so a new pod installs itself once and restarts do not reinstall. Anything
+# else (FALSE, unset, empty) runs startup.sh.
 #
 # Separate from bootstrap: if ComfyUI itself updated (via git pull or
 # ComfyUI-Manager) and its requirements.txt now needs packages the venv
@@ -514,6 +540,15 @@ fi
 # boots skip it entirely.
 # -----------------------------------------------------------------------------
 case "${SETUP,,}" in
+    auto)
+        if [ ! -x "$WORKSPACE/startup.sh" ]; then
+            echo "[init] SETUP=AUTO and /workspace/startup.sh missing — first boot: running full provision"
+            curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
+            chmod +x "$WORKSPACE/bootstrap.sh"
+            exec bash "$WORKSPACE/bootstrap.sh"
+        fi
+        echo "[init] SETUP=AUTO — already provisioned, normal boot"
+        ;;
     true|1|yes|on)
         echo "[init] SETUP=TRUE — fetching bootstrap.sh and running full provision"
         # Up-front warning if HF_TOKEN missing — bootstrap downloads ~50 GB
