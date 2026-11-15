@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # rs-nodes pod-side GPU IDLE auto-stop. Started by init.sh in the background on every boot of a
-# GPU pod (ComfyUI and NO_COMFY alike). STOPS the pod (never terminates: /workspace survives)
-# after the GPUs have been idle for the set number of minutes, so a forgotten pod does not run
-# all night. Works with Frames closed - it runs on the pod.
+# GPU pod (ComfyUI and NO_COMFY alike). STOPS - or, if chosen, TERMINATES - the pod after the
+# GPUs have been idle for the set number of minutes, so a forgotten pod does not run all night.
+# Works with Frames closed - it runs on the pod.
+#
+# Action when the limit is reached (default stop):
+#   /workspace/.rs/idle_stop_action - "stop" or "terminate"; Frames writes it over SSH; read every
+#                                     minute
+#   RS_IDLE_STOP_ACTION             - env; seeds the file only when the file does not exist yet
+# Stop keeps the pod as a placeholder (its disk still bills); terminate removes it - and with it a
+# POD volume's /workspace (a network volume survives). A refused terminate falls back to stop, so
+# GPU billing ends either way.
 #
 # Limit (minutes, 0 = off). Any write to the limit file (even the same value: Frames'
 # "Keep running") restarts the idle count.
@@ -10,7 +18,8 @@
 #                                    without a restart (changing pod env vars restarts the pod)
 #   RS_IDLE_STOP_MIN               - env; seeds the file only when the file does not exist yet
 # State for Frames' countdown: /workspace/.rs/idle_state.json
-#   {"idleMin": N, "limitMin": N, "gpuUtil": N, "busy": 0|1, "updatedAt": epochSeconds}
+#   {"idleMin": N, "limitMin": N, "gpuUtil": N, "busy": 0|1, "action": "stop"|"terminate",
+#    "updatedAt": epochSeconds}
 # Idle = the busiest GPU at or under RS_IDLE_GPU_UTIL percent (default 5). Minutes spent while a
 # bootstrap / node-pack install / model download runs never count as idle.
 # Stops itself with the pod-scoped RUNPOD_API_KEY RunPod sets on every pod.
@@ -18,6 +27,7 @@
 set -u
 STATE_DIR=/workspace/.rs
 LIMIT_FILE="$STATE_DIR/idle_stop_min"
+ACTION_FILE="$STATE_DIR/idle_stop_action"
 STATE_FILE="$STATE_DIR/idle_state.json"
 LOG_FILE="$STATE_DIR/idle_stop.log"
 PID_FILE="$STATE_DIR/idle_stop.pid"
@@ -33,6 +43,12 @@ fi
 echo $$ > "$PID_FILE"
 
 [ -f "$LIMIT_FILE" ] || echo "${RS_IDLE_STOP_MIN:-0}" > "$LIMIT_FILE"
+[ -f "$ACTION_FILE" ] || echo "${RS_IDLE_STOP_ACTION:-stop}" > "$ACTION_FILE"
+
+# stop, unless the file says exactly terminate.
+idle_action() {
+    if [ "$(tr -dc 'a-z' < "$ACTION_FILE" 2>/dev/null)" = "terminate" ]; then echo terminate; else echo stop; fi
+}
 
 log() { echo "[idle-stop $(date '+%F %T')] $*" >> "$LOG_FILE"; }
 
@@ -52,7 +68,23 @@ stop_pod() {
     return 1
 }
 
-log "started (limit $(cat "$LIMIT_FILE" 2>/dev/null) min, idle at <= ${THRESH}% GPU)"
+terminate_pod() {
+    log "GPU idle for $1 min (limit $2) - TERMINATING pod ${RUNPOD_POD_ID:-?}"
+    if [ -z "${RUNPOD_POD_ID:-}" ]; then log "RUNPOD_POD_ID not set - cannot terminate"; return 1; fi
+    if command -v runpodctl >/dev/null 2>&1; then
+        runpodctl pod remove "$RUNPOD_POD_ID" >> "$LOG_FILE" 2>&1 && return 0
+        runpodctl remove pod "$RUNPOD_POD_ID" >> "$LOG_FILE" 2>&1 && return 0
+    fi
+    if [ -n "${RUNPOD_API_KEY:-}" ]; then
+        curl -fsS -X DELETE "https://api.runpod.io/v2/pods/${RUNPOD_POD_ID}" \
+            -H "Authorization: Bearer ${RUNPOD_API_KEY}" >> "$LOG_FILE" 2>&1 && return 0
+    fi
+    # Never leave it running at GPU rates because terminate was refused: stop instead.
+    log "terminate refused (the pod key may not allow it) - stopping instead"
+    stop_pod "$1" "$2"
+}
+
+log "started (limit $(cat "$LIMIT_FILE" 2>/dev/null) min, then $(idle_action), idle at <= ${THRESH}% GPU)"
 idle=0
 limit_mtime=$(stat -c %Y "$LIMIT_FILE" 2>/dev/null || echo 0)
 while true; do
@@ -65,10 +97,15 @@ while true; do
     busy=0
     if pgrep -f "bootstrap.sh|install_extras.sh|download_models.sh|install_ollama.sh|redo_bootstrap.sh" >/dev/null 2>&1; then busy=1; fi
     if [ "$busy" = "1" ] || [ "$util" -gt "$THRESH" ]; then idle=0; else idle=$((idle + 1)); fi
-    printf '{"idleMin": %d, "limitMin": %d, "gpuUtil": %d, "busy": %d, "updatedAt": %d}\n' \
-        "$idle" "$limit" "$util" "$busy" "$(date +%s)" > "$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+    action=$(idle_action)
+    printf '{"idleMin": %d, "limitMin": %d, "gpuUtil": %d, "busy": %d, "action": "%s", "updatedAt": %d}\n' \
+        "$idle" "$limit" "$util" "$busy" "$action" "$(date +%s)" > "$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
     if [ "$limit" -gt 0 ] && [ "$idle" -ge "$limit" ]; then
-        stop_pod "$idle" "$limit" && exit 0
+        if [ "$action" = "terminate" ]; then
+            terminate_pod "$idle" "$limit" && exit 0
+        else
+            stop_pod "$idle" "$limit" && exit 0
+        fi
         idle=0  # stop failed: try again after another full idle period, not every minute
     fi
     sleep 60
