@@ -363,9 +363,144 @@ fi
 # "Connection timed out during banner exchange" while an interactive login on
 # your account key still works. That divergence was the whole bug.
 # -----------------------------------------------------------------------------
+# Ollama install + start, as a function: the ComfyUI path runs it below as before; a bare
+# NO_COMFY pod runs it too when RS_INSTALL_OLLAMA=1 (Frames: "Install Ollama" with no ComfyUI),
+# in the background once sshd is up - it used to skip Ollama entirely.
+rs_start_ollama() {
+    if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
+        # Persistence target on the network volume — survives container restarts.
+        OLLAMA_PERSIST_DIR="/workspace/.ollama-install"
+        OLLAMA_PERSIST_BIN="$OLLAMA_PERSIST_DIR/bin/ollama"
+        OLLAMA_PERSIST_LIB="$OLLAMA_PERSIST_DIR/lib/ollama"
+        # Install path the official installer ACTUALLY uses (it ignores
+        # OLLAMA_INSTALL_DIR despite docs claiming otherwise on some versions).
+        OLLAMA_SYS_BIN="/usr/local/bin/ollama"
+        OLLAMA_SYS_LIB="/usr/local/lib/ollama"
+        OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
+        OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+        # RunPod container env can ship NVIDIA_VISIBLE_DEVICES=void which hides
+        # all GPUs from ollama serve and forces silent CPU fallback. Force
+        # visibility on so the daemon sees the GPU at load time.
+        NVIDIA_VISIBLE_DEVICES_VAL="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
+
+        # Strategy: try restore-from-volume first (fast, no network), fall back
+        # to fresh install (slow, ~15s download). After fresh install, mirror
+        # /usr/local → /workspace for next-boot restore.
+
+        # 1. Restore from /workspace if we have a cached install. /usr/local
+        #    gets wiped on every container restart, so we re-populate it from
+        #    /workspace on each boot if possible.
+        if [ -x "$OLLAMA_PERSIST_BIN" ] && [ ! -x "$OLLAMA_SYS_BIN" ]; then
+            echo "[init] ollama: restoring cached install from $OLLAMA_PERSIST_DIR"
+            mkdir -p /usr/local/bin /usr/local/lib
+            cp -a "$OLLAMA_PERSIST_BIN" "$OLLAMA_SYS_BIN"
+            [ -d "$OLLAMA_PERSIST_LIB" ] && cp -a "$OLLAMA_PERSIST_LIB" /usr/local/lib/ 2>/dev/null || true
+            chmod +x "$OLLAMA_SYS_BIN"
+        fi
+
+        # 2. If still missing, run the official installer (it installs to
+        #    /usr/local regardless of OLLAMA_INSTALL_DIR — accept this and
+        #    mirror to /workspace after).
+        if [ ! -x "$OLLAMA_SYS_BIN" ]; then
+            echo "[init] ollama: not present — running official installer"
+            OLLAMA_INSTALLED=0
+            for _ot in 1 2 3; do
+                if curl -fsSL --max-time 600 https://ollama.com/install.sh | \
+                   sh 2>&1 | sed 's/^/[ollama-install] /'; then
+                    if [ -x "$OLLAMA_SYS_BIN" ]; then
+                        OLLAMA_INSTALLED=1
+                        echo "[init] ollama: installed at $OLLAMA_SYS_BIN"
+                        break
+                    fi
+                fi
+                echo "[init] ollama: install attempt ${_ot}/3 failed, retrying in 5s"
+                sleep 5
+            done
+            if [ "$OLLAMA_INSTALLED" != "1" ]; then
+                echo "[init] ollama: ERROR — install failed after 3 attempts"
+            else
+                # Mirror to /workspace so next boot can restore without
+                # network. cp -a preserves perms/symlinks within the lib dir.
+                echo "[init] ollama: mirroring install to $OLLAMA_PERSIST_DIR for next-boot reuse"
+                mkdir -p "$OLLAMA_PERSIST_DIR/bin"
+                cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
+                if [ -d "$OLLAMA_SYS_LIB" ]; then
+                    mkdir -p "$OLLAMA_PERSIST_DIR/lib"
+                    cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
+                fi
+            fi
+        else
+            echo "[init] ollama: binary present at $OLLAMA_SYS_BIN"
+        fi
+
+        # 2b. Cache-poison guard. Fast path: cuda_v* libs present → silent
+        #     no-op. Slow path (e.g. you swapped GPU types and a previous
+        #     pod's CPU-only install got mirrored to /workspace): wipe both
+        #     /usr/local AND the /workspace persist cache, then reinstall.
+        #     Bounded to 3 retries so a template where the installer simply
+        #     cannot detect the GPU (like A100) doesn't infinite-loop;
+        #     ollama just runs on CPU in that case and the user gets a clear
+        #     warning to investigate manually.
+        if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
+            : # GPU build present — silent fast path
+        elif [ -x "$OLLAMA_SYS_BIN" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+            echo "[init] ollama: GPU detected but cuda_v* libs missing — wiping cache + reinstalling (3 tries max)"
+            pkill -9 -f "ollama serve" 2>/dev/null || true
+            sleep 2
+            rm -rf "$OLLAMA_SYS_BIN" "$OLLAMA_SYS_LIB"
+            rm -rf "$OLLAMA_PERSIST_BIN" "$OLLAMA_PERSIST_LIB" 2>/dev/null || true
+            _CUDA_OK=0
+            for _ot in 1 2 3; do
+                curl -fsSL --max-time 600 https://ollama.com/install.sh | \
+                    sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
+                if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
+                    echo "[init] ollama: GPU build installed on attempt ${_ot}"
+                    _CUDA_OK=1
+                    break
+                fi
+                echo "[init] ollama: reinstall attempt ${_ot}/3 still missing cuda libs; retrying in 5s"
+                sleep 5
+            done
+            if [ "$_CUDA_OK" = "1" ]; then
+                echo "[init] ollama: mirroring GPU install to $OLLAMA_PERSIST_DIR"
+                mkdir -p "$OLLAMA_PERSIST_DIR/bin" "$OLLAMA_PERSIST_DIR/lib"
+                cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
+                cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
+            else
+                echo "[init] ollama: GIVE UP — installer can't produce GPU build on this template after 3 tries. Daemon will run on CPU."
+            fi
+        fi
+
+        # 3. Start the server if not already running. Fully detached so it
+        #    survives ComfyUI dying.
+        if [ -x "$OLLAMA_SYS_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+            mkdir -p "$OLLAMA_MODELS_VAL"
+            echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL (NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES_VAL)"
+            setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS_VAL" OLLAMA_HOST="$OLLAMA_HOST_VAL" \
+                NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES_VAL" \
+                "$OLLAMA_SYS_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
+            disown 2>/dev/null || true
+        fi
+
+        # 4. Healthcheck — wait up to 20s for API.
+        if [ -x "$OLLAMA_SYS_BIN" ]; then
+            for _oi in 1 2 3 4 5 6 7 8 9 10; do
+                if curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
+                    echo "[init] ollama: API up on $OLLAMA_HOST_VAL"
+                    break
+                fi
+                sleep 2
+            done
+            if ! curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
+                echo "[init] ollama: WARN — server didn't respond after 20s; check /workspace/ollama.log"
+            fi
+        fi
+    fi
+}
+
 case "${NO_COMFY,,}" in
     true|1|yes|on)
-        echo "[init] NO_COMFY=TRUE — bare pod (SSH only; no ComfyUI, no Ollama, no bootstrap)."
+        echo "[init] NO_COMFY=TRUE — bare pod (SSH only; no ComfyUI, no bootstrap; Ollama only with RS_INSTALL_OLLAMA=1)."
         # Restore authorized_keys from the volume (top of init already rebuilt it).
         if [ -s /workspace/.ssh/authorized_keys ]; then
             cp /workspace/.ssh/authorized_keys /root/.ssh/authorized_keys
@@ -408,6 +543,11 @@ case "${NO_COMFY,,}" in
         echo "[init] =========================================================="
         echo "[init] Container will stay alive until you stop it."
         # Keep PID 1 alive so RunPod doesn't restart the container.
+    # "Install Ollama" on a bare pod: install / start it now (background - SSH is already up).
+    if [ "${RS_INSTALL_OLLAMA:-0}" = "1" ]; then
+        echo "[init] RS_INSTALL_OLLAMA=1 on a bare pod - starting Ollama in the background (log: /workspace/ollama-init.log)"
+        ( rs_start_ollama ) >> /workspace/ollama-init.log 2>&1 &
+    fi
         exec tail -f /dev/null
         ;;
 esac
@@ -423,135 +563,7 @@ esac
 #
 # Skipped if RS_INSTALL_OLLAMA=0.
 # -----------------------------------------------------------------------------
-if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
-    # Persistence target on the network volume — survives container restarts.
-    OLLAMA_PERSIST_DIR="/workspace/.ollama-install"
-    OLLAMA_PERSIST_BIN="$OLLAMA_PERSIST_DIR/bin/ollama"
-    OLLAMA_PERSIST_LIB="$OLLAMA_PERSIST_DIR/lib/ollama"
-    # Install path the official installer ACTUALLY uses (it ignores
-    # OLLAMA_INSTALL_DIR despite docs claiming otherwise on some versions).
-    OLLAMA_SYS_BIN="/usr/local/bin/ollama"
-    OLLAMA_SYS_LIB="/usr/local/lib/ollama"
-    OLLAMA_HOST_VAL="${OLLAMA_HOST:-127.0.0.1:11434}"
-    OLLAMA_MODELS_VAL="${OLLAMA_MODELS:-/workspace/.ollama/models}"
-    # RunPod container env can ship NVIDIA_VISIBLE_DEVICES=void which hides
-    # all GPUs from ollama serve and forces silent CPU fallback. Force
-    # visibility on so the daemon sees the GPU at load time.
-    NVIDIA_VISIBLE_DEVICES_VAL="${NVIDIA_VISIBLE_DEVICES_OVERRIDE:-all}"
-
-    # Strategy: try restore-from-volume first (fast, no network), fall back
-    # to fresh install (slow, ~15s download). After fresh install, mirror
-    # /usr/local → /workspace for next-boot restore.
-
-    # 1. Restore from /workspace if we have a cached install. /usr/local
-    #    gets wiped on every container restart, so we re-populate it from
-    #    /workspace on each boot if possible.
-    if [ -x "$OLLAMA_PERSIST_BIN" ] && [ ! -x "$OLLAMA_SYS_BIN" ]; then
-        echo "[init] ollama: restoring cached install from $OLLAMA_PERSIST_DIR"
-        mkdir -p /usr/local/bin /usr/local/lib
-        cp -a "$OLLAMA_PERSIST_BIN" "$OLLAMA_SYS_BIN"
-        [ -d "$OLLAMA_PERSIST_LIB" ] && cp -a "$OLLAMA_PERSIST_LIB" /usr/local/lib/ 2>/dev/null || true
-        chmod +x "$OLLAMA_SYS_BIN"
-    fi
-
-    # 2. If still missing, run the official installer (it installs to
-    #    /usr/local regardless of OLLAMA_INSTALL_DIR — accept this and
-    #    mirror to /workspace after).
-    if [ ! -x "$OLLAMA_SYS_BIN" ]; then
-        echo "[init] ollama: not present — running official installer"
-        OLLAMA_INSTALLED=0
-        for _ot in 1 2 3; do
-            if curl -fsSL --max-time 600 https://ollama.com/install.sh | \
-               sh 2>&1 | sed 's/^/[ollama-install] /'; then
-                if [ -x "$OLLAMA_SYS_BIN" ]; then
-                    OLLAMA_INSTALLED=1
-                    echo "[init] ollama: installed at $OLLAMA_SYS_BIN"
-                    break
-                fi
-            fi
-            echo "[init] ollama: install attempt ${_ot}/3 failed, retrying in 5s"
-            sleep 5
-        done
-        if [ "$OLLAMA_INSTALLED" != "1" ]; then
-            echo "[init] ollama: ERROR — install failed after 3 attempts"
-        else
-            # Mirror to /workspace so next boot can restore without
-            # network. cp -a preserves perms/symlinks within the lib dir.
-            echo "[init] ollama: mirroring install to $OLLAMA_PERSIST_DIR for next-boot reuse"
-            mkdir -p "$OLLAMA_PERSIST_DIR/bin"
-            cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
-            if [ -d "$OLLAMA_SYS_LIB" ]; then
-                mkdir -p "$OLLAMA_PERSIST_DIR/lib"
-                cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
-            fi
-        fi
-    else
-        echo "[init] ollama: binary present at $OLLAMA_SYS_BIN"
-    fi
-
-    # 2b. Cache-poison guard. Fast path: cuda_v* libs present → silent
-    #     no-op. Slow path (e.g. you swapped GPU types and a previous
-    #     pod's CPU-only install got mirrored to /workspace): wipe both
-    #     /usr/local AND the /workspace persist cache, then reinstall.
-    #     Bounded to 3 retries so a template where the installer simply
-    #     cannot detect the GPU (like A100) doesn't infinite-loop;
-    #     ollama just runs on CPU in that case and the user gets a clear
-    #     warning to investigate manually.
-    if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
-        : # GPU build present — silent fast path
-    elif [ -x "$OLLAMA_SYS_BIN" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        echo "[init] ollama: GPU detected but cuda_v* libs missing — wiping cache + reinstalling (3 tries max)"
-        pkill -9 -f "ollama serve" 2>/dev/null || true
-        sleep 2
-        rm -rf "$OLLAMA_SYS_BIN" "$OLLAMA_SYS_LIB"
-        rm -rf "$OLLAMA_PERSIST_BIN" "$OLLAMA_PERSIST_LIB" 2>/dev/null || true
-        _CUDA_OK=0
-        for _ot in 1 2 3; do
-            curl -fsSL --max-time 600 https://ollama.com/install.sh | \
-                sh 2>&1 | sed 's/^/[ollama-reinstall] /' || true
-            if [ -x "$OLLAMA_SYS_BIN" ] && ls "$OLLAMA_SYS_LIB"/cuda_v* >/dev/null 2>&1; then
-                echo "[init] ollama: GPU build installed on attempt ${_ot}"
-                _CUDA_OK=1
-                break
-            fi
-            echo "[init] ollama: reinstall attempt ${_ot}/3 still missing cuda libs; retrying in 5s"
-            sleep 5
-        done
-        if [ "$_CUDA_OK" = "1" ]; then
-            echo "[init] ollama: mirroring GPU install to $OLLAMA_PERSIST_DIR"
-            mkdir -p "$OLLAMA_PERSIST_DIR/bin" "$OLLAMA_PERSIST_DIR/lib"
-            cp -a "$OLLAMA_SYS_BIN" "$OLLAMA_PERSIST_BIN" 2>/dev/null || true
-            cp -a "$OLLAMA_SYS_LIB" "$OLLAMA_PERSIST_DIR/lib/" 2>/dev/null || true
-        else
-            echo "[init] ollama: GIVE UP — installer can't produce GPU build on this template after 3 tries. Daemon will run on CPU."
-        fi
-    fi
-
-    # 3. Start the server if not already running. Fully detached so it
-    #    survives ComfyUI dying.
-    if [ -x "$OLLAMA_SYS_BIN" ] && ! pgrep -f "ollama serve" >/dev/null 2>&1; then
-        mkdir -p "$OLLAMA_MODELS_VAL"
-        echo "[init] ollama: starting serve on $OLLAMA_HOST_VAL (NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES_VAL)"
-        setsid nohup env OLLAMA_MODELS="$OLLAMA_MODELS_VAL" OLLAMA_HOST="$OLLAMA_HOST_VAL" \
-            NVIDIA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES_VAL" \
-            "$OLLAMA_SYS_BIN" serve >>/workspace/ollama.log 2>&1 </dev/null &
-        disown 2>/dev/null || true
-    fi
-
-    # 4. Healthcheck — wait up to 20s for API.
-    if [ -x "$OLLAMA_SYS_BIN" ]; then
-        for _oi in 1 2 3 4 5 6 7 8 9 10; do
-            if curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
-                echo "[init] ollama: API up on $OLLAMA_HOST_VAL"
-                break
-            fi
-            sleep 2
-        done
-        if ! curl -fsS --max-time 1 "http://${OLLAMA_HOST_VAL}/api/tags" >/dev/null 2>&1; then
-            echo "[init] ollama: WARN — server didn't respond after 20s; check /workspace/ollama.log"
-        fi
-    fi
-fi
+rs_start_ollama
 
 # -----------------------------------------------------------------------------
 # Dispatch: SETUP=TRUE triggers a full bootstrap (re-provision). SETUP=AUTO
